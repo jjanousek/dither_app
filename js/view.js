@@ -112,12 +112,14 @@ export class Viewport {
     el.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       if (e.target.closest('#zoom-controls, #split-divider, #busy')) return;
+      e.preventDefault(); // stop WebKit from starting a text-selection drag
       panning = { x: e.clientX, y: e.clientY, tx: this.tx, ty: this.ty };
       el.classList.add('panning');
       el.setPointerCapture(e.pointerId);
     });
     el.addEventListener('pointermove', (e) => {
       if (!panning) return;
+      e.preventDefault();
       this.tx = panning.tx + (e.clientX - panning.x);
       this.ty = panning.ty + (e.clientY - panning.y);
       this.fitMode = false;
@@ -142,11 +144,13 @@ export class Viewport {
     let splitDrag = false;
     this.divider.addEventListener('pointerdown', (e) => {
       e.stopPropagation();
+      e.preventDefault(); // selection drags break the gesture, esp. in WebKit
       splitDrag = true;
       this.divider.setPointerCapture(e.pointerId);
     });
     this.divider.addEventListener('pointermove', (e) => {
       if (!splitDrag) return;
+      e.preventDefault();
       const rect = el.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const w = this.output.width * this.zoom;

@@ -24,6 +24,14 @@ html, body {
   font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
+  /* it's an editor: drags must never start text selection */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+input[type='text'], textarea {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 button { font-family: inherit; }
@@ -114,6 +122,7 @@ main { display: flex; height: calc(100% - 52px); }
   flex: 1;
   overflow: hidden;
   cursor: grab;
+  touch-action: none;
   background-color: var(--bg-stage);
   background-image: radial-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px);
   background-size: 22px 22px;
@@ -165,6 +174,7 @@ main { display: flex; height: calc(100% - 52px); }
   bottom: 0;
   width: 0;
   z-index: 12;
+  touch-action: none;
 }
 #split-divider::before {
   content: '';

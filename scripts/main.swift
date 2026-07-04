@@ -219,6 +219,19 @@ extension AppDelegate: WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
         decisionHandler(.grant) // macOS still shows its own camera consent dialog
     }
 
+    // <input type=file> needs the app to supply the picker in WKWebView
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping ([URL]?) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.beginSheetModal(for: window) { resp in
+            completionHandler(resp == .OK ? panel.urls : nil)
+        }
+    }
+
     // downloads land in ~/Downloads with a deduplicated name
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
                   suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
