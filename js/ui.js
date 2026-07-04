@@ -5,7 +5,7 @@
 import { MODES } from './state.js';
 import { ALGORITHMS, getAlgorithm } from './engine/engine.js';
 import { PALETTES, getPalette } from './palettes.js';
-import { RAMPS } from './engine/ascii.js';
+import { RAMPS, FONTS } from './engine/ascii.js';
 
 // ---------- tiny component helpers ----------
 
@@ -188,28 +188,56 @@ export function buildPanel({ state, mount, onChange, exportSettings }) {
     }
   } else if (state.mode === 'ascii') {
     const a = state.ascii;
-    select(eff, 'Characters', {
-      options: Object.entries(RAMPS).map(([id, r]) => ({ value: id, label: r.name })),
-      value: a.rampId,
-      oninput: (v) => { a.rampId = v; changeAndRefresh(); },
+    select(eff, 'Renderer', {
+      options: [
+        { value: 'ramp', label: 'Characters (ramp)' },
+        { value: 'shape', label: 'Shape match' },
+        { value: 'quadrant', label: 'Blocks 2×2' },
+        { value: 'braille', label: 'Braille 2×4' },
+      ],
+      value: a.renderer,
+      oninput: (v) => { a.renderer = v; changeAndRefresh(); },
     });
-    if (a.rampId === 'custom') {
-      textInput(eff, 'Custom set', {
-        value: a.customChars,
-        placeholder: 'dark → light, e.g. @#+-. ',
-        oninput: (v) => { a.customChars = v || '@ '; change(); },
+    if (a.renderer === 'ramp') {
+      select(eff, 'Characters', {
+        options: Object.entries(RAMPS).map(([id, r]) => ({ value: id, label: r.name })),
+        value: a.rampId,
+        oninput: (v) => { a.rampId = v; changeAndRefresh(); },
+      });
+      if (a.rampId === 'custom') {
+        textInput(eff, 'Custom set', {
+          value: a.customChars,
+          placeholder: 'any glyphs — coverage is measured',
+          oninput: (v) => { a.customChars = v || '@ '; change(); },
+        });
+      }
+    }
+    if (a.renderer === 'shape') {
+      select(eff, 'Symbols', {
+        options: [
+          { value: 'ascii', label: 'ASCII (pure text)' },
+          { value: 'blocks', label: 'ASCII + blocks' },
+        ],
+        value: a.shapeSet,
+        oninput: (v) => { a.shapeSet = v; change(); },
       });
     }
+    select(eff, 'Font', {
+      options: Object.entries(FONTS).map(([id, f]) => ({ value: id, label: f.name })),
+      value: a.fontId,
+      oninput: (v) => { a.fontId = v; change(); },
+    });
     slider(eff, 'Font size', {
       min: 4, max: 32, step: 1, value: a.cellSize,
       fmt: (v) => `${v}px`,
       oninput: (v) => { a.cellSize = v; change(); },
     });
+    toggle(eff, 'Bold', { value: a.bold, oninput: (v) => { a.bold = v; change(); } });
     select(eff, 'Color', {
       options: [
         { value: 'mono', label: 'Monochrome' },
-        { value: 'fg', label: 'Colored characters' },
-        { value: 'bg', label: 'Colored cells' },
+        { value: 'fg', label: 'Colored glyphs' },
+        { value: 'bg', label: 'Full color (fg + bg)' },
       ],
       value: a.colorMode,
       oninput: (v) => { a.colorMode = v; changeAndRefresh(); },
@@ -217,12 +245,34 @@ export function buildPanel({ state, mount, onChange, exportSettings }) {
     if (a.colorMode === 'mono') {
       color(eff, 'Text', { value: a.fg, oninput: (v) => { a.fg = v; change(); } });
     }
-    if (a.colorMode !== 'bg' || a.braille) {
+    if (a.colorMode !== 'bg') {
       color(eff, 'Background', { value: a.bg, oninput: (v) => { a.bg = v; change(); } });
     }
+    if (a.renderer !== 'shape') {
+      select(eff, 'Dither', {
+        options: [
+          { value: 'none', label: 'None' },
+          { value: 'floyd', label: 'Floyd–Steinberg' },
+          { value: 'bayer', label: 'Bayer 4×4' },
+        ],
+        value: a.dither,
+        oninput: (v) => { a.dither = v; change(); },
+      });
+    }
+    if (a.renderer === 'quadrant' || a.renderer === 'braille') {
+      slider(eff, 'Dot threshold', {
+        min: 0.1, max: 0.9, step: 0.01, value: a.dotThreshold, fmt: pct,
+        oninput: (v) => { a.dotThreshold = v; change(); },
+      });
+    }
+    if (a.renderer === 'ramp') {
+      slider(eff, 'Edge detail', {
+        min: 0, max: 1, step: 0.01, value: a.edgeStrength, fmt: pct,
+        oninput: (v) => { a.edgeStrength = v; change(); },
+      });
+    }
+    toggle(eff, 'Auto contrast', { value: a.autoContrast, oninput: (v) => { a.autoContrast = v; change(); } });
     toggle(eff, 'Invert mapping', { value: a.invertRamp, oninput: (v) => { a.invertRamp = v; change(); } });
-    toggle(eff, 'Edge characters', { value: a.edges, oninput: (v) => { a.edges = v; change(); } });
-    toggle(eff, 'Braille mode', { value: a.braille, oninput: (v) => { a.braille = v; changeAndRefresh(); } });
   } else {
     const c = state.cells;
     slider(eff, 'Cell size', {
@@ -418,6 +468,24 @@ export function buildPanel({ state, mount, onChange, exportSettings }) {
     value: exportSettings.recordSeconds,
     oninput: (v) => { exportSettings.recordSeconds = v; },
   });
+  if (state.mode === 'ascii') {
+    select(ex, 'Text format', {
+      options: [
+        { value: 'plain', label: 'Plain text (.txt)' },
+        { value: 'ansi', label: 'ANSI colors (.ans)' },
+        { value: 'html', label: 'Web page (.html)' },
+      ],
+      value: exportSettings.txtFormat,
+      oninput: (v) => { exportSettings.txtFormat = v; },
+    });
+    const copyRow = row(ex, null);
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'btn';
+    copyBtn.style.flex = '1';
+    copyBtn.textContent = 'Copy ASCII to clipboard';
+    copyBtn.onclick = () => exportSettings.onCopyText?.();
+    copyRow.appendChild(copyBtn);
+  }
   const note = document.createElement('div');
   note.style.cssText = 'font-size:11.5px;color:var(--text-dim);line-height:1.5';
   note.textContent = 'PNG / Video / GIF buttons live in the top bar. Video exports record the live preview in real time (with audio when the source has it).';

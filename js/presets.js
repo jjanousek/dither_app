@@ -146,7 +146,7 @@ export const PRESETS = [
       ascii: {
         rampId: 'dots',
         cellSize: 8,
-        braille: true,
+        renderer: 'braille',
         colorMode: 'mono',
         fg: '#e8e8e8',
         bg: '#0a0a0c',
@@ -415,6 +415,55 @@ PRESETS.push(
       pixelSize: 3,
       contrast: 0.1,
       anim: { style: 'wave', speed: 2.5, intensity: 0.55 },
+    },
+  },
+);
+
+// ---------------------------------------------------------------------------
+// New-generation ASCII looks (shape matching & full-color blocks)
+// ---------------------------------------------------------------------------
+PRESETS.push(
+  {
+    id: 'structural',
+    name: 'Structural',
+    params: {
+      mode: 'ascii',
+      contrast: 0.1,
+      ascii: {
+        renderer: 'shape',
+        shapeSet: 'ascii',
+        cellSize: 10,
+        colorMode: 'mono',
+        fg: '#d8d8e0',
+        bg: '#0a0a0c',
+      },
+    },
+  },
+  {
+    id: 'textmode',
+    name: 'Textmode Color',
+    params: {
+      mode: 'ascii',
+      saturation: 1.15,
+      ascii: {
+        renderer: 'shape',
+        shapeSet: 'blocks',
+        cellSize: 9,
+        colorMode: 'bg',
+      },
+    },
+  },
+  {
+    id: 'mosaic-blocks',
+    name: 'Block Mosaic',
+    params: {
+      mode: 'ascii',
+      contrast: 0.05,
+      ascii: {
+        renderer: 'quadrant',
+        cellSize: 10,
+        colorMode: 'bg',
+      },
     },
   },
 );

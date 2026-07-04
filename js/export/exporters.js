@@ -10,8 +10,75 @@ export function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
-export function exportText(text, name = 'ascii') {
-  downloadBlob(new Blob([text], { type: 'text/plain' }), `${name}.txt`);
+export function exportText(text, name = 'ascii', ext = 'txt') {
+  downloadBlob(new Blob([text], { type: 'text/plain' }), `${name}.${ext}`);
+}
+
+// ---------------------------------------------------------------------------
+// Colored-text builders from the ASCII renderer's lastGrid
+// (rows of [char, fgRGB|null, bgRGB|null]).
+// ---------------------------------------------------------------------------
+
+// ANSI truecolor: SGR 38;2 / 48;2 with run-length elision and a per-line
+// reset (terminals with background-color-erase flood the line otherwise).
+export function buildAnsi(grid) {
+  const out = [];
+  for (const row of grid) {
+    let curFg = -1;
+    let curBg = -2;
+    let line = '';
+    for (const [ch, fg, bg] of row) {
+      const f = fg ?? -1;
+      const b = bg ?? -1;
+      if (f !== curFg) {
+        line += f < 0 ? '\x1b[39m' : `\x1b[38;2;${(f >> 16) & 255};${(f >> 8) & 255};${f & 255}m`;
+        curFg = f;
+      }
+      if (b !== curBg) {
+        line += b < 0 ? '\x1b[49m' : `\x1b[48;2;${(b >> 16) & 255};${(b >> 8) & 255};${b & 255}m`;
+        curBg = b;
+      }
+      line += ch;
+    }
+    out.push(line + '\x1b[0m');
+  }
+  return out.join('\n') + '\n';
+}
+
+// Self-contained HTML with per-run color spans.
+export function buildHtml(grid, pageBg = '#0a0a0c') {
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const css = (v) => `#${(v & 0xffffff).toString(16).padStart(6, '0')}`;
+  const rows = grid.map((row) => {
+    let html = '';
+    let run = '';
+    let curFg = null;
+    let curBg = null;
+    const flush = () => {
+      if (!run) return;
+      const style = [
+        curFg !== null ? `color:${css(curFg)}` : '',
+        curBg !== null ? `background:${css(curBg)}` : '',
+      ].filter(Boolean).join(';');
+      html += style ? `<span style="${style}">${esc(run)}</span>` : esc(run);
+      run = '';
+    };
+    for (const [ch, fg, bg] of row) {
+      const f = fg ?? null;
+      const b = bg ?? null;
+      if (f !== curFg || b !== curBg) {
+        flush();
+        curFg = f;
+        curBg = b;
+      }
+      run += ch;
+    }
+    flush();
+    return html;
+  });
+  return `<!doctype html><meta charset="utf-8"><title>ascii art</title>` +
+    `<body style="background:${pageBg};margin:20px 0">` +
+    `<pre style="font:12px/1 Menlo,monospace;text-align:center">${rows.join('\n')}</pre>`;
 }
 
 // ---------------------------------------------------------------------------

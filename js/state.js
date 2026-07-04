@@ -38,16 +38,21 @@ export const DEFAULTS = {
 
   // --- ascii mode ---
   ascii: {
+    renderer: 'ramp',      // 'ramp' | 'shape' | 'quadrant' | 'braille'
+    shapeSet: 'ascii',     // shape matching glyph pool: 'ascii' | 'blocks'
     rampId: 'classic',
     customChars: '@#+-. ',
     cellSize: 12,          // 4..32 px
-    font: "'Courier New', ui-monospace, Menlo, monospace",
+    fontId: 'menlo',       // see FONTS in engine/ascii.js
+    bold: false,
     colorMode: 'mono',     // 'mono' | 'fg' | 'bg'
     fg: '#e8e8e8',
     bg: '#0a0a0c',
-    invertRamp: false,  // base mapping is bright=dense (right for dark backgrounds)
-    edges: false,          // Sobel edge-directed glyphs
-    braille: false,        // 2x4 braille subcells
+    invertRamp: false,     // base mapping is bright=dense (right for dark backgrounds)
+    dither: 'floyd',       // 'none' | 'floyd' | 'bayer' — level/dot dithering
+    dotThreshold: 0.5,     // quadrant & braille dot cutoff
+    edgeStrength: 0,       // 0..1 Sobel edge-directed glyphs (ramp & shape)
+    autoContrast: true,    // percentile luminance stretch
   },
 
   // --- cell effects (dots/lego/voxel/led/lattice/mosaic) ---

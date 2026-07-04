@@ -5,7 +5,7 @@ import { createGL, compileProgram, QUAD_VS, createTexture, uploadTexture, upload
 import { DITHER_FS, MAX_PALETTE } from './shaders.js';
 import { applyAdjustments, errorDiffusion, orderedDither, quantize, MATRICES, DIFFUSION_KERNELS } from './cpu.js';
 import { getBlueNoise } from './bluenoise.js';
-import { AsciiRenderer } from './ascii.js';
+import { AsciiRenderer, fontSpec } from './ascii.js';
 import { CELL_EFFECTS } from '../effects/cells.js';
 import { paletteToFloat, paletteToUniform } from '../palettes.js';
 
@@ -307,15 +307,20 @@ export class Engine {
 
   #renderAscii(source, srcW, srcH, p) {
     const a = p.ascii;
-    // One sample per character cell; use font metrics for the column count so
-    // the output aspect ratio matches the source. Braille packs 2x4 dots per
-    // glyph, so it samples at double/quadruple density.
+    // Renderer decides sub-cell sampling density:
+    // ramp 1x1, shape 4x8 (glyph matching), quadrant 2x2, braille 2x4.
+    const renderer = a.renderer || (a.braille ? 'braille' : 'ramp');
+    const DENSITY = { ramp: [1, 1], shape: [8, 8], quadrant: [2, 2], braille: [2, 4] };
+    const [dx, dy] = DENSITY[renderer] || DENSITY.ramp;
+    const MEASURE = { ramp: a.chars, shape: 'M', quadrant: '█', braille: '⣿' };
+
     const cellH = a.cellSize;
-    const cellW = this.ascii.measure(a.font, cellH, a.braille ? '⣿' : a.chars);
+    const font = fontSpec(a);
+    const cellW = this.ascii.measure(font, cellH, MEASURE[renderer]);
     const rows = Math.max(1, Math.round(srcH / cellH));
     const cols = Math.max(1, Math.round((srcW / srcH) * rows * (cellH / cellW)));
-    const w = a.braille ? cols * 2 : cols;
-    const h = a.braille ? rows * 4 : rows;
+    const w = cols * dx;
+    const h = rows * dy;
 
     this.#drawWork(source, w, h, p);
     const img = this.workCtx.getImageData(0, 0, w, h);
@@ -327,15 +332,19 @@ export class Engine {
       invert: p.invert,
     });
     return this.ascii.render(img, {
+      renderer,
       chars: a.chars,
       cellSize: a.cellSize,
-      font: a.font,
+      font,
       colorMode: a.colorMode,
       fg: a.fg,
       bg: a.bg,
       invertRamp: a.invertRamp,
-      edges: a.edges,
-      braille: a.braille,
+      dither: a.dither || 'none',
+      dotThreshold: a.dotThreshold ?? 0.5,
+      edgeStrength: a.edgeStrength || (a.edges ? 0.5 : 0),
+      autoContrast: a.autoContrast !== false,
+      shapeSet: a.shapeSet || 'ascii',
     });
   }
 

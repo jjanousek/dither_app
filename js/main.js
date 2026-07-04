@@ -8,7 +8,7 @@ import { RAMPS } from './engine/ascii.js';
 import { applyPostFX } from './effects/postfx.js';
 import { PRESETS, shuffleParams } from './presets.js';
 import { loadFile, openWebcam, demoImage, bindDropAndPaste } from './sources.js';
-import { exportText, VideoExporter, exportGIF, downloadBlob } from './export/exporters.js';
+import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob } from './export/exporters.js';
 import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js';
 import { Viewport } from './view.js';
 
@@ -23,7 +23,7 @@ const cctx = cmp.getContext('2d');
 const engine = new Engine();
 const thumbEngine = new Engine();
 const state = createState();
-const exportSettings = { pngSize: 'source', gifSize: '480', recordSeconds: '5' };
+const exportSettings = { pngSize: 'source', gifSize: '480', recordSeconds: '5', txtFormat: 'plain' };
 
 let source = null;
 let dirty = true;
@@ -554,9 +554,27 @@ async function doExportGIF() {
 function doExportTxt() {
   if (state.mode !== 'ascii') return;
   renderOnce();
-  exportText(engine.ascii.lastText, `${source?.name || 'ditherlab'}-ascii`);
-  toast('ASCII text exported');
+  const name = `${source?.name || 'ditherlab'}-ascii`;
+  const fmt = exportSettings.txtFormat;
+  if (fmt === 'ansi' && engine.ascii.lastGrid) {
+    exportText(buildAnsi(engine.ascii.lastGrid), name, 'ans');
+    toast('ANSI text exported — try: cat file.ans');
+  } else if (fmt === 'html' && engine.ascii.lastGrid) {
+    exportText(buildHtml(engine.ascii.lastGrid, state.ascii.bg), name, 'html');
+    toast('HTML exported');
+  } else {
+    exportText(engine.ascii.lastText, name);
+    toast('ASCII text exported');
+  }
 }
+
+exportSettings.onCopyText = () => {
+  if (state.mode !== 'ascii') return;
+  renderOnce();
+  navigator.clipboard.writeText(engine.ascii.lastText)
+    .then(() => toast('Copied to clipboard'))
+    .catch(() => toast('Clipboard unavailable'));
+};
 
 // ---------------------------------------------------------------------------
 // UI wiring

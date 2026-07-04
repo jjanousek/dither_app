@@ -11,10 +11,15 @@ Drop in a photo, a video, or your webcam feed and turn it into 1-bit dither art,
 - **19 dithering algorithms** — Floyd–Steinberg, Atkinson, Jarvis–Judice–Ninke, Stucki, Burkes, three Sierras and False Floyd–Steinberg (error diffusion, with serpentine scan); Bayer 2×2/4×4/8×8, clustered-dot 4×4/8×8 and true blue noise (ordered, WebGL-accelerated); white noise; rotating halftone dot & line screens; plain quantize.
 - **30 palettes** — 1-bit, Game Boy (DMG / Pocket / Light), CGA, EGA, C64, ZX Spectrum, NES, PICO-8, Apple II, Teletext, phosphor terminals, E-Ink, Obra Dinn, and a custom palette editor with up to 32 colors.
 - **8 effect modes** — Dither, ASCII, Dots, LEGO, Voxel, LED, Lattice, Mosaic.
-- **ASCII engine** — 12 character ramps + custom sets, monochrome or colored glyphs, Sobel edge-directed characters (`- / | \`), braille mode (2×4 dots per glyph), plain-text export.
+- **ASCII engine** — four renderers:
+  - *Characters* — 14 ramps + custom sets, **coverage-calibrated** against the actual font, with cell-level Floyd–Steinberg / Bayer dithering and a Sobel edge-glyph overlay (`- / | \`)
+  - *Shape match* — chafa-style structural matching: every cell is compared against pre-rasterized 8×8 glyph bitmaps (Hamming prefilter + per-pen color refinement), with one or two colors per cell — text that genuinely reconstructs the image
+  - *Blocks 2×2* — quadrant-mosaic mode with two colors per cell (luminance-gap splitting)
+  - *Braille 2×4* — dot art with Floyd–Steinberg dithered dots and adjustable threshold
+  - plus font choice + bold, percentile auto-contrast, monochrome / colored-glyph / full-color modes everywhere.
 - **Video & webcam** — the full pipeline runs per-frame in real time, with a scrubber, playback speed and live fps readout.
 - **Animation** — six phase-driven styles (Breathe, Pulse, Sweep, Wave, Flow, Shimmer) that work in every mode, on videos *and still images*. Animated stills export as **seamlessly looping GIFs**.
-- **Exports** — PNG (pixel-exact up to 2× source), WebM/MP4 video with audio passthrough, animated GIF from a built-in encoder, ASCII `.txt`.
+- **Exports** — PNG (pixel-exact up to 2× source), WebM/MP4 video with audio passthrough, animated GIF from a built-in encoder, and ASCII as plain `.txt`, **ANSI truecolor `.ans`** (renders in any modern terminal via `cat`), self-contained `.html`, or straight to the clipboard.
 
 ## The editor
 
@@ -25,6 +30,10 @@ A zoom/pan viewport (scroll to zoom, drag to pan, double-click for fit ↔ 1:1),
 Twenty-three one-click presets — from Terminal and Newsprint to Vaporwave and Retro CRT — plus a Shuffle button that rolls a random look.
 
 ![Matrix preset: green binary ASCII](docs/ascii.png)
+
+The shape-matching renderer in full color rebuilds the image out of pure text — every cell is a glyph chosen for its shape, with foreground and background colors fitted per cell:
+
+![Shape-matching ASCII in full color](docs/ascii-color.png)
 
 Adjustments (brightness, contrast, gamma, saturation, hue, sepia, blur, invert, grayscale) and a post-FX stack (vignette, scanlines, film grain, chromatic aberration, glow) sit on top of every mode.
 
