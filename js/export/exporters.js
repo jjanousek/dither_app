@@ -1,0 +1,205 @@
+// Export: PNG stills, WebM/MP4 video via MediaRecorder, animated GIF, ASCII text.
+
+import { GifEncoder } from './gif.js';
+
+export function downloadBlob(blob, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+export function exportText(text, name = 'ascii') {
+  downloadBlob(new Blob([text], { type: 'text/plain' }), `${name}.txt`);
+}
+
+// ---------------------------------------------------------------------------
+// Video export: records the live preview canvas via captureStream while the
+// source video plays through once. Audio is carried over when possible.
+// ---------------------------------------------------------------------------
+export class VideoExporter {
+  constructor(canvas, sourceVideo, { fps = 30, onProgress, onDone } = {}) {
+    this.canvas = canvas;
+    this.video = sourceVideo;
+    this.fps = fps;
+    this.onProgress = onProgress || (() => {});
+    this.onDone = onDone || (() => {});
+    this.recorder = null;
+    this._tick = null;
+    this._abort = null;
+    this._cancelled = false;
+  }
+
+  static pickMime() {
+    const candidates = [
+      'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+      'video/mp4',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ];
+    return candidates.find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+  }
+
+  // Await an event, but also settle on cancel() or after a safety timeout
+  // (currentTime = 0 on an already-rewound video may never fire 'seeked').
+  #waitFor(target, event, timeoutMs) {
+    return new Promise((resolve) => {
+      let timer = null;
+      const settle = () => {
+        target.removeEventListener(event, settle);
+        clearTimeout(timer);
+        this._abort = null;
+        resolve();
+      };
+      target.addEventListener(event, settle);
+      this._abort = settle;
+      if (timeoutMs) timer = setTimeout(settle, timeoutMs);
+    });
+  }
+
+  async start(name = 'dithered') {
+    const mime = VideoExporter.pickMime();
+    if (!mime) throw new Error('MediaRecorder is not supported in this browser');
+
+    const video = this.video;
+    const wasLooping = video.loop;
+    const stream = this.canvas.captureStream(this.fps);
+    this._cancelled = false;
+
+    const chunks = [];
+    this.recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
+    this.recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    const stopped = new Promise((resolve) => { this.recorder.onstop = resolve; });
+
+    try {
+      // Audio passthrough (muted flag only silences playback, not capture,
+      // but unmute so captureStream carries sound in all engines).
+      try {
+        video.muted = false;
+        const audio = video.captureStream ? video.captureStream() : null;
+        const track = audio?.getAudioTracks?.()[0];
+        if (track) stream.addTrack(track);
+      } catch { /* silent video is fine */ }
+
+      // Play the clip through exactly once from the start.
+      video.loop = false;
+      video.pause();
+      if (video.currentTime > 0.01) {
+        video.currentTime = 0;
+        await this.#waitFor(video, 'seeked', 4000);
+      }
+      if (this._cancelled) throw new Error('cancelled');
+
+      this.recorder.start(250);
+      await video.play();
+      this._tick = setInterval(() => {
+        this.onProgress(isFinite(video.duration) && video.duration ? video.currentTime / video.duration : 0);
+      }, 200);
+
+      await this.#waitFor(video, 'ended');
+      clearInterval(this._tick);
+      if (this.recorder.state !== 'inactive') this.recorder.stop();
+      await stopped;
+      if (this._cancelled) throw new Error('cancelled');
+
+      const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+      const blob = new Blob(chunks, { type: mime.split(';')[0] });
+      downloadBlob(blob, `${name}.${ext}`);
+      this.onDone(blob);
+      return blob;
+    } finally {
+      clearInterval(this._tick);
+      this._abort = null;
+      if (this.recorder.state !== 'inactive') this.recorder.stop();
+      stream.getTracks().forEach((t) => t.stop());
+      video.loop = wasLooping;
+      video.muted = true;
+      video.play().catch(() => {});
+    }
+  }
+
+  cancel() {
+    this._cancelled = true;
+    clearInterval(this._tick);
+    if (this.recorder && this.recorder.state !== 'inactive') this.recorder.stop();
+    this._abort?.();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GIF export: samples processed frames while the video plays once.
+// renderFrame() must return the current processed canvas.
+// ---------------------------------------------------------------------------
+export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, name = 'dithered', onProgress = () => {}, animate = null }) {
+  const first = renderFrame();
+  const scale = Math.min(1, maxWidth / first.width);
+  const w = Math.max(1, Math.round(first.width * scale));
+  const h = Math.max(1, Math.round(first.height * scale));
+
+  const frame = document.createElement('canvas');
+  frame.width = w;
+  frame.height = h;
+  const fctx = frame.getContext('2d', { willReadFrequently: true });
+  fctx.imageSmoothingEnabled = false;
+
+  const enc = new GifEncoder(w, h, { fps });
+
+  if (!video) {
+    if (animate) {
+      // Animated still: step the animation phase over exactly one cycle so
+      // the exported GIF loops seamlessly.
+      for (let i = 0; i < animate.count; i++) {
+        animate.setPhase(i / animate.count);
+        const processed = renderFrame();
+        fctx.drawImage(processed, 0, 0, w, h);
+        enc.addFrame(fctx.getImageData(0, 0, w, h).data);
+        onProgress((i + 1) / animate.count);
+      }
+      downloadBlob(enc.finish(), `${name}.gif`);
+      return;
+    }
+    // Single image -> single-frame GIF
+    fctx.drawImage(first, 0, 0, w, h);
+    enc.addFrame(fctx.getImageData(0, 0, w, h).data);
+    downloadBlob(enc.finish(), `${name}.gif`);
+    return;
+  }
+
+  const wasLooping = video.loop;
+  video.loop = false;
+  video.pause();
+
+  const seekTo = (t) => new Promise((r) => {
+    let timer = null;
+    const hnd = () => { video.removeEventListener('seeked', hnd); clearTimeout(timer); r(); };
+    video.addEventListener('seeked', hnd);
+    timer = setTimeout(hnd, 4000); // safety: some streams drop seeked events
+    video.currentTime = t;
+  });
+
+  try {
+    // MediaRecorder-produced webm (including this app's own exports) reports
+    // duration = Infinity until forced to demux to the end.
+    if (!isFinite(video.duration)) await seekTo(1e10);
+    const duration = video.duration;
+    if (!isFinite(duration) || duration <= 0) throw new Error('Video duration unknown — cannot sample frames');
+
+    const step = 1 / fps;
+    const frameCount = Math.max(1, Math.min(480, Math.floor(duration * fps)));
+
+    for (let i = 0; i < frameCount; i++) {
+      await seekTo(Math.min(duration - 0.001, i * step));
+      const processed = renderFrame();
+      fctx.drawImage(processed, 0, 0, w, h);
+      enc.addFrame(fctx.getImageData(0, 0, w, h).data);
+      onProgress((i + 1) / frameCount);
+    }
+
+    downloadBlob(enc.finish(), `${name}.gif`);
+  } finally {
+    video.loop = wasLooping;
+    video.play().catch(() => {});
+  }
+}

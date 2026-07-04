@@ -1,0 +1,9 @@
+{
+  "name": "dither-tool",
+  "version": "1.0.0",
+  "description": "Dither + ASCII studio for images and video — local, no build step",
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8173 --bind 127.0.0.1"
+  }
+}

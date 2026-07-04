@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ditherlab — dither &amp; ASCII studio</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0a0c'/><rect x='2' y='2' width='2' height='2' fill='white'/><rect x='6' y='2' width='2' height='2' fill='white'/><rect x='4' y='4' width='2' height='2' fill='white'/><rect x='8' y='4' width='2' height='2' fill='white'/><rect x='2' y='6' width='2' height='2' fill='white'/><rect x='10' y='2' width='2' height='2' fill='white'/><rect x='12' y='4' width='2' height='2' fill='white'/><rect x='6' y='6' width='2' height='2' fill='white'/><rect x='12' y='8' width='2' height='2' fill='white'/><rect x='4' y='8' width='2' height='2' fill='white'/><rect x='8' y='8' width='2' height='2' fill='white'/><rect x='2' y='10' width='2' height='2' fill='white'/><rect x='6' y='10' width='2' height='2' fill='white'/><rect x='10' y='10' width='2' height='2' fill='white'/><rect x='4' y='12' width='2' height='2' fill='white'/><rect x='8' y='12' width='2' height='2' fill='white'/><rect x='12' y='12' width='2' height='2' fill='white'/></svg>">
+</head>
+<body>
+  <header id="topbar">
+    <div class="logo"><span class="logo-mark"></span>DITHERLAB</div>
+
+    <div class="tb-group">
+      <button id="btn-open" class="btn" title="Open image or video (drop or paste works too)">
+        <svg viewBox="0 0 16 16"><path d="M8 10V2.5M5 5l3-2.8L11 5M2.5 10.5v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2"/></svg>
+        <span>Open</span>
+      </button>
+      <input type="file" id="file-input" accept="image/*,video/*" hidden>
+      <button id="btn-webcam" class="btn btn-icon" title="Use webcam">
+        <svg viewBox="0 0 16 16"><rect x="1.5" y="4" width="9.5" height="8" rx="1.5"/><path d="M11 7.5 14.5 5v6L11 8.5"/></svg>
+      </button>
+      <button id="btn-demo" class="btn btn-icon" title="Load demo scene">
+        <svg viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><circle cx="5.5" cy="6" r="1.2"/><path d="M2.5 11.5 6 8l3 3 2.5-2.5 2 2"/></svg>
+      </button>
+    </div>
+
+    <span class="sep"></span>
+
+    <div class="tb-group">
+      <button id="btn-undo" class="btn btn-icon" title="Undo (⌘Z)" disabled>
+        <svg viewBox="0 0 16 16"><path d="M6 3.5 3 6.5l3 3M3.5 6.5h6a3.5 3.5 0 0 1 0 7H6"/></svg>
+      </button>
+      <button id="btn-redo" class="btn btn-icon" title="Redo (⇧⌘Z)" disabled>
+        <svg viewBox="0 0 16 16"><path d="M10 3.5l3 3-3 3M12.5 6.5h-6a3.5 3.5 0 0 0 0 7H10"/></svg>
+      </button>
+      <button id="btn-reset" class="btn btn-icon" title="Reset all settings">
+        <svg viewBox="0 0 16 16"><path d="M2.5 8a5.5 5.5 0 1 1 1.6 3.9M2.5 12V8.8h3.2"/></svg>
+      </button>
+    </div>
+
+    <span class="sep"></span>
+
+    <div class="tb-group">
+      <button id="btn-shuffle" class="btn" title="Random look">
+        <svg viewBox="0 0 16 16"><path d="M1.5 4.5h3l6 7h4M14.5 11.5l-2-2m2 2-2 2M1.5 11.5h3l1.7-2M8.7 6.6l1.8-2.1h4M14.5 4.5l-2-2m2 2-2 2"/></svg>
+        <span>Shuffle</span>
+      </button>
+      <button id="btn-compare" class="btn" title="Hold to see the original (or hold C)">
+        <svg viewBox="0 0 16 16"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></svg>
+        <span>Compare</span>
+      </button>
+      <button id="btn-split" class="btn" title="Toggle before/after split view">
+        <svg viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M8 1.5v13"/></svg>
+        <span>Split</span>
+      </button>
+    </div>
+
+    <div class="tb-group tb-right">
+      <button id="btn-export-png" class="btn btn-accent" title="Export still as PNG">PNG</button>
+      <button id="btn-export-video" class="btn btn-accent" title="Export processed video" hidden>Video</button>
+      <button id="btn-export-gif" class="btn btn-accent" title="Export animated GIF" hidden>GIF</button>
+      <button id="btn-export-txt" class="btn btn-accent" title="Download ASCII text" hidden>TXT</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="stage">
+      <div id="viewport">
+        <div id="canvas-stack">
+          <canvas id="output"></canvas>
+          <canvas id="compare-canvas" hidden></canvas>
+        </div>
+        <div id="split-divider" hidden>
+          <div class="split-labels"><span>before</span><span>after</span></div>
+          <div class="split-handle" title="Drag to move the split">
+            <svg viewBox="0 0 16 16"><path d="M6 5 3 8l3 3M10 5l3 3-3 3"/></svg>
+          </div>
+        </div>
+        <div id="zoom-controls">
+          <button id="zoom-out" class="zbtn" title="Zoom out (−)">−</button>
+          <button id="zoom-readout" class="zbtn zread" title="Click to fit">100%</button>
+          <button id="zoom-in" class="zbtn" title="Zoom in (+)">+</button>
+          <span class="zsep"></span>
+          <button id="zoom-fit" class="zbtn" title="Fit to view (0)">
+            <svg viewBox="0 0 16 16"><path d="M6 2H2v4M10 2h4v4M6 14H2v-4M10 14h4v-4"/></svg>
+          </button>
+          <button id="zoom-100" class="zbtn" title="Actual pixels (1)">1:1</button>
+        </div>
+        <div id="drop-hint"><span class="kbd-hint">drop an image or video · paste from clipboard · drag to pan · scroll to zoom</span></div>
+        <div id="busy" hidden><div class="busy-box"><div id="busy-label">Exporting…</div><div class="busy-bar"><div id="busy-fill"></div></div><button id="busy-cancel" class="btn">Cancel</button></div></div>
+      </div>
+
+      <div id="video-bar" hidden>
+        <button id="btn-play" class="btn btn-icon">❚❚</button>
+        <input id="seek" type="range" min="0" max="1000" value="0" step="1">
+        <span id="time">0:00 / 0:00</span>
+        <select id="speed" class="mini-select" title="Playback speed">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+      </div>
+
+      <div id="preset-strip"></div>
+
+      <div id="status-bar">
+        <span id="st-left">—</span>
+        <span id="st-right"></span>
+      </div>
+    </section>
+    <aside id="panel"></aside>
+  </main>
+
+  <div id="toast" hidden></div>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
