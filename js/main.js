@@ -11,6 +11,7 @@ import { loadFile, openWebcam, demoImage, bindDropAndPaste } from './sources.js'
 import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob } from './export/exporters.js';
 import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js';
 import { Viewport } from './view.js';
+import { GenerativeSource } from './generate.js';
 
 const MAX_LIVE_PIXELS = 420_000; // CPU error-diffusion budget for video preview
 
@@ -39,6 +40,10 @@ let animPhase = 0;
 let phaseOverride = null; // exporters pin the phase for deterministic loops
 let lastLoopT = 0;
 const isAnimating = () => state.anim.style !== 'none';
+
+// generative scene source (lazy — created on first Generate click)
+let gen = null;
+const GEN_CYCLES_PER_SEC = 0.125; // at speed 1× a scene loops every 8s
 
 // reusable upscale canvas for post-FX over pixelated results
 const upCanvas = document.createElement('canvas');
@@ -99,6 +104,7 @@ function srcDims() {
 function renderOnce() {
   const [w, h] = srcDims();
   if (!w || !h) return out;
+  if (source.type === 'gen') source.gen.tick(phaseOverride ?? source.gen.phase);
   const p = derived();
   // live sources AND animated stills render every frame -> cap the CPU budget
   const capped = source.type !== 'image' || isAnimating();
@@ -183,8 +189,13 @@ function loop(t) {
   const animating = isAnimating() && phaseOverride === null;
   if (animating) animPhase = (animPhase + (dt / 1000) * state.anim.speed * 0.15) % 1;
 
+  if (source.type === 'gen' && phaseOverride === null) {
+    source.gen.phase = (source.gen.phase + (dt / 1000) * source.gen.params.speed * GEN_CYCLES_PER_SEC) % 1;
+  }
   const isLive = source.type !== 'image';
-  const playing = isLive && !source.el.paused && !source.el.ended;
+  const playing = isLive && (source.el instanceof HTMLVideoElement
+    ? (!source.el.paused && !source.el.ended)
+    : true); // webcam-less live sources (generated scenes) always play
   if (!dirty && !playing && !animating) return;
   dirty = false;
 
@@ -368,6 +379,7 @@ function setSource(next) {
   view.fit(); // re-fit even when the new output has identical dimensions
   updateExportButtons();
   updateStatus();
+  rebuildPanel(); // scene controls appear only for generated sources
   dirty = true;
   setTimeout(renderPresetThumbs, 250);
   toast(`${source.name || source.type} · ${source.width}×${source.height}`);
@@ -384,9 +396,10 @@ async function openFile(file) {
 function updateExportButtons() {
   const isVideo = source?.type === 'video';
   const isWebcam = source?.type === 'webcam';
+  const isGen = source?.type === 'gen';
   const animatedStill = source?.type === 'image' && isAnimating();
-  $('btn-export-video').hidden = !(isVideo || isWebcam || animatedStill);
-  $('btn-export-gif').hidden = !isVideo && source?.type !== 'image';
+  $('btn-export-video').hidden = !(isVideo || isWebcam || animatedStill || isGen);
+  $('btn-export-gif').hidden = !isVideo && source?.type !== 'image' && !isGen;
   $('btn-export-txt').hidden = state.mode !== 'ascii';
 }
 
@@ -509,12 +522,17 @@ function recordCanvasSeconds(secs, filename) {
 async function doExportVideo() {
   if (!source || exporting) return;
   const animatedStill = source.type === 'image' && isAnimating();
-  if (!(source.el instanceof HTMLVideoElement) && !animatedStill) return;
+  const isGen = source.type === 'gen';
+  if (!(source.el instanceof HTMLVideoElement) && !animatedStill && !isGen) return;
   exporting = true;
 
   const secs = parseInt(exportSettings.recordSeconds, 10) || 5;
   if (source.type === 'webcam') {
     recordCanvasSeconds(secs, 'ditherlab-webcam');
+    return;
+  }
+  if (isGen) {
+    recordCanvasSeconds(secs, `${source.name || 'scene'}-${state.mode}`);
     return;
   }
   if (animatedStill) {
@@ -548,7 +566,12 @@ async function doExportGIF() {
   // Animated stills bake exactly one animation cycle -> seamless loop.
   let fps = 12;
   let animate = null;
-  if (source.type === 'image' && isAnimating()) {
+  if (source.type === 'gen') {
+    const cycleSec = 1 / (source.gen.params.speed * GEN_CYCLES_PER_SEC);
+    const count = Math.min(180, Math.max(24, Math.round(cycleSec * 15)));
+    fps = count / cycleSec;
+    animate = { count, setPhase: (ph) => { phaseOverride = ph; } };
+  } else if (source.type === 'image' && isAnimating()) {
     const cycleSec = 1 / (state.anim.speed * 0.15);
     const count = Math.min(150, Math.max(10, Math.round(cycleSec * 15)));
     fps = count / cycleSec;
@@ -613,6 +636,12 @@ function rebuildPanel() {
     state,
     mount: $('panel'),
     exportSettings,
+    gen: source?.type === 'gen' ? source.gen : null,
+    onGenChange: () => {
+      if (source?.type === 'gen') source.name = source.gen.sceneName().toLowerCase();
+      updateStatus();
+      dirty = true;
+    },
     onChange: () => {
       if (exporting) return;
       updateExportButtons();
@@ -665,6 +694,29 @@ $('file-input').addEventListener('change', (e) => {
 });
 
 $('btn-demo').onclick = () => setSource(demoImage());
+
+$('btn-generate').onclick = () => {
+  if (exporting) return;
+  if (!gen) {
+    gen = new GenerativeSource(1280, 800);
+    if (!gen.isSupported()) {
+      toast('WebGL2 unavailable — cannot generate scenes');
+      gen = null;
+      return;
+    }
+  }
+  if (source?.type === 'gen') gen.nextScene();
+  else gen.setScene(gen.params.scene, { randomizeSeed: true });
+  gen.tick(gen.phase);
+  setSource({
+    type: 'gen',
+    el: gen.canvas,
+    width: gen.canvas.width,
+    height: gen.canvas.height,
+    name: gen.sceneName().toLowerCase(),
+    gen,
+  });
+};
 $('btn-webcam').onclick = async () => {
   if (exporting) return;
   try {
@@ -779,6 +831,24 @@ if (bootPreset) {
   updateStatus();
   [...document.querySelectorAll('.preset-card')]
     .find((c) => c.textContent.includes(bootPreset.name))?.classList.add('active');
+}
+const genParam = qp.get('gen');
+if (genParam) {
+  gen = new GenerativeSource(1280, 800);
+  if (gen.isSupported()) {
+    gen.setScene(genParam, { randomizeSeed: false });
+    gen.tick(0);
+    setSource({
+      type: 'gen',
+      el: gen.canvas,
+      width: gen.canvas.width,
+      height: gen.canvas.height,
+      name: gen.sceneName().toLowerCase(),
+      gen,
+    });
+  } else {
+    gen = null;
+  }
 }
 const splitParam = qp.get('split');
 if (splitParam && splitParam !== '0' && splitParam.toLowerCase() !== 'false') $('btn-split').click();

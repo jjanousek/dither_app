@@ -8,6 +8,7 @@ Drop in a photo, a video, or your webcam feed and turn it into 1-bit dither art,
 
 - [Quick start](#quick-start)
 - [Effect modes](#effect-modes)
+- [Generative scenes](#generative-scenes)
 - [Dithering](#dithering)
 - [ASCII art](#ascii-art)
 - [Palettes](#palettes)
@@ -30,7 +31,7 @@ python3 scripts/serve.py        # or: npm start (plain `python3 -m http.server 8
 
 A static server is needed only because ES modules require `http://`. The server binds to `127.0.0.1`, so nothing is reachable from your network. The app opens with a built-in demo scene — drop any image or video on it, paste from the clipboard, or hit the webcam button.
 
-**Shareable links:** `?preset=<id>` boots straight into a preset, `&split=1` opens the split view — e.g. `http://127.0.0.1:8173/?preset=gameboy&split=1`.
+**Shareable links:** `?preset=<id>` boots straight into a preset, `?gen=<scene>` into a generative scene, `&split=1` opens the split view — e.g. `http://127.0.0.1:8173/?preset=gameboy&split=1`.
 
 ## Effect modes
 
@@ -48,6 +49,12 @@ Eight renderers, switchable with one click. All of them run on stills, videos, a
 | **Mosaic** | flat tiles with grout lines |
 
 The cell modes (Dots → Mosaic) share controls for cell size, coverage, scatter jitter, and color: sample colors from the image or render as a duotone (background + foreground color).
+
+## Generative scenes
+
+No source material? Hit **Generate** (the sparkle button): six animated procedural scenes — **Mesh Gradient, Neuro Noise, Warp Field, Smoke, Voronoi Flow, Metaballs** — render straight into the pipeline like a live video source, so every dither/ASCII mode, palette, and post effect applies in real time. Each scene has its own palette, zoom, speed and seed controls, and every scene is a pure function of a loop phase, so **GIF exports are perfectly seamless loops**. Clicking Generate again cycles scenes; `?gen=<scene>` boots straight into one.
+
+![Warp Field scene dithered with the Vaporwave preset](docs/generate.png)
 
 ## Dithering
 
@@ -184,4 +191,4 @@ Design notes:
 
 ## Acknowledgements
 
-Inspired by the excellent [ditther.com](https://www.ditther.com/) and [ascii-magic.com](https://www.ascii-magic.com/) — this is an independent, from-scratch implementation of the genre they popularized. The ASCII engine owes its techniques to the published work around [chafa](https://hpjansson.org/chafa/), [libcaca](http://caca.zoy.org/wiki/libcaca), jp2a, and the braille-art community. All classic dithering algorithms are due to their original authors (Floyd & Steinberg, Bill Atkinson, Bayer, Ulichney, et al.).
+Inspired by the excellent [ditther.com](https://www.ditther.com/) and [ascii-magic.com](https://www.ascii-magic.com/); the generative scenes are original implementations inspired by the techniques in [Paper Shaders](https://github.com/paper-design/shaders) (Apache-2.0, by the [paper.design](https://paper.design/) team) — this is an independent, from-scratch implementation of the genre they popularized. The ASCII engine owes its techniques to the published work around [chafa](https://hpjansson.org/chafa/), [libcaca](http://caca.zoy.org/wiki/libcaca), jp2a, and the braille-art community. All classic dithering algorithms are due to their original authors (Floyd & Steinberg, Bill Atkinson, Bayer, Ulichney, et al.).

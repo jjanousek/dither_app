@@ -6,6 +6,7 @@ import { MODES } from './state.js';
 import { ALGORITHMS, getAlgorithm } from './engine/engine.js';
 import { PALETTES, getPalette } from './palettes.js';
 import { RAMPS, FONTS } from './engine/ascii.js';
+import { GEN_SCENES } from './generate.js';
 
 // ---------- tiny component helpers ----------
 
@@ -127,11 +128,44 @@ const pct = (v) => `${Math.round(v * 100)}%`;
 
 // ---------- panel ----------
 
-export function buildPanel({ state, mount, onChange, exportSettings }) {
+export function buildPanel({ state, mount, onChange, exportSettings, gen = null, onGenChange = null }) {
   mount.innerHTML = '';
-  const refresh = () => buildPanel({ state, mount, onChange, exportSettings });
+  const refresh = () => buildPanel({ state, mount, onChange, exportSettings, gen, onGenChange });
   const change = () => onChange();
   const changeAndRefresh = () => { onChange(); refresh(); };
+
+  // --- SCENE (generated sources only) ---
+  if (gen) {
+    const sc = section(mount, 'Scene');
+    select(sc, 'Scene', {
+      options: GEN_SCENES.map((s) => ({ value: s.id, label: s.name })),
+      value: gen.params.scene,
+      oninput: (v) => { gen.setScene(v, { randomizeSeed: false }); onGenChange?.(); refresh(); },
+    });
+    gen.params.colors.forEach((cHex, i) => {
+      color(sc, `Color ${i + 1}`, {
+        value: cHex,
+        oninput: (v) => { gen.params.colors[i] = v; onGenChange?.(); },
+      });
+    });
+    slider(sc, 'Zoom', {
+      min: 0.4, max: 3, step: 0.05, value: gen.params.scale,
+      fmt: (v) => `${v.toFixed(2)}×`,
+      oninput: (v) => { gen.params.scale = v; onGenChange?.(); },
+    });
+    slider(sc, 'Speed', {
+      min: 0.25, max: 3, step: 0.05, value: gen.params.speed,
+      fmt: (v) => `${v.toFixed(2)}×`,
+      oninput: (v) => { gen.params.speed = v; onGenChange?.(); },
+    });
+    const seedRow = row(sc, null);
+    const seedBtn = document.createElement('button');
+    seedBtn.className = 'btn';
+    seedBtn.style.flex = '1';
+    seedBtn.textContent = 'New seed';
+    seedBtn.onclick = () => { gen.params.seed = Math.random(); onGenChange?.(); };
+    seedRow.appendChild(seedBtn);
+  }
 
   // --- EFFECT ---
   const eff = section(mount, 'Effect');
