@@ -21,7 +21,8 @@ done
 iconutil -c icns "$ICONSET" -o "$TMP/Ditherlab.icns"
 
 echo "→ compile"
-sed "s|__PROJECT_DIR__|$PROJECT_DIR|" main.swift > "$TMP/main.swift"
+# literal substitution (sed would corrupt paths containing & or |)
+python3 -c 'import sys; print(open(sys.argv[1]).read().replace("__PROJECT_DIR__", sys.argv[2]), end="")' main.swift "$PROJECT_DIR" > "$TMP/main.swift"
 mkdir -p "$TMP/Ditherlab.app/Contents/MacOS" "$TMP/Ditherlab.app/Contents/Resources"
 swiftc -O -swift-version 5 -o "$TMP/Ditherlab.app/Contents/MacOS/Ditherlab" "$TMP/main.swift"
 
@@ -40,7 +41,7 @@ cat > "$TMP/Ditherlab.app/Contents/Info.plist" <<PLIST
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>1.0.0</string>
 	<key>CFBundleVersion</key><string>1</string>
-	<key>LSMinimumSystemVersion</key><string>12.0</string>
+	<key>LSMinimumSystemVersion</key><string>13.5</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Ditherlab uses the camera for the webcam source.</string>

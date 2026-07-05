@@ -11,14 +11,29 @@ import Cocoa
 import WebKit
 
 let projectDir = "__PROJECT_DIR__"
-let appURL = URL(string: "http://127.0.0.1:8173/")!
+// Port is dynamic: 8173 is preferred, 8271 is the fallback when a foreign
+// (non-Ditherlab) process already owns 8173. Set once by startServerIfNeeded
+// before pollAndLoad runs.
+var appPort = 8173
+var appURL = URL(string: "http://127.0.0.1:8173/")!
 let testMode = ProcessInfo.processInfo.environment["DL_TEST_DOWNLOAD"] == "1"
+
+/// Thread-safe Process holder: the spawn happens on a background queue, so a
+/// plain stored property could be missed by a fast Cmd-Q (applicationWillTerminate).
+final class ProcessHolder {
+    private let lock = NSLock()
+    private var process: Process?
+    var value: Process? {
+        get { lock.lock(); defer { lock.unlock() }; return process }
+        set { lock.lock(); defer { lock.unlock() }; process = newValue }
+    }
+}
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var webView: WKWebView!
-    var serverProcess: Process?
-    var loadDeadline = Date().addingTimeInterval(8)
+    let serverProcess = ProcessHolder()
+    var loadDeadline = Date().addingTimeInterval(25) // cold python3 launches can take a while
     var lastDownload: URL?
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -46,13 +61,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
-        startServerIfNeeded()
-        pollAndLoad()
+        startServerIfNeeded() // calls pollAndLoad once the port is chosen
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ note: Notification) { serverProcess?.terminate() }
+    func applicationWillTerminate(_ note: Notification) { serverProcess.value?.terminate() }
 
     // MARK: server
 
@@ -70,30 +84,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return ok
     }
 
+    enum PortProbe {
+        case ditherlab // a Ditherlab server already answers here — reuse it
+        case foreign   // something else owns the port — do not spawn on it
+        case free      // nothing answered — safe to spawn here
+    }
+
+    func probe(port: Int) -> PortProbe {
+        var result = PortProbe.free
+        let sem = DispatchSemaphore(value: 0)
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/")!, timeoutInterval: 0.6)
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: req) { data, response, _ in
+            if let d = data, let s = String(data: d, encoding: .utf8),
+               s.lowercased().contains("ditherlab") {
+                result = .ditherlab
+            } else if data != nil || response != nil {
+                result = .foreign
+            }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 1.0)
+        return result
+    }
+
+    func usePort(_ port: Int) {
+        appPort = port
+        appURL = URL(string: "http://127.0.0.1:\(port)/")!
+    }
+
     func startServerIfNeeded() {
         DispatchQueue.global().async {
-            if self.serverResponds() { return } // reuse an existing Ditherlab server
+            defer { DispatchQueue.main.async { self.pollAndLoad() } }
+
+            var spawnPort: Int?
+            scan: for port in [8173, 8271] {
+                switch self.probe(port: port) {
+                case .ditherlab:
+                    self.usePort(port) // reuse the existing Ditherlab server
+                    return
+                case .foreign:
+                    continue // occupied by another program, try the next port
+                case .free:
+                    spawnPort = port
+                    break scan
+                }
+            }
+            guard let port = spawnPort else { return } // both ports foreign → deadline alert
+
+            self.usePort(port)
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            p.arguments = ["python3", "scripts/serve.py", "8173"]
+            p.arguments = ["python3", "scripts/serve.py", String(port),
+                           "--parent", String(ProcessInfo.processInfo.processIdentifier)]
             p.currentDirectoryURL = URL(fileURLWithPath: projectDir)
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
             do {
                 try p.run()
-                DispatchQueue.main.async { self.serverProcess = p }
+                // assign synchronously so a fast Cmd-Q always sees the process
+                self.serverProcess.value = p
             } catch { /* handled by the load deadline alert */ }
         }
     }
 
     func pollAndLoad() {
         DispatchQueue.global().async {
-            let ok = self.serverResponds()
+            var ok = self.serverResponds()
+            let expired = Date() > self.loadDeadline
+            if !ok && expired { ok = self.serverResponds() } // final re-check before the fatal alert
             DispatchQueue.main.async {
                 if ok {
                     self.webView.load(URLRequest(url: appURL))
                     self.scheduleTestHook()
-                } else if Date() > self.loadDeadline {
+                } else if expired {
                     self.showStartupError()
                 } else {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.pollAndLoad() }
@@ -108,7 +172,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = """
         Check that python3 is installed (run “xcode-select --install” in \
         Terminal), that the Ditherlab folder still exists at \
-        \(projectDir), and that port 8173 is not used by another program.
+        \(projectDir), and that ports 8173 and 8271 are not both used by \
+        other programs (tried http://127.0.0.1:\(appPort)/).
         """
         alert.alertStyle = .critical
         alert.runModal()
@@ -133,14 +198,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         main.addItem(appItem)
 
         let editMenu = NSMenu(title: "Edit")
-        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
-        let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
-        redo.keyEquivalentModifierMask = [.command, .shift]
-        editMenu.addItem(redo)
+        // No Undo/Redo items: they would swallow Cmd+Z before the page's own
+        // keydown handler, which implements app-level undo in JS.
         editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        // Paste goes through the app delegate so images on the pasteboard can
+        // be bridged into the page (WKWebView never fires JS 'paste' for them).
+        let paste = NSMenuItem(title: "Paste", action: #selector(pasteSmart(_:)), keyEquivalent: "v")
+        paste.keyEquivalentModifierMask = [.command]
+        paste.target = self
+        editMenu.addItem(paste)
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         let editItem = NSMenuItem()
         editItem.submenu = editMenu
@@ -167,6 +235,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func reloadPage() { webView.reload() }
+
+    // Cmd-V: if the pasteboard holds an image, hand it to the page as a data
+    // URL (window.__dlNativePaste, a guarded no-op until the JS side exists);
+    // otherwise forward a normal paste so text fields keep working.
+    @objc func pasteSmart(_ sender: Any?) {
+        let pb = NSPasteboard.general
+        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage],
+           let image = images.first,
+           let tiff = image.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            let b64 = png.base64EncodedString()
+            webView.evaluateJavaScript(
+                "window.__dlNativePaste && window.__dlNativePaste('data:image/png;base64,\(b64)')")
+            return
+        }
+        let pasteSel = NSSelectorFromString("paste:")
+        if webView.responds(to: pasteSel) {
+            webView.perform(pasteSel, with: nil)
+        }
+    }
 
     // MARK: automated export test (DL_TEST_DOWNLOAD=1)
 

@@ -67,7 +67,7 @@ function lzwEncode(indices, minCodeSize, out) {
       dict.set(key, nextCode);
       if (nextCode === (1 << codeSize) && codeSize < 12) codeSize++;
       nextCode++;
-      if (nextCode >= 4095) {
+      if (nextCode >= 4096) {
         emit(clearCode);
         dict = new Map();
         nextCode = eoiCode + 1;
@@ -180,7 +180,8 @@ export class GifEncoder {
     this.frames.push(idx);
   }
 
-  finish() {
+  // abortFn (optional): checked between frames; throwing 'cancelled' aborts.
+  async finish(abortFn) {
     // Bucket averages -> candidate colors
     const colors = this.sums.map((s) => [
       Math.round(s[0] / s[3]),
@@ -225,6 +226,8 @@ export class GifEncoder {
     // (fixed round(100/fps) drifts ~4% at 12fps).
     let accCs = 0;
     for (let f = 0; f < this.frames.length; f++) {
+      if (abortFn && abortFn()) throw new Error('cancelled');
+      if (f > 0 && f % 4 === 0) await new Promise((r) => setTimeout(r, 0)); // keep the UI alive
       const target = Math.round(((f + 1) * 100) / this.fps);
       const delay = Math.max(2, target - accCs);
       accCs += delay;

@@ -41,6 +41,13 @@ grainTile.height = GRAIN_SIZE;
 let grainPattern = null;        // CanvasPattern, created lazily once
 let grainPatternK = -1;         // resolution factor baked into its transform
 
+// CanvasPattern.setTransform is missing on WebKit < 15.4 (N32). Detect ONCE
+// at module scope; when unsupported we draw the grain tile unscaled instead
+// of throwing every frame.
+const PATTERN_TRANSFORM_OK =
+    typeof CanvasPattern !== 'undefined' &&
+    'setTransform' in CanvasPattern.prototype;
+
 // Scanline tile cache (rebuilt only when line spacing changes)
 let scanTile = null;
 let scanPattern = null;
@@ -115,21 +122,46 @@ function drawGlow(w, h, glow, k) {
     outCtx.globalCompositeOperation = 'source-over';
 }
 
-function drawGrain(w, h, grain, k) {
+function drawGrain(w, h, grain, k, grainPhase) {
     if (!grainPattern) grainPattern = outCtx.createPattern(grainTile, 'repeat');
-    if (grainPatternK !== k) {
-        // Scale the noise tile so speckle size stays constant relative to the
-        // image. DOMMatrix allocation only happens when k changes (resize).
-        grainPattern.setTransform(new DOMMatrix().scale(k));
-        grainPatternK = k;
+    // Effective tile scale actually applied to the pattern. On WebKit < 15.4
+    // (no CanvasPattern.setTransform, N32) the tile stays unscaled, so
+    // offsets must align to the UNSCALED tile period instead of k.
+    let tileK = 1;
+    if (PATTERN_TRANSFORM_OK) {
+        if (grainPatternK !== k) {
+            // Scale the noise tile so speckle size stays constant relative to
+            // the image. DOMMatrix allocation only happens when k changes
+            // (resize).
+            grainPattern.setTransform(new DOMMatrix().scale(k));
+            grainPatternK = k;
+        }
+        tileK = k;
     }
-    // Offset scaled by k so it stays aligned with the scaled tile period.
-    const off = ((frameCounter * 7919) % GRAIN_SIZE) * k;
+    // Offsets scaled by the applied tile scale so they stay aligned with the
+    // tile period.
+    let offX;
+    let offY;
+    if (grainPhase !== null) {
+        // Pure function of phase (N34: same phase -> identical grain). The
+        // modulo makes phase 1.0 land on the same offset as phase 0.0 so a
+        // baked GIF loop is seamless (N33), while intermediate phases still
+        // animate the grain over the cycle.
+        const step = ((Math.round(grainPhase * GRAIN_SIZE) % GRAIN_SIZE) +
+            GRAIN_SIZE) % GRAIN_SIZE;
+        offX = step * tileK;
+        offY = ((step * 71) % GRAIN_SIZE) * tileK; // decorrelated, wraps too
+    } else {
+        // Legacy: internal frame counter drives the animation (live video).
+        const off = ((frameCounter * 7919) % GRAIN_SIZE) * tileK;
+        offX = off;
+        offY = off;
+    }
     outCtx.globalCompositeOperation = 'overlay';
     outCtx.globalAlpha = Math.min(1, grain * 0.55);
-    outCtx.translate(-off, -off);
+    outCtx.translate(-offX, -offY);
     outCtx.fillStyle = grainPattern;
-    outCtx.fillRect(0, 0, w + off, h + off);
+    outCtx.fillRect(0, 0, w + offX, h + offY);
     outCtx.setTransform(1, 0, 0, 1, 0, 0);
     outCtx.globalAlpha = 1;
     outCtx.globalCompositeOperation = 'source-over';
@@ -192,11 +224,21 @@ function drawVignette(w, h, vignette) {
  * @param {{vignette?:number, scanlines?:number, grain?:number,
  *          chromatic?:number, glow?:number}} fx
  *   vignette 0..1, scanlines 0..1, grain 0..1, chromatic 0..20 (px at
- *   1080p-height reference; scaled with output height), glow 0..1
+ *   1080p-height reference; scaled with the resolution factor), glow 0..1
+ * @param {{grainPhase?:(number|null), refH?:(number|null)}} [opts]
+ *   grainPhase: 0..1 position in the grain animation cycle. When provided,
+ *     the grain offset is a pure function of it — identical phase produces
+ *     identical grain (deterministic re-exports, N34) and phase 1.0 wraps to
+ *     the same offset as 0.0 (seamless baked GIF loops, N33). When
+ *     null/undefined, the legacy internal frame counter animates the grain.
+ *   refH: reference height for the resolution factor
+ *     k = max(0.25, refH/1080), so preview and export can share the same k
+ *     and post-FX intensity matches between them (N36). When null/undefined,
+ *     the output canvas height is used (legacy behavior).
  * @returns {HTMLCanvasElement} srcCanvas untouched when all values are
  *   0/falsy, otherwise a module-level reusable output canvas
  */
-export function applyPostFX(srcCanvas, fx) {
+export function applyPostFX(srcCanvas, fx, opts = {}) {
     if (!fx) return srcCanvas;
 
     const vignette = +fx.vignette || 0;
@@ -223,9 +265,18 @@ export function applyPostFX(srcCanvas, fx) {
     // Resolution factor: chromatic shift, glow blur, and grain speckle are
     // sized relative to a 1080p-height reference so preview and full-size
     // export look the same. Clamped so tiny previews don't zero effects out.
-    const k = Math.max(0.25, h / 1080);
+    // opts.refH lets preview and export share one reference height (N36);
+    // otherwise the output canvas height is used, as before.
+    const refH = (opts && typeof opts.refH === 'number' &&
+        isFinite(opts.refH) && opts.refH > 0) ? opts.refH : h;
+    const k = Math.max(0.25, refH / 1080);
 
-    frameCounter++;
+    // Phase-driven grain (exports) vs legacy counter-driven grain (live).
+    // The counter only advances on legacy calls so a phase-driven export in
+    // between never perturbs it.
+    const grainPhase = (opts && typeof opts.grainPhase === 'number' &&
+        isFinite(opts.grainPhase)) ? opts.grainPhase : null;
+    if (grainPhase === null) frameCounter++;
 
     // Defensive state reset (canvas resize also resets, but cheap either way)
     outCtx.setTransform(1, 0, 0, 1, 0, 0);
@@ -246,7 +297,7 @@ export function applyPostFX(srcCanvas, fx) {
 
     // 2) Glow, 3) grain, 4) scanlines, 5) vignette.
     if (glow > 0) drawGlow(w, h, glow, k);
-    if (grain > 0) drawGrain(w, h, grain, k);
+    if (grain > 0) drawGrain(w, h, grain, k, grainPhase);
     if (scanlines > 0) drawScanlines(w, h, scanlines);
     if (vignette > 0) drawVignette(w, h, vignette);
 

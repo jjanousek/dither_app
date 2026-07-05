@@ -137,6 +137,14 @@ function renderDots(ctx, grid, o) {
 // LEGO — rounded brick with vertical shading gradient + center stud
 // ---------------------------------------------------------------------------
 
+// Cached unit vertical gradients for the brick body, keyed by 15-bit
+// quantized RGB (5 bits/channel — within ±4 of the exact color, invisible on
+// a shading gradient). Each entry is a createLinearGradient(0,0,0,1) with the
+// base color at 0 and the 20%-darker shade at 1; position/scale come from the
+// canvas transform, so the fill matches the old per-cell gradient. Bounded:
+// cleared if it ever grows past 4096 (15-bit key caps it at ~32k anyway).
+const legoBodyCache = new Map();
+
 function renderLego(ctx, grid, o) {
   const { cols, rows, data } = grid;
   const cell = o.cell;
@@ -153,6 +161,14 @@ function renderLego(ctx, grid, o) {
   const studR = cell * 0.22;
   const rimW = Math.max(0.6, studR * 0.15);
   const drawSpec = cell >= 10;
+
+  // Unit-space geometry: each brick is drawn in a (0..1)² space mapped onto
+  // the tile via setTransform. The scale is uniform (tile × tile), so arcs
+  // stay circular and line widths scale exactly — output is pixel-equivalent
+  // to drawing in canvas space, but the body gradient can be cached.
+  const rxU = rx / tile;
+  const studRU = studR / tile;
+  const rimWU = rimW / tile;
 
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
@@ -176,36 +192,48 @@ function renderLego(ctx, grid, o) {
       // Duotone: paper hue fixed, luminance drives opacity.
       ctx.globalAlpha = duo ? 0.3 + 0.7 * L : 1;
 
+      // Map the unit square onto this brick; everything below draws in unit
+      // space, so the cached unit gradient lands exactly where the old
+      // per-cell createLinearGradient(dx, dy, dx, dy + tile) did.
+      ctx.setTransform(tile, 0, 0, tile, dx, dy);
+
       // Brick body: vertical gradient from base color to 20% darker.
-      const body = ctx.createLinearGradient(dx, dy, dx, dy + tile);
-      body.addColorStop(0, `rgb(${r},${g},${b})`);
-      body.addColorStop(1, `rgb(${Math.round(r * 0.8)},${Math.round(g * 0.8)},${Math.round(b * 0.8)})`);
-      rrect(ctx, dx, dy, tile, tile, rx);
+      const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+      let body = legoBodyCache.get(key);
+      if (!body) {
+        if (legoBodyCache.size > 4096) legoBodyCache.clear();
+        body = ctx.createLinearGradient(0, 0, 0, 1);
+        body.addColorStop(0, `rgb(${r},${g},${b})`);
+        body.addColorStop(1, `rgb(${Math.round(r * 0.8)},${Math.round(g * 0.8)},${Math.round(b * 0.8)})`);
+        legoBodyCache.set(key, body);
+      }
+      rrect(ctx, 0, 0, 1, 1, rxU);
       ctx.fillStyle = body;
       ctx.fill();
 
       // Stud: 15% brighter than the brick.
       ctx.beginPath();
-      ctx.arc(cx, cy, studR, 0, TAU);
+      ctx.arc(0.5, 0.5, studRU, 0, TAU);
       ctx.fillStyle = `rgb(${lighten(r, 0.15)},${lighten(g, 0.15)},${lighten(b, 0.15)})`;
       ctx.fill();
 
       // Subtle darker rim around the stud.
       ctx.beginPath();
-      ctx.arc(cx, cy, studR * 0.9, 0, TAU);
+      ctx.arc(0.5, 0.5, studRU * 0.9, 0, TAU);
       ctx.strokeStyle = 'rgba(0,0,0,0.22)';
-      ctx.lineWidth = rimW;
+      ctx.lineWidth = rimWU;
       ctx.stroke();
 
       // Tiny specular glint on larger cells.
       if (drawSpec) {
         ctx.beginPath();
-        ctx.arc(cx - studR * 0.3, cy - studR * 0.3, studR * 0.2, 0, TAU);
+        ctx.arc(0.5 - studRU * 0.3, 0.5 - studRU * 0.3, studRU * 0.2, 0, TAU);
         ctx.fillStyle = 'rgba(255,255,255,0.35)';
         ctx.fill();
       }
     }
   }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalAlpha = 1;
 }
 
@@ -229,15 +257,25 @@ function renderVoxel(ctx, grid, o) {
   const hh = th * 0.5;
   const maxH = cell * (0.15 + 1.1);
 
+  // Scatter jitter moves cubes past the ideal grid extents: ±amp in x and
+  // ±amp*0.3 in y (see the render loop — the y amplitude is capped there so
+  // painter's order holds; reserve space for it here, don't change it there).
+  // Add a small margin on top since face strokes overhang the geometry.
+  const jitX = amp + 2;
+  const jitY = amp * 0.3 + 2;
+
   // Projected content extents (before offset): a cube's base center sits at
   // y = row*th (+ th/2 stagger for odd cols); its top vertex reaches
-  // base - blockH - th and its bottom is the base itself.
-  const minY = -maxH - th;
-  const maxY = (rows - 1) * th + hh;
-  const offY = (o.height - (maxY - minY)) * 0.5 - minY;
+  // base - blockH - th and its bottom is the base itself, ±jitY around both.
+  const minY = -maxH - th - jitY;
+  const maxY = (rows - 1) * th + hh + jitY;
+  const offY = Math.max(0, (o.height - (maxY - minY)) * 0.5 - minY);
+  // Leftmost geometry is col 0's left face vertex at x = -jitter; shift right
+  // so jittered cubes stay on-canvas.
+  const offX = Math.max(0, jitX);
 
   ctx.save();
-  ctx.translate(0, offY);
+  ctx.translate(offX, offY);
   ctx.lineJoin = 'round';
 
   // Back-to-front: rows top-down; within a row draw even columns first, then
@@ -327,7 +365,8 @@ function renderVoxel(ctx, grid, o) {
 // LED — bloom pass + rounded pixel pass + dark grid gap lines
 // ---------------------------------------------------------------------------
 
-// Cached unit radial gradients for the LED bloom pass, keyed by packed RGB.
+// Cached unit radial gradients for the LED bloom pass, keyed by 15-bit
+// quantized RGB (5 bits/channel) so nearby colors share an entry across frames.
 // One gradient per color; position/scale come from the canvas transform and
 // per-cell luminance is applied via globalAlpha, so output is identical to
 // building a gradient per cell. Bounded: cleared if it ever grows past 4096.
@@ -344,6 +383,8 @@ function renderLED(ctx, grid, o) {
   paintBg(ctx, o);
 
   // ── Pass 1: bloom for bright cells ──
+  // Additive blending so overlapping halos accumulate like real light.
+  ctx.globalCompositeOperation = 'lighter';
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
       const i = (row * cols + col) * 4;
@@ -363,9 +404,11 @@ function renderLED(ctx, grid, o) {
 
       const bloomR = cell * (0.8 + L * 1.4);
 
-      // Key on the actual color drawn (duotone uses parsed o.paper RGB, which
-      // can change between frames — the packed value covers both modes).
-      const key = (r << 16) | (g << 8) | b;
+      // Key on the quantized color drawn (duotone uses parsed o.paper RGB —
+      // the packed value covers both modes). 5 bits/channel: ±4 per channel
+      // is invisible on a soft radial glow, and the cache hits across frames
+      // instead of missing on every slightly-different sampled color.
+      const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
       let glow = glowCache.get(key);
       if (!glow) {
         if (glowCache.size > 4096) glowCache.clear();
@@ -387,6 +430,7 @@ function renderLED(ctx, grid, o) {
     }
   }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
 
   // ── Pass 2: rounded pixels ──

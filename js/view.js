@@ -20,6 +20,7 @@ export class Viewport {
     this.ty = 0;
     this.fitMode = true;
     this._lastW = 0;
+    this._lastH = 0;
 
     this.splitOn = false;
     this.splitFrac = 0.5;
@@ -41,7 +42,7 @@ export class Viewport {
     const cw = this.output.width;
     const ch = this.output.height;
     if (vw <= 0 || vh <= 0 || !cw || !ch) return;
-    this.zoom = Math.min(vw / cw, vh / ch);
+    this.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(vw / cw, vh / ch)));
     this.tx = (this.el.clientWidth - cw * this.zoom) / 2;
     this.ty = (this.el.clientHeight - ch * this.zoom) / 2;
     this.fitMode = true;
@@ -73,18 +74,21 @@ export class Viewport {
   // Call whenever the output canvas bitmap size changes.
   contentResized() {
     const w = this.output.width;
+    const h = this.output.height;
     if (this.fitMode) {
       this.fit();
-    } else if (this._lastW && w && w !== this._lastW) {
+    } else if (this._lastW && this._lastH && w && h && (w !== this._lastW || h !== this._lastH)) {
       // same content at a different bitmap resolution (compare-hold, post-FX
-      // upscale, mode switch): compensate so the on-screen size doesn't jump
-      const r = this._lastW / w;
-      this.zoom = Math.min(MAX_ZOOM * 8, Math.max(MIN_ZOOM / 8, this.zoom * r));
+      // upscale, mode switch): compensate so the on-screen size doesn't jump.
+      // Geometric mean keeps both axes stable when the aspect drifts slightly.
+      const r = Math.sqrt((this._lastW * this._lastH) / (w * h));
+      this.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this.zoom * r));
       this.apply();
     } else {
       this.#positionDivider();
     }
     this._lastW = w;
+    this._lastH = h;
   }
 
   // ---- split ---------------------------------------------------------------
@@ -114,7 +118,12 @@ export class Viewport {
       if (e.ctrlKey || e.metaKey) {
         // pinch-zoom gesture (trackpads report it as ctrl+wheel)
         this.#zoomTo(this.zoom * Math.exp(-e.deltaY * 0.01), cx, cy);
-      } else {
+      } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        // horizontal-dominant scroll pans instead of zooming in
+        this.tx -= e.deltaX;
+        this.fitMode = false;
+        this.apply();
+      } else if (e.deltaY !== 0) {
         this.#zoomTo(this.zoom * (e.deltaY > 0 ? 1 / 1.13 : 1.13), cx, cy);
       }
     }, { passive: false });
@@ -125,12 +134,12 @@ export class Viewport {
       if (e.button !== 0) return;
       if (e.target.closest('#zoom-controls, #split-divider, #busy')) return;
       e.preventDefault(); // stop WebKit from starting a text-selection drag
-      panning = { x: e.clientX, y: e.clientY, tx: this.tx, ty: this.ty };
+      panning = { id: e.pointerId, x: e.clientX, y: e.clientY, tx: this.tx, ty: this.ty };
       el.classList.add('panning');
       el.setPointerCapture(e.pointerId);
     });
     el.addEventListener('pointermove', (e) => {
-      if (!panning) return;
+      if (!panning || e.pointerId !== panning.id) return;
       e.preventDefault();
       this.tx = panning.tx + (e.clientX - panning.x);
       this.ty = panning.ty + (e.clientY - panning.y);
@@ -147,7 +156,7 @@ export class Viewport {
     el.addEventListener('pointercancel', endPan);
 
     el.addEventListener('dblclick', (e) => {
-      if (e.target.closest('#zoom-controls, #split-divider')) return;
+      if (e.target.closest('#zoom-controls, #split-divider, #busy')) return;
       if (this.fitMode) this.actualSize();
       else this.fit();
     });
@@ -184,6 +193,16 @@ export class Viewport {
     window.addEventListener('resize', () => {
       if (this.fitMode) this.fit();
       else this.#positionDivider();
+    });
+
+    // lost focus mid-drag: never leave a drag armed
+    const cancelDrags = () => {
+      if (panning) { panning = null; el.classList.remove('panning'); }
+      splitDrag = false;
+    };
+    window.addEventListener('blur', cancelDrags);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') cancelDrags();
     });
   }
 }

@@ -69,7 +69,7 @@ export const DIFFUSION_KERNELS = {
 
 // ---------------------------------------------------------------------------
 // Adjustments (must mirror the GLSL math in shaders.js exactly)
-// order: brightness/contrast -> gamma -> saturation -> invert
+// order: saturation (clamped) -> brightness/contrast -> gamma -> invert
 // ---------------------------------------------------------------------------
 export function applyAdjustments(imageData, p) {
   const d = imageData.data;
@@ -95,15 +95,21 @@ export function applyAdjustments(imageData, p) {
       d[i + 2] = lut[d[i + 2]];
     }
   } else {
+    // float-space curve so saturated pixels match the GPU path exactly
+    const curve = (v) => {
+      v = Math.min(1, Math.max(0, v / 255));
+      v = (v - 0.5) * cf + 0.5 + brightness;
+      v = Math.min(1, Math.max(0, v));
+      v = Math.pow(v, ig);
+      if (invert) v = 1 - v;
+      return v * 255;
+    };
     for (let i = 0; i < d.length; i += 4) {
-      let r = d[i], g = d[i + 1], b = d[i + 2];
+      const r = d[i], g = d[i + 1], b = d[i + 2];
       const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-      r = l + (r - l) * saturation;
-      g = l + (g - l) * saturation;
-      b = l + (b - l) * saturation;
-      d[i] = lut[Math.min(255, Math.max(0, Math.round(r)))];
-      d[i + 1] = lut[Math.min(255, Math.max(0, Math.round(g)))];
-      d[i + 2] = lut[Math.min(255, Math.max(0, Math.round(b)))];
+      d[i] = curve(l + (r - l) * saturation);
+      d[i + 1] = curve(l + (g - l) * saturation);
+      d[i + 2] = curve(l + (b - l) * saturation);
     }
   }
 }
@@ -200,8 +206,8 @@ export function orderedDither(imageData, palette, matrix, { strength = 1, bias =
   const { size, data: m } = matrix;
   // Spread scaled by palette density: fewer colors need a larger spread.
   const spread = (255 * strength) / Math.max(1, n - 1) * 1.5;
-  const ox = ((Math.round(offsetX) % size) + size) % size;
-  const oy = ((Math.round(offsetY) % size) + size) % size;
+  const ox = ((Math.floor(offsetX) % size) + size) % size;
+  const oy = ((Math.floor(offsetY) % size) + size) % size;
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -290,3 +296,73 @@ export const MATRICES = {
   cluster4: { size: 4, data: new Float32Array(CLUSTER4.map((v) => (v + 0.5) / 16)) },
   cluster8: { size: 8, data: new Float32Array(CLUSTER8.map((v) => (v + 0.5) / 64)) },
 };
+
+// ---------------------------------------------------------------------------
+// CPU fallbacks for the GPU-only modes (used when WebGL is unavailable).
+// Math mirrors shaders.js so the output matches the GPU path.
+// ---------------------------------------------------------------------------
+
+function hash12(x, y) {
+  // same hash as the shader (approximately; used only in the no-WebGL path)
+  const fract = (v) => v - Math.floor(v);
+  let p3x = fract(x * 0.1031);
+  let p3y = fract(y * 0.1031);
+  let p3z = fract(x * 0.1031);
+  const dt = p3x * (p3y + 33.33) + p3y * (p3z + 33.33) + p3z * (p3x + 33.33);
+  p3x += dt; p3y += dt; p3z += dt;
+  return fract((p3x + p3y) * p3z);
+}
+
+export function whiteNoiseDither(imageData, palette, { strength = 1, bias = 0 } = {}) {
+  const { width: w, height: h, data: d } = imageData;
+  const n = palette.length / 3;
+  const spread = (255 * strength) / Math.max(1, n - 1) * 1.5;
+  const cl = (v) => Math.min(255, Math.max(0, v));
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const t = hash12(x, y) - 0.5 + bias;
+      const pi = nearestIndex(palette, n, cl(d[i] + t * spread), cl(d[i + 1] + t * spread), cl(d[i + 2] + t * spread));
+      d[i] = palette[pi];
+      d[i + 1] = palette[pi + 1];
+      d[i + 2] = palette[pi + 2];
+    }
+  }
+}
+
+export function halftoneDither(imageData, palette, { scale = 6, angle = 45, bias = 0, line = false } = {}) {
+  const { width: w, height: h, data: d } = imageData;
+  const n = palette.length / 3;
+  // darkest / brightest palette entries (same as paletteExtremes in the shader)
+  let dark = 0, bright = 0, dMin = Infinity, dMax = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const l = 0.2126 * palette[i * 3] + 0.7152 * palette[i * 3 + 1] + 0.0722 * palette[i * 3 + 2];
+    if (l < dMin) { dMin = l; dark = i * 3; }
+    if (l > dMax) { dMax = l; bright = i * 3; }
+  }
+  const rad = (angle * Math.PI) / 180;
+  const ca = Math.cos(rad), sa = Math.sin(rad);
+  const s = Math.max(scale, 1.5);
+  const fract = (v) => v - Math.floor(v);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const lum = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+      const l = Math.min(1, Math.max(0, lum + bias));
+      const px = ca * x - sa * y;
+      const py = sa * x + ca * y;
+      let on;
+      if (line) {
+        on = Math.abs(fract(py / s) - 0.5) * 2 <= (1 - l);
+      } else {
+        const cx = fract(px / s) - 0.5;
+        const cy = fract(py / s) - 0.5;
+        on = Math.hypot(cx, cy) <= Math.sqrt(1 - l) * 0.75;
+      }
+      const pi = on ? dark : bright;
+      d[i] = palette[pi];
+      d[i + 1] = palette[pi + 1];
+      d[i + 2] = palette[pi + 2];
+    }
+  }
+}

@@ -88,6 +88,12 @@ export class AsciiRenderer {
     this._rampCache = new Map();
   }
 
+  // Drop cached glyph metrics/atlases (fonts loaded, etc.).
+  clearCaches() {
+    this._atlasCache.clear();
+    this._rampCache.clear();
+  }
+
   // Widest advance of the glyphs, so the sample grid matches the glyph grid.
   measure(font, cellH, chars = 'M') {
     this.ctx.font = fontString(font, cellH);
@@ -720,7 +726,7 @@ export class AsciiRenderer {
     const dots = this.#ditherBits(lum, W, H, dotThreshold, dither);
 
     const cellH = cellSize;
-    const cellW = this.measure(font, cellH, '⣿');
+    const cellW = this.measure(font, cellH, '⣿⠀⠿'); // blank + full: detect mixed advances
     const ctx = this.#beginDraw(cols, rows, cellW, cellH, font, bg);
     const fgInt = hexToInt(fg);
 
@@ -776,7 +782,14 @@ export class AsciiRenderer {
       grid.push(grow);
       if (colorMode === 'mono') {
         ctx.fillStyle = fg;
-        ctx.fillText(line, 0, cy * cellH);
+        if (this.lastUniform) {
+          ctx.fillText(line, 0, cy * cellH);
+        } else {
+          // mixed braille advances (font fallback): draw per cell to keep columns
+          for (let cx2 = 0; cx2 < line.length; cx2++) {
+            ctx.fillText(line[cx2], cx2 * cellW, cy * cellH);
+          }
+        }
       }
     }
     return this.#finish(lines, grid);
@@ -788,7 +801,10 @@ export class AsciiRenderer {
 // ---------------------------------------------------------------------------
 
 function hexToInt(hex) {
-  return parseInt(hex.replace('#', ''), 16) & 0xffffff;
+  let h = String(hex).replace('#', '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  const v = parseInt(h, 16);
+  return Number.isFinite(v) ? v & 0xffffff : 0;
 }
 
 function rgbInt(r, g, b) {
@@ -809,9 +825,19 @@ function cellMean(px, _unused, _o) {
   return rgbInt(r / 64, g / 64, b / 64);
 }
 
-// insertion into the fixed-size candidate list (ascending Hamming distance)
+// insertion into the fixed-size candidate list (ascending Hamming distance).
+// A glyph may only occupy one slot: the better of its normal/inverted match.
 function insertCand(idx, ham, inv, g, hd, isInv) {
   const K = idx.length;
+  for (let k = 0; k < K; k++) {
+    if (ham[k] <= 64 && idx[k] === g) {
+      if (hd >= ham[k]) return; // existing entry is at least as good
+      // remove the worse duplicate, then fall through to insert
+      for (let m = k; m < K - 1; m++) { ham[m] = ham[m + 1]; idx[m] = idx[m + 1]; inv[m] = inv[m + 1]; }
+      ham[K - 1] = 65;
+      break;
+    }
+  }
   if (hd >= ham[K - 1]) return;
   let i = K - 1;
   while (i > 0 && ham[i - 1] > hd) {

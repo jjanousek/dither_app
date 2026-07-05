@@ -51,6 +51,15 @@ export async function openWebcam() {
   video.playsInline = true;
   video.srcObject = stream;
   await video.play();
+  // videoWidth can still be 0 right after play() — wait for metadata
+  if (!video.videoWidth) {
+    await new Promise((resolve) => {
+      let t = null;
+      const poll = setInterval(() => { if (video.videoWidth) settle(); }, 50);
+      const settle = () => { clearInterval(poll); clearTimeout(t); resolve(); };
+      t = setTimeout(settle, 3000);
+    });
+  }
   return {
     type: 'webcam',
     el: video,
@@ -150,5 +159,5 @@ export function demoImage(w = 1200, h = 800) {
   ctx.fillStyle = bar;
   ctx.fillRect(0, 0, w, 26);
 
-  return { type: 'image', el: c, width: w, height: h, name: 'demo' };
+  return { type: 'image', el: c, width: w, height: h, name: 'demo', isDemo: true };
 }

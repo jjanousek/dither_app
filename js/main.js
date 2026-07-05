@@ -1,10 +1,10 @@
 // App bootstrap: state, render loop, viewport, history, source management,
 // exports, preset thumbnails, UI wiring.
 
-import { Engine } from './engine/engine.js';
+import { Engine, getAlgorithm } from './engine/engine.js';
 import { createState, applyParams, resetState, DEFAULTS } from './state.js';
 import { getPalette } from './palettes.js';
-import { RAMPS } from './engine/ascii.js';
+import { RAMPS, FONTS } from './engine/ascii.js';
 import { applyPostFX } from './effects/postfx.js';
 import { PRESETS, shuffleParams } from './presets.js';
 import { loadFile, openWebcam, demoImage, bindDropAndPaste } from './sources.js';
@@ -13,7 +13,13 @@ import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js'
 import { Viewport } from './view.js';
 import { GenerativeSource } from './generate.js';
 
-const MAX_LIVE_PIXELS = 420_000; // CPU error-diffusion budget for video preview
+const MAX_LIVE_PIXELS = 420_000;   // CPU error-diffusion budget for video preview
+const EXPORT_PIXELS = 1_600_000;   // GIF/text exports render finer than the live preview
+const MAX_EXPORT_SIDE = 16384;     // canvas hard limits (Chromium/WebKit)
+const MAX_EXPORT_AREA = 64_000_000;
+const canRecord = typeof HTMLCanvasElement !== 'undefined'
+  && typeof HTMLCanvasElement.prototype.captureStream === 'function'
+  && !!window.MediaRecorder;
 
 const $ = (id) => document.getElementById(id);
 const out = $('output');
@@ -37,13 +43,32 @@ let fpsText = '';
 
 // animation clock: phase in 0..1, wraps once per cycle
 let animPhase = 0;
-let phaseOverride = null; // exporters pin the phase for deterministic loops
+let phaseOverride = null;    // exporters pin the effect-animation phase
+let genPhaseOverride = null; // exporters pin the generative-scene phase
 let lastLoopT = 0;
-const isAnimating = () => state.anim.style !== 'none';
+const isAnimating = () => {
+  const s = state.anim.style;
+  if (s === 'none') return false;
+  if (s === 'flow' || s === 'shimmer') {
+    // these drift the pattern of ordered/noise/halftone dithers; on every
+    // other mode/algorithm they are no-ops — don't burn a core on them
+    return state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'gpu';
+  }
+  return true;
+};
 
 // generative scene source (lazy — created on first Generate click)
 let gen = null;
 const GEN_CYCLES_PER_SEC = 0.125; // at speed 1× a scene loops every 8s
+
+// Post-FX grain determinism: exports/thumbnails must be reproducible and
+// baked loops must wrap; live video keeps the free-running legacy counter.
+function currentGrainPhase() {
+  if (source?.type === 'gen') return genPhaseOverride ?? source.gen.phase;
+  if (phaseOverride !== null) return phaseOverride;
+  if (isAnimating()) return animPhase;
+  return source?.type === 'image' ? 0 : null;
+}
 
 // reusable upscale canvas for post-FX over pixelated results
 const upCanvas = document.createElement('canvas');
@@ -101,14 +126,14 @@ function srcDims() {
 // ---------------------------------------------------------------------------
 // render + present
 // ---------------------------------------------------------------------------
-function renderOnce() {
+function renderOnce(budgetOverride = null) {
   const [w, h] = srcDims();
   if (!w || !h) return out;
-  if (source.type === 'gen') source.gen.tick(phaseOverride ?? source.gen.phase);
+  if (source.type === 'gen') source.gen.tick(genPhaseOverride ?? source.gen.phase);
   const p = derived();
   // live sources AND animated stills render every frame -> cap the CPU budget
   const capped = source.type !== 'image' || isAnimating();
-  const result = engine.render(source.el, w, h, p, capped ? MAX_LIVE_PIXELS : Infinity);
+  const result = engine.render(source.el, w, h, p, budgetOverride ?? (capped ? MAX_LIVE_PIXELS : Infinity));
   if (result) present(result, w, h);
   return out;
 }
@@ -130,7 +155,7 @@ function present(result, srcW) {
       upCtx.drawImage(result, 0, 0, W, H);
       final = upCanvas;
     }
-    final = applyPostFX(final, state.fx);
+    final = applyPostFX(final, state.fx, { grainPhase: currentGrainPhase(), refH: srcDims()[1] || final.height });
   }
   let resized = false;
   if (out.width !== final.width || out.height !== final.height) {
@@ -139,7 +164,7 @@ function present(result, srcW) {
     resized = true;
   }
   octx.drawImage(final, 0, 0);
-  const pixelate = state.mode === 'dither' && !fxOn;
+  const pixelate = state.mode === 'dither'; // chunky pixels stay crisp even with FX
   out.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
   if (view.splitOn && !comparing) drawSplitOverlay();
@@ -182,14 +207,17 @@ function drawSplitOverlay() {
 function loop(t) {
   requestAnimationFrame(loop);
   if (!source) return;
-  const dt = lastLoopT ? Math.min(100, t - lastLoopT) : 16;
+  const rawDt = lastLoopT ? t - lastLoopT : 16;
   lastLoopT = t;
+  // recordings must track wall time even when rAF is throttled; otherwise
+  // swallow the jump after a long gap (window was hidden)
+  const dt = exporting ? Math.min(1000, rawDt) : (rawDt > 250 ? 0 : rawDt);
 
   // advance the animation clock (paused while an exporter pins the phase)
   const animating = isAnimating() && phaseOverride === null;
   if (animating) animPhase = (animPhase + (dt / 1000) * state.anim.speed * 0.15) % 1;
 
-  if (source.type === 'gen' && phaseOverride === null) {
+  if (source.type === 'gen' && genPhaseOverride === null) {
     source.gen.phase = (source.gen.phase + (dt / 1000) * source.gen.params.speed * GEN_CYCLES_PER_SEC) % 1;
   }
   const isLive = source.type !== 'image';
@@ -248,10 +276,16 @@ function updateUndoButtons() {
   $('btn-redo').disabled = history.index >= history.stack.length - 1;
 }
 
+// snapshots capture the app state AND the active generative-scene params,
+// so undo/redo can revert scene edits too
+function snapshotStr() {
+  return JSON.stringify({ s: state, g: source?.type === 'gen' ? source.gen.params : null });
+}
+
 function commitHistory() {
   clearTimeout(histTimer);
   histTimer = null;
-  const snap = JSON.stringify(state);
+  const snap = snapshotStr();
   if (history.stack[history.index] === snap) return;
   history.stack.splice(history.index + 1);
   history.stack.push(snap);
@@ -267,11 +301,17 @@ function pushHistory() {
 }
 
 function restoreSnapshot(snap) {
+  const parsed = JSON.parse(snap);
   resetState(state);
-  applyParams(state, JSON.parse(snap));
+  applyParams(state, parsed.s || parsed);
+  if (parsed.g && source?.type === 'gen') {
+    Object.assign(source.gen.params, parsed.g);
+    source.name = source.gen.sceneName().toLowerCase();
+  }
   clearActivePreset($('preset-strip')); // the restored state may not match the highlighted card
   rebuildPanel();
   updateExportButtons();
+  updateUndoButtons();
   updateStatus();
   dirty = true;
 }
@@ -332,7 +372,7 @@ async function renderPresetThumbs() {
       const base = structuredClone(DEFAULTS);
       applyParams(base, p.params);
       const result = thumbEngine.render(snap, TW, TH, deriveParams(base), Infinity);
-      const final = applyPostFX(result, base.fx);
+      const final = applyPostFX(result, base.fx, { grainPhase: 0, refH: TH });
       const tctx = target.getContext('2d');
       tctx.imageSmoothingEnabled = false;
       tctx.fillStyle = '#000';
@@ -362,6 +402,7 @@ function setSource(next) {
   if (source) {
     if (source.stream) source.stream.getTracks().forEach((tr) => tr.stop());
     if (source.el instanceof HTMLVideoElement && !source.stream) source.el.pause();
+    if (source._seekHandler) source.el.removeEventListener('seeked', source._seekHandler);
     if (source.url) URL.revokeObjectURL(source.url);
   }
   source = next;
@@ -369,12 +410,13 @@ function setSource(next) {
   if (source.type === 'video') {
     source.el.playbackRate = parseFloat($('speed').value) || 1;
     $('btn-play').textContent = '❚❚';
-    // re-render when the exporters or the user seek a paused video
-    source.el.addEventListener('seeked', () => { dirty = true; });
+    // re-render when the user seeks a paused video (exporters render themselves)
+    source._seekHandler = () => { if (!exporting) dirty = true; };
+    source.el.addEventListener('seeked', source._seekHandler);
     source.el.play().catch(() => {});
   }
   $('video-bar').hidden = source.type !== 'video';
-  $('drop-hint').hidden = source.name !== 'demo';
+  $('drop-hint').hidden = !source.isDemo;
   view.fitMode = true;
   view.fit(); // re-fit even when the new output has identical dimensions
   updateExportButtons();
@@ -398,8 +440,9 @@ function updateExportButtons() {
   const isWebcam = source?.type === 'webcam';
   const isGen = source?.type === 'gen';
   const animatedStill = source?.type === 'image' && isAnimating();
-  $('btn-export-video').hidden = !(isVideo || isWebcam || animatedStill || isGen);
-  $('btn-export-gif').hidden = !isVideo && source?.type !== 'image' && !isGen;
+  $('btn-export-video').hidden = !canRecord || !(isVideo || isWebcam || animatedStill || isGen);
+  // a static image would make a pointless single-frame "animated" GIF
+  $('btn-export-gif').hidden = !(isVideo || isGen || animatedStill);
   $('btn-export-txt').hidden = state.mode !== 'ascii';
 }
 
@@ -427,39 +470,57 @@ $('busy-cancel').onclick = () => busyCancel && busyCancel();
 // ---------------------------------------------------------------------------
 async function doExportPNG() {
   if (!source || exporting) return;
-  const [w, h] = srcDims();
-  toast('Rendering…');
-  await new Promise((r) => setTimeout(r, 30)); // let toast paint before a heavy CPU pass
-  const p = derived();
-  const result = engine.render(source.el, w, h, p, Infinity);
-  if (!result) return;
+  exporting = true; // block source swaps / concurrent exports mid-encode
+  let outC;
+  try {
+    const [w, h] = srcDims();
+    toast('Rendering…');
+    await new Promise((r) => setTimeout(r, 30)); // let toast paint before a heavy CPU pass
+    const p = derived();
+    const result = engine.render(source.el, w, h, p, Infinity);
+    if (!result) return;
 
-  let W = result.width;
-  let H = result.height;
-  if (state.mode === 'dither') {
-    if (exportSettings.pngSize === 'source') { W = w; H = h; }
-    if (exportSettings.pngSize === 'source2x') { W = w * 2; H = h * 2; }
-  } else if (exportSettings.pngSize === 'source2x') {
-    W = result.width * 2;
-    H = result.height * 2;
+    let W = result.width;
+    let H = result.height;
+    if (state.mode === 'dither') {
+      if (exportSettings.pngSize === 'source') { W = w; H = h; }
+      if (exportSettings.pngSize === 'source2x') { W = w * 2; H = h * 2; }
+    } else if (exportSettings.pngSize === 'source2x') {
+      W = result.width * 2;
+      H = result.height * 2;
+    }
+    // stay under the browser's canvas limits instead of silently cropping
+    if (W > MAX_EXPORT_SIDE || H > MAX_EXPORT_SIDE || W * H > MAX_EXPORT_AREA) {
+      const k = Math.min(MAX_EXPORT_SIDE / W, MAX_EXPORT_SIDE / H, Math.sqrt(MAX_EXPORT_AREA / (W * H)));
+      W = Math.floor(W * k);
+      H = Math.floor(H * k);
+      toast(`PNG capped to ${W}×${H} (browser canvas limit)`);
+    }
+
+    const c = document.createElement('canvas');
+    c.width = W;
+    c.height = H;
+    if (c.width !== W || c.height !== H) {
+      toast('PNG export failed — image too large for this browser');
+      return;
+    }
+    const cx = c.getContext('2d');
+    cx.imageSmoothingEnabled = false;
+    cx.drawImage(result, 0, 0, W, H);
+    const final = applyPostFX(c, state.fx, { grainPhase: currentGrainPhase() ?? 0, refH: h });
+
+    // applyPostFX may return a shared canvas — copy before async toBlob
+    outC = final === c ? c : (() => {
+      const cc = document.createElement('canvas');
+      cc.width = final.width;
+      cc.height = final.height;
+      cc.getContext('2d').drawImage(final, 0, 0);
+      return cc;
+    })();
+  } finally {
+    exporting = false;
   }
-
-  const c = document.createElement('canvas');
-  c.width = W;
-  c.height = H;
-  const cx = c.getContext('2d');
-  cx.imageSmoothingEnabled = false;
-  cx.drawImage(result, 0, 0, W, H);
-  const final = applyPostFX(c, state.fx);
-
-  // applyPostFX may return a shared canvas — copy before async toBlob
-  const outC = final === c ? c : (() => {
-    const cc = document.createElement('canvas');
-    cc.width = final.width;
-    cc.height = final.height;
-    cc.getContext('2d').drawImage(final, 0, 0);
-    return cc;
-  })();
+  if (!outC) return;
 
   outC.toBlob((blob) => {
     if (!blob) {
@@ -526,11 +587,16 @@ async function doExportVideo() {
   if (!(source.el instanceof HTMLVideoElement) && !animatedStill && !isGen) return;
   exporting = true;
 
-  const secs = parseInt(exportSettings.recordSeconds, 10) || 5;
+  let secs = parseInt(exportSettings.recordSeconds, 10) || 5;
   if (source.type === 'webcam') {
     recordCanvasSeconds(secs, 'ditherlab-webcam');
     return;
   }
+  // stretch to a whole number of animation cycles so the saved clip loops
+  const cps = isGen
+    ? source.gen.params.speed * GEN_CYCLES_PER_SEC
+    : (isAnimating() ? state.anim.speed * 0.15 : 0);
+  if (cps > 0) secs = Math.max(1, Math.round(secs * cps)) / cps;
   if (isGen) {
     recordCanvasSeconds(secs, `${source.name || 'scene'}-${state.mode}`);
     return;
@@ -570,7 +636,16 @@ async function doExportGIF() {
     const cycleSec = 1 / (source.gen.params.speed * GEN_CYCLES_PER_SEC);
     const count = Math.min(180, Math.max(24, Math.round(cycleSec * 15)));
     fps = count / cycleSec;
-    animate = { count, setPhase: (ph) => { phaseOverride = ph; } };
+    // effect animation runs a whole number of its own cycles inside the
+    // scene loop, so both wrap seamlessly in the baked GIF
+    const animCycles = isAnimating() ? Math.max(1, Math.round(cycleSec * state.anim.speed * 0.15)) : 0;
+    animate = {
+      count,
+      setPhase: (ph) => {
+        genPhaseOverride = ph;
+        if (animCycles) phaseOverride = (ph * animCycles) % 1;
+      },
+    };
   } else if (source.type === 'image' && isAnimating()) {
     const cycleSec = 1 / (state.anim.speed * 0.15);
     const count = Math.min(150, Math.max(10, Math.round(cycleSec * 15)));
@@ -585,10 +660,12 @@ async function doExportGIF() {
     await exportGIF({
       video: source.type === 'video' ? source.el : null,
       animate,
-      renderFrame: () => { renderOnce(); return out; },
+      renderFrame: () => { renderOnce(EXPORT_PIXELS); return out; },
       fps,
       maxWidth,
       name: `${source.name || 'ditherlab'}-${state.mode}`,
+      onInfo: (msg) => toast(msg, 4000),
+      shouldAbort: () => cancelled,
       onProgress: (f) => {
         if (cancelled) throw new Error('cancelled');
         busyProgress(f);
@@ -599,30 +676,42 @@ async function doExportGIF() {
     toast(err.message === 'cancelled' ? 'Export cancelled' : `GIF export failed: ${err.message}`);
   }
   phaseOverride = null;
+  genPhaseOverride = null;
+  dirty = true; // restore the live preview resolution
   hideBusy();
   exporting = false;
 }
 
 function doExportTxt() {
   if (state.mode !== 'ascii') return;
-  renderOnce();
+  renderOnce(Infinity); // text exports always use the full-resolution grid
   const name = `${source?.name || 'ditherlab'}-ascii`;
   const fmt = exportSettings.txtFormat;
   if (fmt === 'ansi' && engine.ascii.lastGrid) {
-    exportText(buildAnsi(engine.ascii.lastGrid), name, 'ans');
+    const defaultBg = state.ascii.colorMode === 'mono'
+      ? parseInt(state.ascii.bg.replace('#', ''), 16)
+      : null;
+    exportText(buildAnsi(engine.ascii.lastGrid, { defaultBg }), name, 'ans');
     toast('ANSI text exported — try: cat file.ans');
   } else if (fmt === 'html' && engine.ascii.lastGrid) {
-    exportText(buildHtml(engine.ascii.lastGrid, state.ascii.bg), name, 'html');
+    const f = FONTS[state.ascii.fontId] || FONTS.menlo;
+    exportText(buildHtml(engine.ascii.lastGrid, state.ascii.bg, {
+      family: f.family,
+      size: state.ascii.cellSize,
+      bold: state.ascii.bold,
+    }), name, 'html');
     toast('HTML exported');
   } else {
     exportText(engine.ascii.lastText, name);
     toast('ASCII text exported');
   }
+  dirty = true; // restore the live preview resolution
 }
 
 exportSettings.onCopyText = () => {
   if (state.mode !== 'ascii') return;
-  renderOnce();
+  renderOnce(Infinity);
+  dirty = true;
   navigator.clipboard.writeText(engine.ascii.lastText)
     .then(() => toast('Copied to clipboard'))
     .catch(() => toast('Clipboard unavailable'));
@@ -640,6 +729,7 @@ function rebuildPanel() {
     onGenChange: () => {
       if (source?.type === 'gen') source.name = source.gen.sceneName().toLowerCase();
       updateStatus();
+      pushHistory();
       dirty = true;
     },
     onChange: () => {
@@ -698,7 +788,7 @@ $('btn-demo').onclick = () => setSource(demoImage());
 $('btn-generate').onclick = () => {
   if (exporting) return;
   if (!gen) {
-    gen = new GenerativeSource(1280, 800);
+    gen = new GenerativeSource(1920, 1200);
     if (!gen.isSupported()) {
       toast('WebGL2 unavailable — cannot generate scenes');
       gen = null;
@@ -716,6 +806,7 @@ $('btn-generate').onclick = () => {
     name: gen.sceneName().toLowerCase(),
     gen,
   });
+  commitHistory(); // baseline with the fresh scene params, so edits can undo
 };
 $('btn-webcam').onclick = async () => {
   if (exporting) return;
@@ -761,17 +852,24 @@ $('btn-compare').addEventListener('touchstart', startCompare, { passive: false }
 window.addEventListener('mouseup', endCompare);
 window.addEventListener('touchend', endCompare);
 window.addEventListener('blur', endCompare); // keyup can be lost on window switch
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') endCompare();
+});
 
 window.addEventListener('keydown', (e) => {
   if (exporting) return;
-  // undo/redo first — they legitimately use modifiers
+  const active = document.activeElement;
+  const tag = active?.tagName;
+  const textEditable = tag === 'TEXTAREA'
+    || (tag === 'INPUT' && ['text', 'search', 'number', 'url'].includes(active.type));
+  // undo/redo — but text fields keep their native text-undo
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+    if (textEditable) return;
     e.preventDefault();
     if (e.shiftKey) redo();
     else undo();
     return;
   }
-  const tag = document.activeElement?.tagName;
   const inField = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
   if (inField || e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.key === 'c' && !e.repeat) { comparing = true; dirty = true; }
@@ -823,18 +921,18 @@ setSource(demoImage());
 
 // shareable boot params: ?preset=<id>&split=1
 const qp = new URLSearchParams(location.search);
+const defaultsSnapshot = snapshotStr(); // undo must reach the defaults beneath a boot preset
 const bootPreset = PRESETS.find((p) => p.id === qp.get('preset'));
 if (bootPreset) {
   applyParams(state, bootPreset.params);
   rebuildPanel();
   updateExportButtons();
   updateStatus();
-  [...document.querySelectorAll('.preset-card')]
-    .find((c) => c.textContent.includes(bootPreset.name))?.classList.add('active');
+  document.querySelector(`.preset-card[data-id="${bootPreset.id}"]`)?.classList.add('active');
 }
 const genParam = qp.get('gen');
 if (genParam) {
-  gen = new GenerativeSource(1280, 800);
+  gen = new GenerativeSource(1920, 1200);
   if (gen.isSupported()) {
     gen.setScene(genParam, { randomizeSeed: false });
     gen.tick(0);
@@ -846,6 +944,7 @@ if (genParam) {
       name: gen.sceneName().toLowerCase(),
       gen,
     });
+    commitHistory();
   } else {
     gen = null;
   }
@@ -853,10 +952,28 @@ if (genParam) {
 const splitParam = qp.get('split');
 if (splitParam && splitParam !== '0' && splitParam.toLowerCase() !== 'false') $('btn-split').click();
 
-history.stack = [JSON.stringify(state)];
-history.index = 0;
+history.stack = bootPreset ? [defaultsSnapshot, snapshotStr()] : [snapshotStr()];
+history.index = history.stack.length - 1;
 updateUndoButtons();
 requestAnimationFrame(loop);
+
+// glyph metrics were measured against fallback fonts — refresh once real
+// fonts finish loading so ASCII grids don't stay misaligned
+document.fonts?.ready?.then(() => {
+  engine.ascii.clearCaches();
+  thumbEngine.ascii.clearCaches();
+  dirty = true;
+});
+
+// native macOS paste bridge (the Swift wrapper feeds images through this)
+window.__dlNativePaste = async (dataURL) => {
+  try {
+    const blob = await (await fetch(dataURL)).blob();
+    openFile(new File([blob], 'pasted.png', { type: blob.type || 'image/png' }));
+  } catch {
+    toast('Paste failed');
+  }
+};
 
 // tiny debug/testing handle (not part of the UI)
 window.__dl = {

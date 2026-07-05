@@ -478,12 +478,17 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
   // --- EXPORT ---
   const ex = section(mount, 'Export');
   select(ex, 'PNG size', {
-    options: [
-      { value: 'work', label: 'Pixel-exact (1 px per dot)' },
-      { value: 'source', label: 'Source resolution' },
-      { value: 'source2x', label: '2× source resolution' },
-    ],
-    value: exportSettings.pngSize,
+    options: state.mode === 'dither'
+      ? [
+        { value: 'work', label: 'Pixel-exact (1 px per dot)' },
+        { value: 'source', label: 'Source resolution' },
+        { value: 'source2x', label: '2× source resolution' },
+      ]
+      : [
+        { value: 'source', label: 'Native resolution (1×)' },
+        { value: 'source2x', label: '2× resolution' },
+      ],
+    value: exportSettings.pngSize === 'work' && state.mode !== 'dither' ? 'source' : exportSettings.pngSize,
     oninput: (v) => { exportSettings.pngSize = v; },
   });
   select(ex, 'GIF quality', {
@@ -567,6 +572,7 @@ export function buildPresetStrip({ mount, presets, onApply, onShuffle }) {
       c.classList.add('active');
       onApply(p);
     });
+    c.dataset.id = p.id;
   }
   return thumbCanvases;
 }

@@ -3,7 +3,7 @@
 
 import { createGL, compileProgram, QUAD_VS, createTexture, uploadTexture, uploadR8 } from './gl.js';
 import { DITHER_FS, MAX_PALETTE } from './shaders.js';
-import { applyAdjustments, errorDiffusion, orderedDither, quantize, MATRICES, DIFFUSION_KERNELS } from './cpu.js';
+import { applyAdjustments, errorDiffusion, orderedDither, quantize, whiteNoiseDither, halftoneDither, MATRICES, DIFFUSION_KERNELS } from './cpu.js';
 import { getBlueNoise } from './bluenoise.js';
 import { AsciiRenderer, fontSpec } from './ascii.js';
 import { CELL_EFFECTS } from '../effects/cells.js';
@@ -53,6 +53,17 @@ export class Engine {
 
   #initGL() {
     const gl = this.gl;
+    if (!this._lossHooked) {
+      this._lossHooked = true;
+      this.glCanvas.addEventListener('webglcontextlost', (e) => {
+        e.preventDefault(); // allow restoration
+        this.glLost = true;
+      });
+      this.glCanvas.addEventListener('webglcontextrestored', () => {
+        this.glLost = false;
+        this.#initGL(); // recompile program, re-upload threshold textures
+      });
+    }
     try {
       this.program = compileProgram(gl, QUAD_VS, DITHER_FS);
     } catch (err) {
@@ -65,7 +76,7 @@ export class Engine {
     for (const name of [
       'u_src', 'u_threshold', 'u_srcSize', 'u_thresholdSize', 'u_mode',
       'u_brightness', 'u_contrast', 'u_gamma', 'u_saturation', 'u_strength',
-      'u_bias', 'u_invert', 'u_grayscale', 'u_palette', 'u_paletteSize',
+      'u_bias', 'u_invert', 'u_palette', 'u_paletteSize',
       'u_halftoneScale', 'u_halftoneAngle', 'u_matOffset', 'u_seed',
     ]) {
       this.u[name] = gl.getUniformLocation(this.program, name);
@@ -123,7 +134,7 @@ export class Engine {
     const pal = this.#palettes(p.colors);
     const effSat = p.grayscale ? 0 : p.saturation;
 
-    if (algo.type === 'gpu' && this.gl) {
+    if (algo.type === 'gpu' && this.gl && !this.glLost && !this.gl.isContextLost()) {
       return this.#renderGPU(work, w, h, p, algo, pal, effSat);
     }
     return this.#renderCPU(work, w, h, p, algo, pal, effSat);
@@ -163,7 +174,8 @@ export class Engine {
       g.addColorStop(0.5, `rgba(255,255,255,${alpha})`);
       g.addColorStop(1, 'rgba(255,255,255,0)');
       ctx.save();
-      ctx.globalCompositeOperation = 'overlay';
+      // 'screen': uniform additive brighten, visible over dark content too
+      ctx.globalCompositeOperation = 'screen';
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, w, h);
       ctx.restore();
@@ -179,7 +191,8 @@ export class Engine {
       }
       this.waveCtx.clearRect(0, 0, w, h);
       this.waveCtx.drawImage(this.work, 0, 0);
-      ctx.clearRect(0, 0, w, h);
+      // keep the unshifted frame beneath the shifted rows so the exposed
+      // edge columns show clamped content instead of transparent-black bars
       const amp = Math.max(1, w * 0.05) * a.intensity;
       const ph = phase * Math.PI * 2;
       for (let y = 0; y < h; y++) {
@@ -256,14 +269,23 @@ export class Engine {
     gl.uniform1f(this.u.u_strength, p.ditherStrength);
     gl.uniform1f(this.u.u_bias, p.threshold - 0.5);
     gl.uniform1i(this.u.u_invert, p.invert ? 1 : 0);
-    gl.uniform1i(this.u.u_grayscale, 0);
     gl.uniform3fv(this.u.u_palette, pal.uniform);
     gl.uniform1i(this.u.u_paletteSize, pal.size);
     gl.uniform1f(this.u.u_halftoneScale, p.halftoneScale);
     gl.uniform1f(this.u.u_halftoneAngle, (p.halftoneAngle * Math.PI) / 180);
 
     const tile = algo.mode >= 3 ? Math.max(2, p.halftoneScale) : mat.size;
-    const drift = this.#matAnim(p, tile);
+    let drift = this.#matAnim(p, tile);
+    if (algo.mode === 2 && p.anim?.style === 'flow') {
+      // a hash field can't translate seamlessly: step the seed instead
+      // (16 reseeds per cycle, returns to the phase-0 pattern at wrap)
+      const k = Math.floor(((p.animPhase || 0) % 1) * 16);
+      drift = { ox: 0, oy: 0, seed: k };
+    } else if (algo.mode === 4 && p.anim?.style === 'flow' && drift.oy === 0 && drift.ox !== 0) {
+      // lines only vary in y: horizontal flow would be invisible, so scroll
+      // perpendicular to the lines instead (same seamless lattice distance)
+      drift = { ox: 0, oy: drift.ox, seed: drift.seed };
+    }
     gl.uniform2f(this.u.u_matOffset, drift.ox, drift.oy);
     gl.uniform1f(this.u.u_seed, drift.seed);
 
@@ -298,6 +320,15 @@ export class Engine {
         offsetX: drift.ox,
         offsetY: drift.oy,
       });
+    } else if (algo.mode === 2) {
+      whiteNoiseDither(img, pal.float, { strength: p.ditherStrength, bias });
+    } else if (algo.mode === 3 || algo.mode === 4) {
+      halftoneDither(img, pal.float, {
+        scale: p.halftoneScale,
+        angle: p.halftoneAngle,
+        bias: p.threshold - 0.5,
+        line: algo.mode === 4,
+      });
     } else {
       quantize(img, pal.float, bias);
     }
@@ -308,7 +339,7 @@ export class Engine {
   #renderAscii(source, srcW, srcH, p, maxPixels = Infinity) {
     const a = p.ascii;
     // Renderer decides sub-cell sampling density:
-    // ramp 1x1, shape 4x8 (glyph matching), quadrant 2x2, braille 2x4.
+    // ramp 1x1, shape 8x8 (glyph matching), quadrant 2x2, braille 2x4.
     const renderer = a.renderer || (a.braille ? 'braille' : 'ramp');
     const DENSITY = { ramp: [1, 1], shape: [8, 8], quadrant: [2, 2], braille: [2, 4] };
     const [dx, dy] = DENSITY[renderer] || DENSITY.ramp;
@@ -359,9 +390,10 @@ export class Engine {
     const cell = Math.max(4, c.size);
     let cols = Math.max(1, Math.round(srcW / cell));
     let rows = Math.max(1, Math.round(srcH / cell));
-    if (cols * rows * cell * cell > maxPixels * 4) {
-      // cap the OUTPUT canvas area (cells draw at cell-size resolution)
-      const k = Math.sqrt((maxPixels * 4) / (cols * rows * cell * cell));
+    if (cols * rows * cell * cell > maxPixels * 2) {
+      // cap the OUTPUT canvas area (cells draw at cell-size resolution);
+      // 2x the dither budget since per-cell fills are cheaper than per-pixel
+      const k = Math.sqrt((maxPixels * 2) / (cols * rows * cell * cell));
       cols = Math.max(1, Math.floor(cols * k));
       rows = Math.max(1, Math.floor(rows * k));
     }

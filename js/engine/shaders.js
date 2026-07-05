@@ -31,7 +31,6 @@ uniform float u_saturation;   // 0..2
 uniform float u_strength;     // 0..1 dither strength
 uniform float u_bias;         // threshold bias -0.5..0.5
 uniform bool  u_invert;
-uniform bool  u_grayscale;    // convert to luminance before quantizing
 
 uniform vec3 u_palette[${MAX_PALETTE}];
 uniform int u_paletteSize;
@@ -92,9 +91,8 @@ void main() {
   // Canvas rows are uploaded top-first but clip space points up -> flip V.
   vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
   vec2 pix = floor(uv * u_srcSize);
-  vec3 c = texture(u_src, uv).rgb;
-  c = adjust(c);
-  if (u_grayscale) c = vec3(luma(c));
+  vec4 src = texture(u_src, uv);
+  vec3 c = adjust(src.rgb);
 
   float n = float(u_paletteSize);
   float spread = u_strength / max(1.0, n - 1.0) * 1.5;
@@ -104,13 +102,13 @@ void main() {
     vec2 mpix = mod(pix + u_matOffset, vec2(u_thresholdSize));
     float t = texelFetch(u_threshold, ivec2(mpix), 0).r;
     c += (t - 0.5 + u_bias) * spread * 255.0 / 255.0 * vec3(1.0);
-    outColor = vec4(nearestPalette(clamp(c, 0.0, 1.0)), 1.0);
+    outColor = vec4(nearestPalette(clamp(c, 0.0, 1.0)), src.a);
   } else if (u_mode == 2) {
     // White noise (u_seed reseeds per animation tick). floor(): sub-pixel
     // offsets would decorrelate the hash into boiling instead of drift.
     float t = hash12(pix + floor(u_matOffset) + vec2(u_seed * 91.7, u_seed * 37.3));
     c += (t - 0.5 + u_bias) * spread;
-    outColor = vec4(nearestPalette(clamp(c, 0.0, 1.0)), 1.0);
+    outColor = vec4(nearestPalette(clamp(c, 0.0, 1.0)), src.a);
   } else if (u_mode == 3 || u_mode == 4) {
     // Procedural halftone: dots (3) or lines (4)
     vec3 darkest, brightest;
@@ -132,10 +130,10 @@ void main() {
       float width = (1.0 - l);
       v = step(abs(s - 0.5) * 2.0, width);
     }
-    outColor = vec4(mix(brightest, darkest, v), 1.0);
+    outColor = vec4(mix(brightest, darkest, v), src.a);
   } else {
     // Quantize only (mode 0)
     c += u_bias;
-    outColor = vec4(nearestPalette(clamp(c, 0.0, 1.0)), 1.0);
+    outColor = vec4(nearestPalette(clamp(c, 0.0, 1.0)), src.a);
   }
 }`;
