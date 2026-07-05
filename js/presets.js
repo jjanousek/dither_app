@@ -337,13 +337,14 @@ export function shuffleParams() {
     const dark = Math.random() < 0.75; // mostly light-on-dark
     const duo = pick(DUOTONE_PAIRS);
     params.ascii = {
+      renderer: pick(['ramp', 'ramp', 'ramp', 'shape', 'quadrant', 'braille']),
       rampId: pick(SHUFFLE_RAMPS),
       cellSize: randInt(8, 16),
-      colorMode: pick(['mono', 'mono', 'fg']),
+      colorMode: pick(['mono', 'mono', 'fg', 'bg']),
       fg: dark ? duo.paper : duo.ink,
       bg: dark ? duo.ink : duo.paper,
       invertRamp: !dark,
-      braille: Math.random() < 0.15,
+      dither: pick(['none', 'floyd', 'floyd', 'bayer']),
     };
   } else if (mode !== 'dither') {
     const cells = {

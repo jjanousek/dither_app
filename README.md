@@ -24,7 +24,7 @@ Drop in a photo, a video, or your webcam feed and turn it into 1-bit dither art,
 ```sh
 git clone git@github.com:jjanousek/dither_app.git
 cd dither_app
-python3 -m http.server 8173     # or: npm start, or any static file server
+python3 scripts/serve.py        # or: npm start (plain `python3 -m http.server 8173` works too)
 # open http://127.0.0.1:8173
 ```
 

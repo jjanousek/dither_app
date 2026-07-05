@@ -177,7 +177,11 @@ export class AsciiRenderer {
     const c = document.createElement('canvas');
     const cx = c.getContext('2d', { willReadFrequently: true });
     cx.font = fontString(font, H);
-    const adv = Math.max(4, Math.ceil(cx.measureText('M').width));
+    // slot pitch = widest advance in the set, so wide glyphs (blocks, CJK)
+    // don't bleed into the neighbour's coverage sample
+    let maxW = cx.measureText('M').width;
+    for (const g of glyphs) maxW = Math.max(maxW, cx.measureText(g).width || 0);
+    const adv = Math.max(4, Math.ceil(maxW));
     c.width = adv * glyphs.length;
     c.height = H;
     cx.font = fontString(font, H);
@@ -409,7 +413,9 @@ export class AsciiRenderer {
             const rgb = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
             ctx.fillStyle = intToCss(rgb);
             ctx.fillRect(x * cellW, y * cellH, Math.ceil(cellW), cellH);
-            const ink = lum[j] > 0.5 ? 0x000000 : 0xffffff;
+            // ink contrast comes from the RAW cell color, not the
+            // invertRamp/autoContrast-mutated lum grid
+            const ink = LUMA(data[i], data[i + 1], data[i + 2]) / 255 > 0.5 ? 0x000000 : 0xffffff;
             ctx.fillStyle = intToCss(ink);
             ctx.fillText(ch, x * cellW, y * cellH);
             grow.push([ch, ink, rgb]);

@@ -135,7 +135,6 @@ function present(result, srcW) {
   octx.drawImage(final, 0, 0);
   const pixelate = state.mode === 'dither' && !fxOn;
   out.classList.toggle('pixelated', pixelate);
-  cmp.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
   if (view.splitOn && !comparing) drawSplitOverlay();
 }
@@ -160,18 +159,18 @@ function drawSplitOverlay() {
   if (!source) return;
   const [w, h] = srcDims();
   if (!w || !h) return;
-  if (cmp.width !== out.width || cmp.height !== out.height) {
-    cmp.width = out.width;
-    cmp.height = out.height;
+  // full source resolution, CSS-scaled onto the output's layout box so the
+  // "before" pane stays sharp at any zoom
+  if (cmp.width !== w || cmp.height !== h) {
+    cmp.width = w;
+    cmp.height = h;
   }
-  cctx.clearRect(0, 0, cmp.width, cmp.height);
+  cmp.style.width = `${out.width}px`;
+  cmp.style.height = `${out.height}px`;
+  cctx.clearRect(0, 0, w, h);
   const frac = view.splitFrac;
   if (frac <= 0) return;
-  cctx.drawImage(
-    source.el,
-    0, 0, w * frac, h,
-    0, 0, cmp.width * frac, cmp.height,
-  );
+  cctx.drawImage(source.el, 0, 0, w * frac, h, 0, 0, w * frac, h);
 }
 
 function loop(t) {
@@ -238,22 +237,28 @@ function updateUndoButtons() {
   $('btn-redo').disabled = history.index >= history.stack.length - 1;
 }
 
+function commitHistory() {
+  clearTimeout(histTimer);
+  histTimer = null;
+  const snap = JSON.stringify(state);
+  if (history.stack[history.index] === snap) return;
+  history.stack.splice(history.index + 1);
+  history.stack.push(snap);
+  if (history.stack.length > 100) history.stack.shift();
+  history.index = history.stack.length - 1;
+  updateUndoButtons();
+}
+
+// debounced variant for slider drags; discrete actions call commitHistory()
 function pushHistory() {
   clearTimeout(histTimer);
-  histTimer = setTimeout(() => {
-    const snap = JSON.stringify(state);
-    if (history.stack[history.index] === snap) return;
-    history.stack.splice(history.index + 1);
-    history.stack.push(snap);
-    if (history.stack.length > 100) history.stack.shift();
-    history.index = history.stack.length - 1;
-    updateUndoButtons();
-  }, 350);
+  histTimer = setTimeout(commitHistory, 350);
 }
 
 function restoreSnapshot(snap) {
   resetState(state);
   applyParams(state, JSON.parse(snap));
+  clearActivePreset($('preset-strip')); // the restored state may not match the highlighted card
   rebuildPanel();
   updateExportButtons();
   updateStatus();
@@ -261,7 +266,7 @@ function restoreSnapshot(snap) {
 }
 
 function undo() {
-  clearTimeout(histTimer);
+  commitHistory(); // land any pending debounced change first
   if (history.index > 0) {
     history.index--;
     restoreSnapshot(history.stack[history.index]);
@@ -270,7 +275,7 @@ function undo() {
 }
 
 function redo() {
-  clearTimeout(histTimer);
+  if (histTimer) commitHistory();
   if (history.index < history.stack.length - 1) {
     history.index++;
     restoreSnapshot(history.stack[history.index]);
@@ -359,7 +364,8 @@ function setSource(next) {
   }
   $('video-bar').hidden = source.type !== 'video';
   $('drop-hint').hidden = source.name !== 'demo';
-  view.fitMode = true; // re-fit for the new content size
+  view.fitMode = true;
+  view.fit(); // re-fit even when the new output has identical dimensions
   updateExportButtons();
   updateStatus();
   dirty = true;
@@ -457,27 +463,47 @@ async function doExportPNG() {
 // Record the live preview canvas for a fixed number of seconds (webcam feeds
 // and animated still images — anything without a natural clip length).
 function recordCanvasSeconds(secs, filename) {
-  showBusy(`Recording ${secs}s…`, null);
-  const stream = out.captureStream(30);
-  const mime = VideoExporter.pickMime();
-  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
-  const chunks = [];
-  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  rec.onstop = () => {
-    stream.getTracks().forEach((tr) => tr.stop());
-    downloadBlob(new Blob(chunks, { type: mime.split(';')[0] }), `${filename}.${mime.startsWith('video/mp4') ? 'mp4' : 'webm'}`);
+  let rec = null;
+  let iv = null;
+  let cancelled = false;
+  try {
+    const mime = VideoExporter.pickMime();
+    if (!mime) throw new Error('MediaRecorder is not supported in this browser');
+    const stream = out.captureStream(30);
+    rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
+    const chunks = [];
+    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    rec.onstop = () => {
+      clearInterval(iv);
+      stream.getTracks().forEach((tr) => tr.stop());
+      hideBusy();
+      exporting = false;
+      if (cancelled) {
+        toast('Recording cancelled');
+        return;
+      }
+      downloadBlob(new Blob(chunks, { type: mime.split(';')[0] }), `${filename}.${mime.startsWith('video/mp4') ? 'mp4' : 'webm'}`);
+      toast('Recording saved');
+    };
+    rec.start(250);
+    // wall-clock based: setInterval is throttled in background tabs
+    const t0 = performance.now();
+    iv = setInterval(() => {
+      const elapsed = (performance.now() - t0) / 1000;
+      busyProgress(Math.min(1, elapsed / secs));
+      if (elapsed >= secs) { clearInterval(iv); rec.stop(); }
+    }, 100);
+    showBusy(`Recording ${secs}s…`, () => {
+      cancelled = true;
+      clearInterval(iv);
+      if (rec.state !== 'inactive') rec.stop();
+    });
+  } catch (err) {
+    clearInterval(iv);
     hideBusy();
     exporting = false;
-    toast('Recording saved');
-  };
-  rec.start(250);
-  // wall-clock based: setInterval is throttled in background tabs
-  const t0 = performance.now();
-  const iv = setInterval(() => {
-    const elapsed = (performance.now() - t0) / 1000;
-    busyProgress(Math.min(1, elapsed / secs));
-    if (elapsed >= secs) { clearInterval(iv); rec.stop(); }
-  }, 100);
+    toast(`Recording failed: ${err.message}`);
+  }
 }
 
 async function doExportVideo() {
@@ -527,6 +553,9 @@ async function doExportGIF() {
     const count = Math.min(150, Math.max(10, Math.round(cycleSec * 15)));
     fps = count / cycleSec;
     animate = { count, setPhase: (ph) => { phaseOverride = ph; } };
+  } else if (source.type === 'video' && isAnimating()) {
+    // deterministic: phase follows the video timeline, not the wall clock
+    animate = { setTime: (t) => { phaseOverride = (t * state.anim.speed * 0.15) % 1; } };
   }
 
   try {
@@ -596,12 +625,13 @@ function rebuildPanel() {
 
 function applyPreset(preset) {
   if (exporting) return;
+  commitHistory(); // land any pending debounced edit first
   resetState(state);
   applyParams(state, preset.params);
   rebuildPanel();
   updateExportButtons();
   updateStatus();
-  pushHistory();
+  commitHistory();
   dirty = true;
   toast(preset.name);
 }
@@ -612,13 +642,14 @@ thumbCanvases = buildPresetStrip({
   onApply: applyPreset,
   onShuffle: () => {
     if (exporting) return;
+    commitHistory();
     clearActivePreset($('preset-strip'));
     resetState(state);
     applyParams(state, shuffleParams());
     rebuildPanel();
     updateExportButtons();
     updateStatus();
-    pushHistory();
+    commitHistory();
     dirty = true;
     toast('Shuffled');
   },
@@ -645,18 +676,20 @@ $('btn-webcam').onclick = async () => {
 
 $('btn-reset').onclick = () => {
   if (exporting) return;
+  commitHistory();
   clearActivePreset($('preset-strip'));
   resetState(state);
   rebuildPanel();
   updateExportButtons();
   updateStatus();
-  pushHistory();
+  commitHistory();
   dirty = true;
   toast('Reset');
 };
 
 $('btn-shuffle').onclick = () => {
   if (exporting) return;
+  commitHistory();
   clearActivePreset($('preset-strip'));
   resetState(state);
   applyParams(state, shuffleParams());
@@ -747,7 +780,8 @@ if (bootPreset) {
   [...document.querySelectorAll('.preset-card')]
     .find((c) => c.textContent.includes(bootPreset.name))?.classList.add('active');
 }
-if (qp.get('split')) $('btn-split').click();
+const splitParam = qp.get('split');
+if (splitParam && splitParam !== '0' && splitParam.toLowerCase() !== 'false') $('btn-split').click();
 
 history.stack = [JSON.stringify(state)];
 history.index = 0;

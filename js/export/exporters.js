@@ -216,14 +216,17 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
   if (!video) {
     if (animate) {
       // Animated still: step the animation phase over exactly one cycle so
-      // the exported GIF loops seamlessly.
+      // the exported GIF loops seamlessly. Yield each frame so the busy
+      // overlay paints and Cancel clicks are processed.
       for (let i = 0; i < animate.count; i++) {
         animate.setPhase(i / animate.count);
         const processed = renderFrame();
         fctx.drawImage(processed, 0, 0, w, h);
         enc.addFrame(fctx.getImageData(0, 0, w, h).data);
         onProgress((i + 1) / animate.count);
+        await new Promise((r) => setTimeout(r, 0));
       }
+      await new Promise((r) => setTimeout(r, 0)); // paint 100% before LZW
       downloadBlob(enc.finish(), `${name}.gif`);
       return;
     }
@@ -257,6 +260,8 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
     const frameCount = Math.max(1, Math.min(480, Math.floor(duration * fps)));
 
     for (let i = 0; i < frameCount; i++) {
+      // animated video: lock the phase to the video timeline, not wall clock
+      animate?.setTime?.(i * step);
       await seekTo(Math.min(duration - 0.001, i * step));
       const processed = renderFrame();
       fctx.drawImage(processed, 0, 0, w, h);

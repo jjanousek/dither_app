@@ -106,15 +106,18 @@ void main() {
     c += (t - 0.5 + u_bias) * spread * 255.0 / 255.0 * vec3(1.0);
     outColor = vec4(nearestPalette(clamp(c, 0.0, 1.0)), 1.0);
   } else if (u_mode == 2) {
-    // White noise (u_seed reseeds per animation tick)
-    float t = hash12(pix + u_matOffset + vec2(u_seed * 91.7, u_seed * 37.3));
+    // White noise (u_seed reseeds per animation tick). floor(): sub-pixel
+    // offsets would decorrelate the hash into boiling instead of drift.
+    float t = hash12(pix + floor(u_matOffset) + vec2(u_seed * 91.7, u_seed * 37.3));
     c += (t - 0.5 + u_bias) * spread;
     outColor = vec4(nearestPalette(clamp(c, 0.0, 1.0)), 1.0);
   } else if (u_mode == 3 || u_mode == 4) {
     // Procedural halftone: dots (3) or lines (4)
     vec3 darkest, brightest;
     paletteExtremes(darkest, brightest);
-    vec2 p = rot(u_halftoneAngle) * (pix + u_matOffset);
+    // drift applied AFTER rotation so a whole-tile offset stays a lattice
+    // vector of the rotated pattern (seamless flow loops at any angle)
+    vec2 p = rot(u_halftoneAngle) * pix + u_matOffset;
     float scale = max(u_halftoneScale, 1.5);
     // + bias so raising Threshold brightens, same convention as modes 0/1/2
     float l = clamp(luma(c) + u_bias, 0.0, 1.0);

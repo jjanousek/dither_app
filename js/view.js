@@ -19,6 +19,7 @@ export class Viewport {
     this.tx = 0;
     this.ty = 0;
     this.fitMode = true;
+    this._lastW = 0;
 
     this.splitOn = false;
     this.splitFrac = 0.5;
@@ -71,8 +72,19 @@ export class Viewport {
 
   // Call whenever the output canvas bitmap size changes.
   contentResized() {
-    if (this.fitMode) this.fit();
-    else this.#positionDivider();
+    const w = this.output.width;
+    if (this.fitMode) {
+      this.fit();
+    } else if (this._lastW && w && w !== this._lastW) {
+      // same content at a different bitmap resolution (compare-hold, post-FX
+      // upscale, mode switch): compensate so the on-screen size doesn't jump
+      const r = this._lastW / w;
+      this.zoom = Math.min(MAX_ZOOM * 8, Math.max(MIN_ZOOM / 8, this.zoom * r));
+      this.apply();
+    } else {
+      this.#positionDivider();
+    }
+    this._lastW = w;
   }
 
   // ---- split ---------------------------------------------------------------
@@ -142,7 +154,9 @@ export class Viewport {
 
     // split divider drag
     let splitDrag = false;
+    this.divider.addEventListener('contextmenu', (e) => e.preventDefault());
     this.divider.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return; // right-click must not arm the drag
       e.stopPropagation();
       e.preventDefault(); // selection drags break the gesture, esp. in WebKit
       splitDrag = true;

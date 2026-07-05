@@ -248,7 +248,9 @@ export function buildPanel({ state, mount, onChange, exportSettings }) {
     if (a.colorMode !== 'bg') {
       color(eff, 'Background', { value: a.bg, oninput: (v) => { a.bg = v; change(); } });
     }
-    if (a.renderer !== 'shape') {
+    // quadrant "full color" splits colors per cell — no dot bitmap involved
+    const quadFullColor = a.renderer === 'quadrant' && a.colorMode === 'bg';
+    if (a.renderer !== 'shape' && !quadFullColor) {
       select(eff, 'Dither', {
         options: [
           { value: 'none', label: 'None' },
@@ -259,7 +261,7 @@ export function buildPanel({ state, mount, onChange, exportSettings }) {
         oninput: (v) => { a.dither = v; change(); },
       });
     }
-    if (a.renderer === 'quadrant' || a.renderer === 'braille') {
+    if ((a.renderer === 'quadrant' && !quadFullColor) || a.renderer === 'braille') {
       slider(eff, 'Dot threshold', {
         min: 0.1, max: 0.9, step: 0.01, value: a.dotThreshold, fmt: pct,
         oninput: (v) => { a.dotThreshold = v; change(); },

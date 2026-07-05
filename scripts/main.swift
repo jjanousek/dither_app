@@ -27,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let cfg = WKWebViewConfiguration()
         cfg.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        // never serve stale modules after an update
+        cfg.websiteDataStore = .nonPersistent()
         webView = WKWebView(frame: .zero, configuration: cfg)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -73,7 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if self.serverResponds() { return } // reuse an existing Ditherlab server
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            p.arguments = ["python3", "-m", "http.server", "8173", "--bind", "127.0.0.1"]
+            p.arguments = ["python3", "scripts/serve.py", "8173"]
             p.currentDirectoryURL = URL(fileURLWithPath: projectDir)
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice

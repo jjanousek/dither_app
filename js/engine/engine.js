@@ -106,8 +106,8 @@ export class Engine {
   render(source, srcW, srcH, p, maxPixels = Infinity) {
     if (!srcW || !srcH) return null;
 
-    if (p.mode === 'ascii') return this.#renderAscii(source, srcW, srcH, p);
-    if (p.mode !== 'dither') return this.#renderCells(source, srcW, srcH, p);
+    if (p.mode === 'ascii') return this.#renderAscii(source, srcW, srcH, p, maxPixels);
+    if (p.mode !== 'dither') return this.#renderCells(source, srcW, srcH, p, maxPixels);
 
     let w = Math.max(1, Math.round(srcW / p.pixelSize));
     let h = Math.max(1, Math.round(srcH / p.pixelSize));
@@ -305,7 +305,7 @@ export class Engine {
     return work;
   }
 
-  #renderAscii(source, srcW, srcH, p) {
+  #renderAscii(source, srcW, srcH, p, maxPixels = Infinity) {
     const a = p.ascii;
     // Renderer decides sub-cell sampling density:
     // ramp 1x1, shape 4x8 (glyph matching), quadrant 2x2, braille 2x4.
@@ -317,8 +317,14 @@ export class Engine {
     const cellH = a.cellSize;
     const font = fontSpec(a);
     const cellW = this.ascii.measure(font, cellH, MEASURE[renderer]);
-    const rows = Math.max(1, Math.round(srcH / cellH));
-    const cols = Math.max(1, Math.round((srcW / srcH) * rows * (cellH / cellW)));
+    let rows = Math.max(1, Math.round(srcH / cellH));
+    let cols = Math.max(1, Math.round((srcW / srcH) * rows * (cellH / cellW)));
+    // live-preview budget: shrink the grid, not the glyphs
+    if (cols * dx * rows * dy > maxPixels) {
+      const k = Math.sqrt(maxPixels / (cols * dx * rows * dy));
+      cols = Math.max(1, Math.floor(cols * k));
+      rows = Math.max(1, Math.floor(rows * k));
+    }
     const w = cols * dx;
     const h = rows * dy;
 
@@ -348,11 +354,17 @@ export class Engine {
     });
   }
 
-  #renderCells(source, srcW, srcH, p) {
+  #renderCells(source, srcW, srcH, p, maxPixels = Infinity) {
     const c = p.cells;
     const cell = Math.max(4, c.size);
-    const cols = Math.max(1, Math.round(srcW / cell));
-    const rows = Math.max(1, Math.round(srcH / cell));
+    let cols = Math.max(1, Math.round(srcW / cell));
+    let rows = Math.max(1, Math.round(srcH / cell));
+    if (cols * rows * cell * cell > maxPixels * 4) {
+      // cap the OUTPUT canvas area (cells draw at cell-size resolution)
+      const k = Math.sqrt((maxPixels * 4) / (cols * rows * cell * cell));
+      cols = Math.max(1, Math.floor(cols * k));
+      rows = Math.max(1, Math.floor(rows * k));
+    }
 
     this.#drawWork(source, cols, rows, p);
     const img = this.workCtx.getImageData(0, 0, cols, rows);
