@@ -8,12 +8,13 @@ import { RAMPS, FONTS } from './engine/ascii.js';
 import { applyPostFX } from './effects/postfx.js';
 import { PRESETS, shuffleParams } from './presets.js';
 import { loadFile, openWebcam, demoImage, demoPhoto, bindDropAndPaste } from './sources.js';
-import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob } from './export/exporters.js';
+import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob, canFrameExport, exportVideoFrameAccurate } from './export/exporters.js';
 import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js';
 import { Viewport } from './view.js';
 import { GenerativeSource } from './generate.js';
 
-const MAX_LIVE_PIXELS = 420_000;   // CPU error-diffusion budget for video preview
+const MAX_LIVE_PIXELS = 420_000;   // GPU-dither budget for live video preview
+const MAX_LIVE_CPU_PIXELS = 200_000; // tighter cap for the slow CPU live paths
 const EXPORT_PIXELS = 1_600_000;   // GIF/text exports render finer than the live preview
 const MAX_EXPORT_SIDE = 16384;     // canvas hard limits (Chromium/WebKit)
 const MAX_EXPORT_AREA = 64_000_000;
@@ -138,7 +139,17 @@ function renderOnce(budgetOverride = null) {
   const p = derived();
   // live sources AND animated stills render every frame -> cap the CPU budget
   const capped = source.type !== 'image' || isAnimating();
-  const result = engine.render(source.el, w, h, p, budgetOverride ?? (capped ? MAX_LIVE_PIXELS : Infinity));
+  let budget = capped ? MAX_LIVE_PIXELS : Infinity;
+  // CPU error-diffusion and ASCII shape-matching are the slow live paths
+  // (heavy per-pixel/per-cell JS, several times slower in WebKit). Cap them
+  // harder on live video/webcam so scrubbing stays smooth — exports use
+  // EXPORT_PIXELS, so their quality is unaffected.
+  if (budgetOverride === null && capped && source.type !== 'image') {
+    const cpuDither = state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'cpu';
+    const heavyAscii = state.mode === 'ascii' && state.ascii.renderer === 'shape';
+    if (cpuDither || heavyAscii) budget = MAX_LIVE_CPU_PIXELS;
+  }
+  const result = engine.render(source.el, w, h, p, budgetOverride ?? budget);
   if (result) present(result, w, h);
   return out;
 }
@@ -624,6 +635,35 @@ async function doExportVideo() {
     return;
   }
 
+  const name = `${source.name || 'ditherlab'}-${state.mode}`;
+
+  // Preferred: frame-accurate H.264 via WebCodecs. Renders each frame with no
+  // time pressure, so the exported clip is smooth no matter how slow the
+  // dither is on this device (silent — no audio).
+  if (canFrameExport()) {
+    let cancelled = false;
+    showBusy('Rendering video (frame-accurate)…', () => { cancelled = true; });
+    try {
+      await exportVideoFrameAccurate({
+        video: source.el,
+        renderFrame: () => { renderOnce(EXPORT_PIXELS); return out; },
+        maxWidth: 1280,
+        name,
+        onProgress: busyProgress,
+        onInfo: (msg) => toast(msg, 4000),
+        shouldAbort: () => cancelled,
+      });
+      toast('Video exported');
+    } catch (err) {
+      toast(err.message === 'cancelled' ? 'Export cancelled' : `Video export failed: ${err.message}`);
+    }
+    dirty = true; // restore the live preview resolution
+    hideBusy();
+    exporting = false;
+    return;
+  }
+
+  // Fallback (no WebCodecs): real-time capture, keeps audio.
   const exporter = new VideoExporter(out, source.el, {
     fps: 30,
     onProgress: busyProgress,
@@ -631,7 +671,7 @@ async function doExportVideo() {
   // cancel() aborts start(), which throws 'cancelled' and restores the video
   showBusy('Exporting video (plays through once)…', () => exporter.cancel());
   try {
-    await exporter.start(`${source.name || 'ditherlab'}-${state.mode}`);
+    await exporter.start(name);
     toast('Video exported');
   } catch (err) {
     toast(err.message === 'cancelled' ? 'Export cancelled' : `Video export failed: ${err.message}`);

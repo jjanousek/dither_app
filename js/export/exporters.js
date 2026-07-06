@@ -1,6 +1,105 @@
 // Export: PNG stills, WebM/MP4 video via MediaRecorder, animated GIF, ASCII text.
 
 import { GifEncoder } from './gif.js';
+import { Mp4Muxer } from './mp4.js';
+
+// Frame-accurate H.264/MP4 export via WebCodecs. Unlike the real-time
+// MediaRecorder path, this seeks the source frame by frame and renders each
+// one with no time pressure, so a slow dither can't judder the output — the
+// clip is limited by quality, not by how fast the device renders. Video only
+// (no audio). Returns false if WebCodecs is unavailable so the caller can
+// fall back to the real-time recorder.
+export function canFrameExport() {
+  return typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined';
+}
+
+export async function exportVideoFrameAccurate({
+  video, renderFrame, maxWidth = 1280, name = 'dithered',
+  onProgress = () => {}, onInfo = null, shouldAbort = null,
+}) {
+  // resolve the source frame rate (fall back to 30) and duration
+  if (!isFinite(video.duration)) {
+    video.currentTime = 1e9;
+    await new Promise((res) => {
+      const done = () => { video.removeEventListener('durationchange', done); res(); };
+      video.addEventListener('durationchange', done);
+      setTimeout(done, 4000);
+    });
+  }
+  const duration = video.duration;
+  if (!isFinite(duration) || duration <= 0) throw new Error('video duration unknown');
+  const fps = 30;
+  // hold all compressed samples until finalize -> bound memory (and export
+  // time) by capping the frame count; realistic clips are far under this
+  const MAX_FRAMES = 6000; // ~3.3 min at 30fps
+  let frameCount = Math.max(1, Math.round(duration * fps));
+  if (frameCount > MAX_FRAMES) {
+    frameCount = MAX_FRAMES;
+    onInfo?.(`Long clip: exporting the first ${Math.round(MAX_FRAMES / fps)}s`);
+  }
+
+  // encode size: upscale the rendered (chunky) frame with nearest-neighbor so
+  // the dither stays crisp. Cap the LONGER side (portrait clips too) and round
+  // to even dims (H.264 needs even, and level 4.0 covers up to 1280x1280).
+  const first = renderFrame();
+  const long = Math.max(first.width, first.height);
+  const k = long <= maxWidth ? Math.max(1, Math.floor(maxWidth / long)) : maxWidth / long;
+  const w = Math.max(2, Math.round(first.width * k) & ~1);
+  const h = Math.max(2, Math.round(first.height * k) & ~1);
+
+  const frame = document.createElement('canvas');
+  frame.width = w; frame.height = h;
+  const fctx = frame.getContext('2d');
+  fctx.imageSmoothingEnabled = false; // crisp pixels
+
+  const muxer = new Mp4Muxer(w, h, fps);
+  let encErr = null;
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addChunk(chunk, meta),
+    error: (e) => { encErr = e; },
+  });
+  // H.264 Baseline @ Level 4.0 (0x28): no B-frames (plays everywhere), and
+  // level 4.0's 8192-macroblock limit covers any frame up to 1280x1280.
+  const bitrate = Math.min(24e6, Math.max(2e6, Math.round(w * h * fps * 0.15)));
+  encoder.configure({ codec: 'avc1.420028', width: w, height: h, bitrate, framerate: fps, avc: { format: 'avc' } });
+
+  const wasLooping = video.loop;
+  const wasPaused = video.paused;
+  video.loop = false;
+  video.pause();
+
+  const seekTo = (t) => new Promise((res) => {
+    let timer = null;
+    const done = () => { video.removeEventListener('seeked', done); clearTimeout(timer); res(); };
+    video.addEventListener('seeked', done);
+    timer = setTimeout(done, 4000);
+    video.currentTime = t;
+  });
+
+  try {
+    for (let i = 0; i < frameCount; i++) {
+      if (shouldAbort && shouldAbort()) throw new Error('cancelled');
+      if (encErr) throw encErr;
+      await seekTo(Math.min(duration - 1e-3, i / fps));
+      const processed = renderFrame();
+      fctx.drawImage(processed, 0, 0, processed.width, processed.height, 0, 0, w, h);
+      const vf = new VideoFrame(frame, { timestamp: Math.round((i * 1e6) / fps), duration: Math.round(1e6 / fps) });
+      encoder.encode(vf, { keyFrame: i % 60 === 0 });
+      vf.close();
+      // backpressure: don't let the encode queue run away, and keep UI alive
+      while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 4));
+      onProgress((i + 1) / frameCount);
+    }
+    await encoder.flush();
+    if (encErr) throw encErr;
+    encoder.close();
+    downloadBlob(muxer.finalize(), `${name}.mp4`);
+  } finally {
+    if (encoder.state !== 'closed') { try { encoder.close(); } catch { /* already closing */ } }
+    video.loop = wasLooping;
+    if (!wasPaused) video.play().catch(() => {});
+  }
+}
 
 export function downloadBlob(blob, filename) {
   const a = document.createElement('a');
