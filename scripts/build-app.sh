@@ -23,9 +23,11 @@ for s in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$TMP/Ditherlab.icns"
 
-echo "→ compile"
+echo "→ compile (universal)"
 mkdir -p "$TMP/Ditherlab.app/Contents/MacOS" "$TMP/Ditherlab.app/Contents/Resources"
-swiftc -O -swift-version 5 -o "$TMP/Ditherlab.app/Contents/MacOS/Ditherlab" main.swift
+swiftc -O -swift-version 5 -target arm64-apple-macos13.5 -o "$TMP/dl-arm64" main.swift
+swiftc -O -swift-version 5 -target x86_64-apple-macos13.5 -o "$TMP/dl-x86_64" main.swift
+lipo -create "$TMP/dl-arm64" "$TMP/dl-x86_64" -output "$TMP/Ditherlab.app/Contents/MacOS/Ditherlab"
 
 echo "→ bundle"
 cp "$TMP/Ditherlab.icns" "$TMP/Ditherlab.app/Contents/Resources/Ditherlab.icns"
