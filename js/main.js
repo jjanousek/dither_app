@@ -7,7 +7,7 @@ import { getPalette } from './palettes.js';
 import { RAMPS, FONTS } from './engine/ascii.js';
 import { applyPostFX } from './effects/postfx.js';
 import { PRESETS, shuffleParams } from './presets.js';
-import { loadFile, openWebcam, demoImage, bindDropAndPaste } from './sources.js';
+import { loadFile, openWebcam, demoImage, demoPhoto, bindDropAndPaste } from './sources.js';
 import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob } from './export/exporters.js';
 import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js';
 import { Viewport } from './view.js';
@@ -805,7 +805,7 @@ $('file-input').addEventListener('change', (e) => {
   e.target.value = '';
 });
 
-$('btn-demo').onclick = () => setSource(demoImage());
+$('btn-demo').onclick = async () => setSource(await demoPhoto().catch(() => demoImage()));
 
 $('btn-generate').onclick = () => {
   if (exporting) return;
@@ -947,7 +947,7 @@ $('speed').addEventListener('change', () => {
 bindDropAndPaste($('viewport'), openFile);
 
 // boot with the demo scene
-setSource(demoImage());
+setSource(await demoPhoto().catch(() => demoImage()));
 
 // shareable boot params: ?preset=<id>&split=1
 const qp = new URLSearchParams(location.search);

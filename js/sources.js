@@ -106,6 +106,23 @@ export function bindDropAndPaste(target, onFile) {
   });
 }
 
+// Bundled demo photo (falls back to the procedural scene if it's missing).
+export function demoPhoto(url = 'assets/demo.webp') {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({
+      type: 'image',
+      el: img,
+      width: img.naturalWidth,
+      height: img.naturalHeight,
+      name: 'demo',
+      isDemo: true,
+    });
+    img.onerror = () => reject(new Error('demo image missing'));
+    img.src = url;
+  });
+}
+
 // Procedural demo scene so the app never opens empty.
 export function demoImage(w = 1200, h = 800) {
   const c = document.createElement('canvas');
