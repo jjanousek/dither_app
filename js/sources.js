@@ -107,7 +107,7 @@ export function bindDropAndPaste(target, onFile) {
 }
 
 // Bundled demo photo (falls back to the procedural scene if it's missing).
-export function demoPhoto(url = 'assets/demo.webp') {
+export function demoPhoto(url = 'assets/demo.jpg') {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => resolve({
