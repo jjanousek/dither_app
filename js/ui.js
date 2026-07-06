@@ -87,6 +87,7 @@ function select(body, label, { options, value, oninput }) {
     const opt = document.createElement('option');
     opt.value = o.value;
     opt.textContent = o.label;
+    if (o.disabled) opt.disabled = true;
     if (o.value === value) opt.selected = true;
     parent.appendChild(opt);
   };
@@ -433,6 +434,9 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
 
   // --- ANIMATION ---
   const an = section(mount, 'Animation');
+  // flow/shimmer drift the dither pattern — meaningless for error diffusion
+  // (no fixed lattice) and for non-dither modes, so say it in the option
+  const patternOk = state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'gpu';
   select(an, 'Style', {
     options: [
       { value: 'none', label: 'None' },
@@ -440,8 +444,8 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
       { value: 'pulse', label: 'Pulse (heartbeat)' },
       { value: 'sweep', label: 'Sweep (light band)' },
       { value: 'wave', label: 'Wave (distortion)' },
-      { value: 'flow', label: 'Flow (pattern drift)' },
-      { value: 'shimmer', label: 'Shimmer (pattern jitter)' },
+      { value: 'flow', label: patternOk ? 'Flow (pattern drift)' : 'Flow — needs a pattern dither', disabled: !patternOk },
+      { value: 'shimmer', label: patternOk ? 'Shimmer (pattern jitter)' : 'Shimmer — needs a pattern dither', disabled: !patternOk },
     ],
     value: state.anim.style,
     oninput: (v) => { state.anim.style = v; changeAndRefresh(); },
@@ -470,10 +474,10 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         oninput: (v) => { state.anim.direction = v; change(); },
       });
     }
-    if (state.anim.style === 'flow' || state.anim.style === 'shimmer') {
+    if ((state.anim.style === 'flow' || state.anim.style === 'shimmer') && !patternOk) {
       const hint = document.createElement('div');
       hint.style.cssText = 'font-size:11px;color:var(--text-dim);line-height:1.5';
-      hint.textContent = 'Flow and Shimmer move the pattern of ordered, noise and halftone algorithms. Error-diffusion algorithms have no fixed pattern to animate — pick Bayer, Blue Noise or Halftone to see it.';
+      hint.textContent = 'Flow and Shimmer move the pattern of ordered, noise and halftone algorithms. The current algorithm has no fixed pattern to animate — pick Bayer, Blue Noise or Halftone to see it.';
       an.appendChild(hint);
     }
     const hint2 = document.createElement('div');

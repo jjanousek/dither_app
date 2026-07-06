@@ -142,6 +142,11 @@ export class Engine {
 
   // Downsample the source into the shared work canvas, applying the CSS-filter
   // adjustments and the canvas-space animation styles (sweep / wave).
+  //
+  // Still images cache the downsampled base: a large photo (10MP+) put
+  // through a high-quality resample EVERY animation frame dominates the
+  // frame budget (especially in WebKit) and turns 60fps animations into a
+  // slideshow. The cache key covers everything that feeds the base.
   #drawWork(source, w, h, p) {
     const work = this.work;
     if (work.width !== w || work.height !== h) {
@@ -149,12 +154,32 @@ export class Engine {
       work.height = h;
     }
     const ctx = this.workCtx;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.clearRect(0, 0, w, h); // transparent sources must not ghost old frames
-    ctx.filter = this.#filterString(p);
-    ctx.drawImage(source, 0, 0, w, h);
-    ctx.filter = 'none';
+    if (p.staticSource) {
+      const key = `${w}x${h}|${this.#filterString(p)}`;
+      if (this.baseSrc !== source || this.baseKey !== key) {
+        if (!this.baseCanvas) this.baseCanvas = document.createElement('canvas');
+        const c = this.baseCanvas;
+        c.width = w;
+        c.height = h;
+        const bctx = c.getContext('2d');
+        bctx.imageSmoothingEnabled = true;
+        bctx.imageSmoothingQuality = 'high';
+        bctx.filter = this.#filterString(p);
+        bctx.drawImage(source, 0, 0, w, h);
+        bctx.filter = 'none';
+        this.baseSrc = source;
+        this.baseKey = key;
+      }
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(this.baseCanvas, 0, 0);
+    } else {
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.clearRect(0, 0, w, h); // transparent sources must not ghost old frames
+      ctx.filter = this.#filterString(p);
+      ctx.drawImage(source, 0, 0, w, h);
+      ctx.filter = 'none';
+    }
     this.#animCanvas(p, w, h);
     return work;
   }

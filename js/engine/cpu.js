@@ -154,11 +154,38 @@ export function errorDiffusion(imageData, palette, kernelId, { strength = 1, ser
     buf[j + 2] = d[i + 2];
   }
 
+  // Flatten the kernel into typed arrays: destructuring [dx,dy,wgt] per pixel
+  // per tap dominates the profile (this loop runs every animation frame).
+  // Weights stay doubles so the output is bit-identical to the naive loop.
+  const taps = kernel.length;
+  const kdxF = new Int32Array(taps);
+  const kdxR = new Int32Array(taps);
+  const kdy = new Int32Array(taps);
+  const kw = new Float64Array(taps);
+  const offF = new Int32Array(taps); // linear buffer delta from the current px
+  const offR = new Int32Array(taps);
+  let maxDx = 0;
+  let maxDy = 0;
+  for (let t = 0; t < taps; t++) {
+    const [dx, dy, wgt] = kernel[t];
+    kdxF[t] = dx;
+    kdxR[t] = -dx;
+    kdy[t] = dy;
+    kw[t] = wgt;
+    offF[t] = (dy * w + dx) * 3;
+    offR[t] = (dy * w - dx) * 3;
+    if (Math.abs(dx) > maxDx) maxDx = Math.abs(dx);
+    if (dy > maxDy) maxDy = dy;
+  }
+
   for (let y = 0; y < h; y++) {
     const reverse = serpentine && (y & 1) === 1;
     const xStart = reverse ? w - 1 : 0;
     const xEnd = reverse ? -1 : w;
     const xStep = reverse ? -1 : 1;
+    const adx = reverse ? kdxR : kdxF;
+    const off = reverse ? offR : offF;
+    const safeRow = y + maxDy < h; // interior pixels skip all bounds checks
 
     for (let x = xStart; x !== xEnd; x += xStep) {
       const j = (y * w + x) * 3;
@@ -176,14 +203,24 @@ export function errorDiffusion(imageData, palette, kernelId, { strength = 1, ser
       buf[j + 1] = pg;
       buf[j + 2] = pb;
 
-      for (const [dx, dy, wgt] of kernel) {
-        const nx = x + (reverse ? -dx : dx);
-        const ny = y + dy;
-        if (nx < 0 || nx >= w || ny >= h) continue;
-        const k = (ny * w + nx) * 3;
-        buf[k] += er * wgt;
-        buf[k + 1] += eg * wgt;
-        buf[k + 2] += eb * wgt;
+      if (safeRow && x >= maxDx && x < w - maxDx) {
+        for (let t = 0; t < taps; t++) {
+          const k = j + off[t];
+          const wgt = kw[t];
+          buf[k] += er * wgt;
+          buf[k + 1] += eg * wgt;
+          buf[k + 2] += eb * wgt;
+        }
+      } else {
+        for (let t = 0; t < taps; t++) {
+          const nx = x + adx[t];
+          if (nx < 0 || nx >= w || y + kdy[t] >= h) continue;
+          const k = j + off[t];
+          const wgt = kw[t];
+          buf[k] += er * wgt;
+          buf[k + 1] += eg * wgt;
+          buf[k + 2] += eb * wgt;
+        }
       }
     }
   }

@@ -114,7 +114,12 @@ function deriveParams(s) {
     : (RAMPS[s.ascii.rampId] || RAMPS.classic).chars;
   return { ...s, colors, ascii: { ...s.ascii, chars: ramp } };
 }
-const derived = () => ({ ...deriveParams(state), animPhase: phaseOverride ?? animPhase });
+const derived = () => ({
+  ...deriveParams(state),
+  animPhase: phaseOverride ?? animPhase,
+  // still images can cache their downsampled base across animation frames
+  staticSource: source?.type === 'image',
+});
 
 function srcDims() {
   if (!source) return [0, 0];
