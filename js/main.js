@@ -167,7 +167,9 @@ function present(result, srcW) {
   const pixelate = state.mode === 'dither'; // chunky pixels stay crisp even with FX
   out.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
-  if (view.splitOn && !comparing) drawSplitOverlay();
+  // not during exports: out is at export resolution and the overlay is hidden
+  // behind the busy screen anyway
+  if (view.splitOn && !comparing && !exporting) drawSplitOverlay();
 }
 
 function presentOriginal() {
@@ -221,9 +223,10 @@ function loop(t) {
     source.gen.phase = (source.gen.phase + (dt / 1000) * source.gen.params.speed * GEN_CYCLES_PER_SEC) % 1;
   }
   const isLive = source.type !== 'image';
-  const playing = isLive && (source.el instanceof HTMLVideoElement
-    ? (!source.el.paused && !source.el.ended)
-    : true); // webcam-less live sources (generated scenes) always play
+  const playing = isLive && genPhaseOverride === null // gen bake renders itself
+    && (source.el instanceof HTMLVideoElement
+      ? (!source.el.paused && !source.el.ended)
+      : true); // webcam-less live sources (generated scenes) always play
   if (!dirty && !playing && !animating) return;
   dirty = false;
 
@@ -424,7 +427,10 @@ function setSource(next) {
   rebuildPanel(); // scene controls appear only for generated sources
   dirty = true;
   setTimeout(renderPresetThumbs, 250);
-  toast(`${source.name || source.type} · ${source.width}×${source.height}`);
+  // a slow webcam can arrive with 0×0 dims and fill them in a moment later
+  toast(source.width
+    ? `${source.name || source.type} · ${source.width}×${source.height}`
+    : `${source.name || source.type} — starting…`);
 }
 
 async function openFile(file) {
@@ -472,6 +478,12 @@ async function doExportPNG() {
   if (!source || exporting) return;
   exporting = true; // block source swaps / concurrent exports mid-encode
   let outC;
+  let W = 0;
+  let H = 0; // hoisted: the toBlob callback below outlives the try block
+  // deterministic bake: an animated still exports its reference frame, not
+  // whatever instant the clock happened to be at when the button was clicked
+  const pinPhase = source.type === 'image' && isAnimating() && phaseOverride === null;
+  if (pinPhase) phaseOverride = 0;
   try {
     const [w, h] = srcDims();
     toast('Rendering…');
@@ -480,8 +492,8 @@ async function doExportPNG() {
     const result = engine.render(source.el, w, h, p, Infinity);
     if (!result) return;
 
-    let W = result.width;
-    let H = result.height;
+    W = result.width;
+    H = result.height;
     if (state.mode === 'dither') {
       if (exportSettings.pngSize === 'source') { W = w; H = h; }
       if (exportSettings.pngSize === 'source2x') { W = w * 2; H = h * 2; }
@@ -518,6 +530,7 @@ async function doExportPNG() {
       return cc;
     })();
   } finally {
+    if (pinPhase) phaseOverride = null;
     exporting = false;
   }
   if (!outC) return;
@@ -797,7 +810,15 @@ $('btn-demo').onclick = () => setSource(demoImage());
 $('btn-generate').onclick = () => {
   if (exporting) return;
   if (!gen) {
-    gen = new GenerativeSource(1920, 1200);
+    try {
+      gen = new GenerativeSource(1920, 1200);
+    } catch (err) {
+      // constructor throws on shader compile/link failure (lost context, OOM)
+      gen = null;
+      toast('Could not start generative scenes — try again');
+      console.warn('generate:', err);
+      return;
+    }
     if (!gen.isSupported()) {
       toast('WebGL2 unavailable — cannot generate scenes');
       gen = null;
@@ -848,7 +869,7 @@ $('btn-shuffle').onclick = () => {
   rebuildPanel();
   updateExportButtons();
   updateStatus();
-  pushHistory();
+  commitHistory(); // discrete action: its own undo step, never merged with the next edit
   dirty = true;
   toast('Shuffled');
 };
@@ -941,8 +962,15 @@ if (bootPreset) {
 }
 const genParam = qp.get('gen');
 if (genParam) {
-  gen = new GenerativeSource(1920, 1200);
-  if (gen.isSupported()) {
+  // same guard as btn-generate: a constructor throw here would abort the
+  // whole module (no render loop, dead app) instead of degrading to the demo
+  try {
+    gen = new GenerativeSource(1920, 1200);
+  } catch (err) {
+    gen = null;
+    console.warn('generate:', err);
+  }
+  if (gen && gen.isSupported()) {
     gen.setScene(genParam, { randomizeSeed: false });
     gen.tick(0);
     setSource({

@@ -60,6 +60,9 @@ export async function openWebcam() {
       t = setTimeout(settle, 3000);
     });
   }
+  // dimensions may still be 0 here (slow-warming camera) — return the source
+  // anyway: the render loop reads videoWidth live every frame and self-heals
+  // the moment the first frame arrives
   return {
     type: 'webcam',
     el: video,
@@ -79,10 +82,19 @@ export function loadFile(file) {
 // Wire drag & drop + clipboard paste. onFile receives a File.
 export function bindDropAndPaste(target, onFile) {
   const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  // dragenter/dragleave fire for every child crossed; count depth so the
+  // highlight only clears when the drag truly leaves the target
+  let depth = 0;
+  target.addEventListener('dragenter', (e) => { stop(e); depth++; target.classList.add('dragging'); });
+  // dragover must keep calling preventDefault or the drop won't be allowed
   target.addEventListener('dragover', (e) => { stop(e); target.classList.add('dragging'); });
-  target.addEventListener('dragleave', (e) => { stop(e); target.classList.remove('dragging'); });
+  target.addEventListener('dragleave', (e) => {
+    stop(e);
+    if (--depth <= 0) { depth = 0; target.classList.remove('dragging'); }
+  });
   target.addEventListener('drop', (e) => {
     stop(e);
+    depth = 0;
     target.classList.remove('dragging');
     const file = e.dataTransfer?.files?.[0];
     if (file) onFile(file);

@@ -95,11 +95,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sem = DispatchSemaphore(value: 0)
         var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/")!, timeoutInterval: 0.6)
         req.cachePolicy = .reloadIgnoringLocalCacheData
-        URLSession.shared.dataTask(with: req) { data, response, _ in
+        URLSession.shared.dataTask(with: req) { data, response, error in
             if let d = data, let s = String(data: d, encoding: .utf8),
                s.lowercased().contains("ditherlab") {
                 result = .ditherlab
             } else if data != nil || response != nil {
+                result = .foreign
+            } else if let urlError = error as? URLError,
+                      urlError.code == .timedOut || urlError.code == .networkConnectionLost {
+                // something holds the port but won't speak HTTP (e.g. a TCP
+                // squatter) — spawning here would hit EADDRINUSE, so skip it;
+                // only connection-refused (nothing listening) stays .free
                 result = .foreign
             }
             sem.signal()

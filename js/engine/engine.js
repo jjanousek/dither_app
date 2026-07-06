@@ -321,13 +321,32 @@ export class Engine {
         offsetY: drift.oy,
       });
     } else if (algo.mode === 2) {
-      whiteNoiseDither(img, pal.float, { strength: p.ditherStrength, bias });
+      // same animation drift/reseed as #renderGPU: flow steps the seed (a
+      // hash field can't translate seamlessly), shimmer jumps offsets + seed
+      let drift = this.#matAnim(p, 4);
+      if (p.anim?.style === 'flow') {
+        drift = { ox: 0, oy: 0, seed: Math.floor(((p.animPhase || 0) % 1) * 16) };
+      }
+      whiteNoiseDither(img, pal.float, {
+        strength: p.ditherStrength,
+        bias,
+        seed: drift.seed,
+        ox: drift.ox,
+        oy: drift.oy,
+      });
     } else if (algo.mode === 3 || algo.mode === 4) {
+      let drift = this.#matAnim(p, Math.max(2, p.halftoneScale));
+      if (algo.mode === 4 && p.anim?.style === 'flow' && drift.oy === 0 && drift.ox !== 0) {
+        // lines only vary in y — scroll perpendicular (same as the GPU path)
+        drift = { ox: 0, oy: drift.ox, seed: drift.seed };
+      }
       halftoneDither(img, pal.float, {
         scale: p.halftoneScale,
         angle: p.halftoneAngle,
         bias: p.threshold - 0.5,
         line: algo.mode === 4,
+        ox: drift.ox,
+        oy: drift.oy,
       });
     } else {
       quantize(img, pal.float, bias);

@@ -51,7 +51,7 @@ export const DEFAULTS = {
     invertRamp: false,     // base mapping is bright=dense (right for dark backgrounds)
     dither: 'floyd',       // 'none' | 'floyd' | 'bayer' — level/dot dithering
     dotThreshold: 0.5,     // quadrant & braille dot cutoff
-    edgeStrength: 0,       // 0..1 Sobel edge-directed glyphs (ramp & shape)
+    edgeStrength: 0,       // 0..1 Sobel edge-directed glyphs (ramp renderer only)
     autoContrast: true,    // percentile luminance stretch
   },
 

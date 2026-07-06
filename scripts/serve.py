@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -32,11 +33,22 @@ def _watch_parent(pid):
         time.sleep(5)
         try:
             os.kill(pid, 0)  # signal 0: existence check only
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # PermissionError: the PID was reused by another user's process,
+            # so our actual parent is dead — treat it the same as not found.
             os._exit(0)
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    def send_head(self):
+        # never serve dot-prefixed segments (.git/, .env, ...): hidden files
+        # are project internals, not app assets
+        path = urllib.parse.unquote(self.path.split('?', 1)[0].split('#', 1)[0])
+        if any(seg.startswith('.') for seg in path.split('/') if seg):
+            self.send_error(404, "Not found")
+            return None
+        return super().send_head()
+
     def end_headers(self):
         # no-store: mtime-based 304s must never serve stale modules
         self.send_header('Cache-Control', 'no-store, must-revalidate')

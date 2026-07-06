@@ -10,12 +10,19 @@ import { GEN_SCENES } from './generate.js';
 
 // ---------- tiny component helpers ----------
 
+// survives panel rebuilds — a collapsed section stays collapsed when the
+// user switches mode/algorithm/palette and the whole panel is reconstructed
+const sectionCollapsed = new Map();
+
 function section(mount, title, { collapsed = false } = {}) {
   const el = document.createElement('div');
-  el.className = 'section' + (collapsed ? ' collapsed' : '');
+  const isCollapsed = sectionCollapsed.get(title) ?? collapsed;
+  el.className = 'section' + (isCollapsed ? ' collapsed' : '');
   const h = document.createElement('h3');
   h.textContent = title;
-  h.onclick = () => el.classList.toggle('collapsed');
+  h.onclick = () => {
+    sectionCollapsed.set(title, el.classList.toggle('collapsed'));
+  };
   const body = document.createElement('div');
   body.className = 'section-body';
   el.append(h, body);

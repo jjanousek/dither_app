@@ -246,8 +246,31 @@ export class GenerativeSource {
 
     const gl = this.canvas.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false });
     this.gl = gl;
+    this.lost = false;
     if (!gl) return; // isSupported() gates usage
 
+    // without preventDefault the browser never restores a lost context and
+    // the scene canvas stays blank until a full page reload
+    this.canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      this.lost = true;
+    });
+    this.canvas.addEventListener('webglcontextrestored', () => {
+      try {
+        this.#initGL();
+        this.lost = false;
+        this.tick(this.phase);
+      } catch (err) {
+        console.warn('generate.js: context restore failed', err);
+      }
+    });
+
+    this.#initGL();
+  }
+
+  // (re)build the program — all GL objects die with a lost context
+  #initGL() {
+    const gl = this.gl;
     const compile = (type, src) => {
       const sh = gl.createShader(type);
       gl.shaderSource(sh, src);
@@ -295,7 +318,7 @@ export class GenerativeSource {
   // render one frame at the given phase (0..1)
   tick(phase) {
     const gl = this.gl;
-    if (!gl) return;
+    if (!gl || this.lost || gl.isContextLost()) return;
     const p = this.params;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.uniform2f(this.u.u_res, this.canvas.width, this.canvas.height);

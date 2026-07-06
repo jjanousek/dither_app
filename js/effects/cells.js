@@ -142,7 +142,7 @@ function renderDots(ctx, grid, o) {
 // a shading gradient). Each entry is a createLinearGradient(0,0,0,1) with the
 // base color at 0 and the 20%-darker shade at 1; position/scale come from the
 // canvas transform, so the fill matches the old per-cell gradient. Bounded:
-// cleared if it ever grows past 4096 (15-bit key caps it at ~32k anyway).
+// oldest entry evicted once it reaches 4096 (15-bit key caps it at ~32k anyway).
 const legoBodyCache = new Map();
 
 function renderLego(ctx, grid, o) {
@@ -201,7 +201,9 @@ function renderLego(ctx, grid, o) {
       const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
       let body = legoBodyCache.get(key);
       if (!body) {
-        if (legoBodyCache.size > 4096) legoBodyCache.clear();
+        // At capacity: evict the oldest entry (Maps iterate in insertion
+        // order) instead of wiping the cache mid-frame.
+        if (legoBodyCache.size >= 4096) legoBodyCache.delete(legoBodyCache.keys().next().value);
         body = ctx.createLinearGradient(0, 0, 0, 1);
         body.addColorStop(0, `rgb(${r},${g},${b})`);
         body.addColorStop(1, `rgb(${Math.round(r * 0.8)},${Math.round(g * 0.8)},${Math.round(b * 0.8)})`);
@@ -369,7 +371,7 @@ function renderVoxel(ctx, grid, o) {
 // quantized RGB (5 bits/channel) so nearby colors share an entry across frames.
 // One gradient per color; position/scale come from the canvas transform and
 // per-cell luminance is applied via globalAlpha, so output is identical to
-// building a gradient per cell. Bounded: cleared if it ever grows past 4096.
+// building a gradient per cell. Bounded: oldest entry evicted at 4096.
 const glowCache = new Map();
 
 function renderLED(ctx, grid, o) {
@@ -411,7 +413,9 @@ function renderLED(ctx, grid, o) {
       const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
       let glow = glowCache.get(key);
       if (!glow) {
-        if (glowCache.size > 4096) glowCache.clear();
+        // At capacity: evict the oldest entry (Maps iterate in insertion
+        // order) instead of wiping the cache mid-frame.
+        if (glowCache.size >= 4096) glowCache.delete(glowCache.keys().next().value);
         // Unit gradient with the per-cell alpha factored out into globalAlpha:
         // stops match the previous per-cell gradient (a, a*0.45, 0) exactly.
         glow = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);

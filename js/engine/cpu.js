@@ -313,15 +313,18 @@ function hash12(x, y) {
   return fract((p3x + p3y) * p3z);
 }
 
-export function whiteNoiseDither(imageData, palette, { strength = 1, bias = 0 } = {}) {
+export function whiteNoiseDither(imageData, palette, { strength = 1, bias = 0, seed = 0, ox = 0, oy = 0 } = {}) {
   const { width: w, height: h, data: d } = imageData;
   const n = palette.length / 3;
   const spread = (255 * strength) / Math.max(1, n - 1) * 1.5;
   const cl = (v) => Math.min(255, Math.max(0, v));
+  // same reseed offsets as the shader so flow/shimmer animate on this path too
+  const sx = Math.floor(ox) + seed * 91.7;
+  const sy = Math.floor(oy) + seed * 37.3;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
-      const t = hash12(x, y) - 0.5 + bias;
+      const t = hash12(x + sx, y + sy) - 0.5 + bias;
       const pi = nearestIndex(palette, n, cl(d[i] + t * spread), cl(d[i + 1] + t * spread), cl(d[i + 2] + t * spread));
       d[i] = palette[pi];
       d[i + 1] = palette[pi + 1];
@@ -330,7 +333,7 @@ export function whiteNoiseDither(imageData, palette, { strength = 1, bias = 0 } 
   }
 }
 
-export function halftoneDither(imageData, palette, { scale = 6, angle = 45, bias = 0, line = false } = {}) {
+export function halftoneDither(imageData, palette, { scale = 6, angle = 45, bias = 0, line = false, ox = 0, oy = 0 } = {}) {
   const { width: w, height: h, data: d } = imageData;
   const n = palette.length / 3;
   // darkest / brightest palette entries (same as paletteExtremes in the shader)
@@ -349,8 +352,10 @@ export function halftoneDither(imageData, palette, { scale = 6, angle = 45, bias
       const i = (y * w + x) * 4;
       const lum = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
       const l = Math.min(1, Math.max(0, lum + bias));
-      const px = ca * x - sa * y;
-      const py = sa * x + ca * y;
+      // rot(a)*pix in the shader's column-major convention, drift after
+      // rotation (same as `rot(u_halftoneAngle) * pix + u_matOffset`)
+      const px = ca * x + sa * y + ox;
+      const py = -sa * x + ca * y + oy;
       let on;
       if (line) {
         on = Math.abs(fract(py / s) - 0.5) * 2 <= (1 - l);
