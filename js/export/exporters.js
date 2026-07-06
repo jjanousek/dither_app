@@ -242,17 +242,73 @@ export class VideoExporter {
 // GIF export: samples processed frames while the video plays once.
 // renderFrame() must return the current processed canvas.
 // ---------------------------------------------------------------------------
-export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, name = 'dithered', onProgress = () => {}, onInfo = null, animate = null, shouldAbort = null }) {
+export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, name = 'dithered', onProgress = () => {}, onInfo = null, animate = null, shouldAbort = null, smooth = false }) {
   const first = renderFrame();
-  const scale = Math.min(1, maxWidth / first.width);
-  const w = Math.max(1, Math.round(first.width * scale));
-  const h = Math.max(1, Math.round(first.height * scale));
+  // Dither patterns don't survive fractional resampling — nearest-neighbor at
+  // a ratio like 0.876 drops irregular rows/columns and shreds the pattern.
+  // Snap to a whole-number divisor of the frame instead, picking the divisor
+  // whose OUTPUT width lands closest to the request (ties prefer the larger,
+  // crisper output). ÷1 when 'native' or the request is at/above frame size.
+  let div = 1;
+  if (isFinite(maxWidth) && first.width > maxWidth) {
+    const lo = Math.max(1, Math.floor(first.width / maxWidth));
+    const hi = lo + 1;
+    div = (maxWidth - first.width / hi) < (first.width / lo - maxWidth) ? hi : lo;
+  }
+  const w = Math.max(1, Math.floor(first.width / div));
+  const h = Math.max(1, Math.floor(first.height / div));
 
-  const frame = document.createElement('canvas');
-  frame.width = w;
-  frame.height = h;
-  const fctx = frame.getContext('2d', { willReadFrequently: true });
-  fctx.imageSmoothingEnabled = false;
+  // Memory bound for baked loops (the video path has its own below): at large
+  // sizes, retaining every frame would exhaust the tab. Sampling the same
+  // cycle at a lower fps keeps the loop seamless and the memory flat.
+  if (animate?.count) {
+    const maxFrames = Math.max(24, Math.floor(60e6 / (w * h)));
+    if (animate.count > maxFrames) {
+      const k = Math.ceil(animate.count / maxFrames);
+      animate = { ...animate, count: Math.ceil(animate.count / k) };
+      fps /= k;
+      // let the caller re-derive any nested animation rate for the new count,
+      // or a fast effect layered on a slow scene aliases into a strobe
+      animate.onResample?.(animate.count);
+      onInfo?.(`Large GIF: sampling ${Math.round(fps)} fps to bound memory`);
+    }
+  }
+
+  // Grab a frame at exactly 1 GIF pixel per div×div source block. Canvas
+  // drawImage is NOT a reliable decimator (Chrome box-filters downscales even
+  // with imageSmoothingEnabled=false), so sample the pixels ourselves:
+  // hard-edged content (dither) takes one exact pixel per block; smooth
+  // content (ASCII glyphs, cells) averages the block, or 1px strokes would
+  // randomly hit/miss the sample grid and speckle between frames.
+  const dst = div > 1 ? new Uint8ClampedArray(w * h * 4) : null;
+  const grab = (srcCanvas) => {
+    const ctx = srcCanvas.getContext('2d', { willReadFrequently: true });
+    const img = ctx.getImageData(0, 0, w * div, h * div).data;
+    if (div === 1) return img;
+    const rowStride = w * div * 4;
+    const n = div * div;
+    for (let y = 0; y < h; y++) {
+      let di = y * w * 4;
+      const rowStart = y * div * rowStride;
+      for (let x = 0; x < w; x++, di += 4) {
+        const si = rowStart + x * div * 4;
+        if (smooth) {
+          let r = 0, g = 0, b = 0;
+          for (let by = 0; by < div; by++) {
+            let bi = si + by * rowStride;
+            for (let bx = 0; bx < div; bx++, bi += 4) {
+              r += img[bi]; g += img[bi + 1]; b += img[bi + 2];
+            }
+          }
+          dst[di] = r / n; dst[di + 1] = g / n; dst[di + 2] = b / n;
+        } else {
+          dst[di] = img[si]; dst[di + 1] = img[si + 1]; dst[di + 2] = img[si + 2];
+        }
+        dst[di + 3] = 255;
+      }
+    }
+    return dst;
+  };
 
   const enc = new GifEncoder(w, h, { fps });
 
@@ -263,9 +319,7 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
       // overlay paints and Cancel clicks are processed.
       for (let i = 0; i < animate.count; i++) {
         animate.setPhase(i / animate.count);
-        const processed = renderFrame();
-        fctx.drawImage(processed, 0, 0, w, h);
-        enc.addFrame(fctx.getImageData(0, 0, w, h).data);
+        enc.addFrame(grab(renderFrame()));
         onProgress((i + 1) / animate.count);
         await new Promise((r) => setTimeout(r, 0));
       }
@@ -274,8 +328,7 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
       return;
     }
     // Single image -> single-frame GIF
-    fctx.drawImage(first, 0, 0, w, h);
-    enc.addFrame(fctx.getImageData(0, 0, w, h).data);
+    enc.addFrame(grab(first));
     downloadBlob(await enc.finish(shouldAbort), `${name}.gif`);
     return;
   }
@@ -321,9 +374,7 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
       // animated video: lock the phase to the video timeline, not wall clock
       animate?.setTime?.(i * step);
       await seekTo(Math.min(duration - 0.001, i * step));
-      const processed = renderFrame();
-      fctx.drawImage(processed, 0, 0, w, h);
-      enc.addFrame(fctx.getImageData(0, 0, w, h).data);
+      enc.addFrame(grab(renderFrame()));
       onProgress((i + 1) / frameCount);
     }
 

@@ -625,7 +625,8 @@ async function doExportVideo() {
 async function doExportGIF() {
   if (!source || exporting) return;
   exporting = true;
-  const maxWidth = parseInt(exportSettings.gifSize, 10);
+  // 'native' = exactly the rendered frame, no resampling
+  const maxWidth = exportSettings.gifSize === 'native' ? Infinity : parseInt(exportSettings.gifSize, 10);
   let cancelled = false;
   showBusy('Encoding GIF…', () => { cancelled = true; });
 
@@ -638,12 +639,18 @@ async function doExportGIF() {
     fps = count / cycleSec;
     // effect animation runs a whole number of its own cycles inside the
     // scene loop, so both wrap seamlessly in the baked GIF
-    const animCycles = isAnimating() ? Math.max(1, Math.round(cycleSec * state.anim.speed * 0.15)) : 0;
+    let animCycles = isAnimating() ? Math.max(1, Math.round(cycleSec * state.anim.speed * 0.15)) : 0;
     animate = {
       count,
       setPhase: (ph) => {
         genPhaseOverride = ph;
         if (animCycles) phaseOverride = (ph * animCycles) % 1;
+      },
+      // memory guard lowered the frame count: keep >=3 samples per effect
+      // cycle (still a whole number of cycles -> still seamless) or the
+      // effect strobes in the bake
+      onResample: (newCount) => {
+        if (animCycles) animCycles = Math.max(1, Math.min(animCycles, Math.floor(newCount / 3)));
       },
     };
   } else if (source.type === 'image' && isAnimating()) {
@@ -663,6 +670,8 @@ async function doExportGIF() {
       renderFrame: () => { renderOnce(EXPORT_PIXELS); return out; },
       fps,
       maxWidth,
+      // dither wants exact pixels; ASCII/cells strokes need area-averaging
+      smooth: state.mode !== 'dither',
       name: `${source.name || 'ditherlab'}-${state.mode}`,
       onInfo: (msg) => toast(msg, 4000),
       shouldAbort: () => cancelled,
@@ -980,5 +989,8 @@ window.__dl = {
   renderOnce,
   setPhase(ph) { phaseOverride = ph; dirty = true; },
   clearPhase() { phaseOverride = null; dirty = true; },
+  setGenPhase(ph) { genPhaseOverride = ph; dirty = true; },
+  clearGenPhase() { genPhaseOverride = null; dirty = true; },
+  get source() { return source; },
   state,
 };

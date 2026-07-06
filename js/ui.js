@@ -493,9 +493,10 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
   });
   select(ex, 'GIF quality', {
     options: [
-      { value: '360', label: 'Small (360px)' },
-      { value: '480', label: 'Medium (480px)' },
-      { value: '720', label: 'Large (720px)' },
+      { value: '360', label: 'Small (~360px)' },
+      { value: '480', label: 'Medium (~480px)' },
+      { value: '720', label: 'Large (~720px)' },
+      { value: 'native', label: 'Native (1:1 pixels)' },
     ],
     value: exportSettings.gifSize,
     oninput: (v) => { exportSettings.gifSize = v; },

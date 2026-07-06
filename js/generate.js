@@ -87,9 +87,12 @@ float fbm(vec2 p) {
   }
   return r;
 }
-// loopable fbm: the time axis is a circle in noise space
-float lfbm(vec2 p, float ph) {
-  return fbm(p + 1.7 * vec2(cos(TAU * ph), sin(TAU * ph)));
+// loopable fbm: the time axis is a circle in noise space. r sets how far the
+// sample point travels per cycle — i.e. how fast the field churns. Keep the
+// per-frame image change near the mesh scene's (~1.5%) or the dithered
+// output reads as flicker instead of motion.
+float lfbm(vec2 p, float ph, float r) {
+  return fbm(p + r * vec2(cos(TAU * ph), sin(TAU * ph)));
 }
 
 // multi-stop gradient through the palette
@@ -150,8 +153,8 @@ vec3 neuroScene(vec2 uv, float t) {
 
 vec3 warpScene(vec2 uv, float ph) {
   vec2 p = uv * 3.0;
-  float n1 = lfbm(p + u_seed, ph);
-  float n2 = lfbm(p + u_seed + 11.3, ph);
+  float n1 = lfbm(p + u_seed, ph, 1.0);
+  float n2 = lfbm(p + u_seed + 11.3, ph, 1.0);
   p += 2.2 * (n2 - 0.5) * vec2(cos(TAU * n1), sin(TAU * n1));
   for (int i = 1; i <= 4; i++) {
     p.x += 0.35 / float(i) * cos(TAU * ph + float(i) * 1.5 * p.y);
@@ -163,8 +166,8 @@ vec3 warpScene(vec2 uv, float ph) {
 
 vec3 smokeScene(vec2 uv, float ph) {
   vec2 p = uv * 2.1 + u_seed * 3.0;
-  float q = lfbm(p, ph);
-  float v = lfbm(p + 1.9 * vec2(q, -q) + vec2(0.0, 0.6), ph);
+  float q = lfbm(p, ph, 0.5);
+  float v = lfbm(p + 1.9 * vec2(q, -q) + vec2(0.0, 0.6), ph, 0.5);
   v = v * 0.8 + 0.35 * q;
   return ramp(smoothstep(0.18, 0.92, v));
 }
