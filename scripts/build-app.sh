@@ -59,7 +59,14 @@ cat > "$TMP/Ditherlab.app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force -s - "$TMP/Ditherlab.app" 2>/dev/null
+# Developer ID + hardened runtime when set (required to notarize); else ad-hoc.
+# arm64 binaries MUST carry at least an ad-hoc signature or the kernel kills
+# them on launch (SIGKILL) — never ship unsigned.
+if [[ -n "${DEVELOPER_ID:-}" ]]; then
+  codesign --force --options runtime --timestamp -s "$DEVELOPER_ID" "$TMP/Ditherlab.app"
+else
+  codesign --force -s - "$TMP/Ditherlab.app" 2>/dev/null
+fi
 
 mkdir -p "$HOME/Applications"
 rm -rf "$DEST"
