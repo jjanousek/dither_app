@@ -1,39 +1,125 @@
 // Ditherlab — native macOS wrapper.
 //
-// A WKWebView window around the local Ditherlab server: own Dock icon, own
-// window, quits like a normal app. Starts the bundled Python static server on
-// launch (unless one is already serving Ditherlab) and stops it on quit.
+// A WKWebView window around an in-process static file server: own Dock icon,
+// own window, quits like a normal app. The web assets ship inside the bundle
+// (Contents/Resources/web), so the app is fully self-contained — no Python,
+// no external files, no port conflicts (the server binds an ephemeral port on
+// 127.0.0.1, which WebKit treats as a secure context so the webcam works).
 // Exports (PNG/GIF/video/TXT) are handled as native downloads into ~/Downloads.
-//
-// __PROJECT_DIR__ is substituted by scripts/build-app.sh at build time.
 
 import Cocoa
+import Network
 import WebKit
 
-let projectDir = "__PROJECT_DIR__"
-// Port is dynamic: 8173 is preferred, 8271 is the fallback when a foreign
-// (non-Ditherlab) process already owns 8173. Set once by startServerIfNeeded
-// before pollAndLoad runs.
-var appPort = 8173
-var appURL = URL(string: "http://127.0.0.1:8173/")!
+var appURL = URL(string: "http://127.0.0.1/")! // real port filled in at launch
 let testMode = ProcessInfo.processInfo.environment["DL_TEST_DOWNLOAD"] == "1"
 
-/// Thread-safe Process holder: the spawn happens on a background queue, so a
-/// plain stored property could be missed by a fast Cmd-Q (applicationWillTerminate).
-final class ProcessHolder {
-    private let lock = NSLock()
-    private var process: Process?
-    var value: Process? {
-        get { lock.lock(); defer { lock.unlock() }; return process }
-        set { lock.lock(); defer { lock.unlock() }; process = newValue }
+/// Minimal HTTP/1.1 static file server over Network.framework. GET/HEAD only,
+/// loopback only, Cache-Control: no-store (never serve stale modules after an
+/// update), dot-prefixed path segments are never served.
+final class StaticServer {
+    private let root: URL
+    private var listener: NWListener?
+    private(set) var port: UInt16 = 0
+
+    private static let mime: [String: String] = [
+        "html": "text/html; charset=utf-8", "js": "text/javascript; charset=utf-8",
+        "css": "text/css; charset=utf-8", "json": "application/json",
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "webp": "image/webp", "gif": "image/gif", "svg": "image/svg+xml",
+        "ico": "image/x-icon", "txt": "text/plain; charset=utf-8",
+        "mp4": "video/mp4", "webm": "video/webm", "wasm": "application/wasm",
+        "woff2": "font/woff2",
+    ]
+
+    init(root: URL) { self.root = root.standardizedFileURL }
+
+    func start() throws -> UInt16 {
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
+        let l = try NWListener(using: params)
+        l.newConnectionHandler = { [weak self] conn in self?.serve(conn) }
+        let ready = DispatchSemaphore(value: 0)
+        l.stateUpdateHandler = { state in
+            if case .ready = state { ready.signal() }
+            if case .failed = state { ready.signal() }
+        }
+        l.start(queue: .global(qos: .userInitiated))
+        _ = ready.wait(timeout: .now() + 5)
+        guard case .ready = l.state, let p = l.port?.rawValue else {
+            throw NSError(domain: "Ditherlab", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "local server failed to start"])
+        }
+        listener = l
+        port = p
+        return p
+    }
+
+    private func serve(_ conn: NWConnection) {
+        conn.start(queue: .global(qos: .userInitiated))
+        readRequest(conn, buffer: Data())
+    }
+
+    private func readRequest(_ conn: NWConnection, buffer: Data) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
+            var buf = buffer
+            if let d = data { buf.append(d) }
+            if let headEnd = buf.range(of: Data("\r\n\r\n".utf8)) {
+                let head = String(data: buf[..<headEnd.lowerBound], encoding: .utf8) ?? ""
+                self.respond(conn, head: head)
+            } else if isComplete || error != nil || buf.count > 64 * 1024 {
+                conn.cancel()
+            } else {
+                self.readRequest(conn, buffer: buf)
+            }
+        }
+    }
+
+    private func respond(_ conn: NWConnection, head: String) {
+        let line = head.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
+        let parts = line.split(separator: " ")
+        guard parts.count >= 2 else { return conn.cancel() }
+        let method = String(parts[0])
+        guard method == "GET" || method == "HEAD" else {
+            return send(conn, status: "405 Method Not Allowed", type: "text/plain", body: Data("nope".utf8), headOnly: false)
+        }
+        var path = String(parts[1])
+        if let q = path.firstIndex(where: { $0 == "?" || $0 == "#" }) { path = String(path[..<q]) }
+        path = path.removingPercentEncoding ?? path
+        if path == "/" { path = "/index.html" }
+
+        let segments = path.split(separator: "/").map(String.init)
+        // never serve dotfiles or anything that escapes the web root
+        guard !segments.isEmpty, !segments.contains(where: { $0.hasPrefix(".") || $0 == ".." }) else {
+            return send(conn, status: "404 Not Found", type: "text/plain", body: Data("not found".utf8), headOnly: method == "HEAD")
+        }
+        var file = root
+        for seg in segments { file.appendPathComponent(seg) }
+        file.standardize()
+        guard file.path.hasPrefix(root.path + "/") || file.path == root.path,
+              let body = try? Data(contentsOf: file) else {
+            return send(conn, status: "404 Not Found", type: "text/plain", body: Data("not found".utf8), headOnly: method == "HEAD")
+        }
+        let type = Self.mime[file.pathExtension.lowercased()] ?? "application/octet-stream"
+        send(conn, status: "200 OK", type: type, body: body, headOnly: method == "HEAD")
+    }
+
+    private func send(_ conn: NWConnection, status: String, type: String, body: Data, headOnly: Bool) {
+        let header = "HTTP/1.1 \(status)\r\n"
+            + "Content-Type: \(type)\r\n"
+            + "Content-Length: \(body.count)\r\n"
+            + "Cache-Control: no-store, must-revalidate\r\n"
+            + "Connection: close\r\n\r\n"
+        var out = Data(header.utf8)
+        if !headOnly { out.append(body) }
+        conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var webView: WKWebView!
-    let serverProcess = ProcessHolder()
-    var loadDeadline = Date().addingTimeInterval(25) // cold python3 launches can take a while
+    var server: StaticServer?
     var lastDownload: URL?
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -61,129 +147,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
-        startServerIfNeeded() // calls pollAndLoad once the port is chosen
+        startServerAndLoad()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ note: Notification) { serverProcess.value?.terminate() }
 
     // MARK: server
 
-    func serverResponds() -> Bool {
-        var ok = false
-        let sem = DispatchSemaphore(value: 0)
-        var req = URLRequest(url: appURL, timeoutInterval: 0.6)
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            if let d = data, let s = String(data: d, encoding: .utf8),
-               s.lowercased().contains("ditherlab") { ok = true }
-            sem.signal()
-        }.resume()
-        _ = sem.wait(timeout: .now() + 1.0)
-        return ok
-    }
-
-    enum PortProbe {
-        case ditherlab // a Ditherlab server already answers here — reuse it
-        case foreign   // something else owns the port — do not spawn on it
-        case free      // nothing answered — safe to spawn here
-    }
-
-    func probe(port: Int) -> PortProbe {
-        var result = PortProbe.free
-        let sem = DispatchSemaphore(value: 0)
-        var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/")!, timeoutInterval: 0.6)
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        URLSession.shared.dataTask(with: req) { data, response, error in
-            if let d = data, let s = String(data: d, encoding: .utf8),
-               s.lowercased().contains("ditherlab") {
-                result = .ditherlab
-            } else if data != nil || response != nil {
-                result = .foreign
-            } else if let urlError = error as? URLError,
-                      urlError.code == .timedOut || urlError.code == .networkConnectionLost {
-                // something holds the port but won't speak HTTP (e.g. a TCP
-                // squatter) — spawning here would hit EADDRINUSE, so skip it;
-                // only connection-refused (nothing listening) stays .free
-                result = .foreign
-            }
-            sem.signal()
-        }.resume()
-        _ = sem.wait(timeout: .now() + 1.0)
-        return result
-    }
-
-    func usePort(_ port: Int) {
-        appPort = port
-        appURL = URL(string: "http://127.0.0.1:\(port)/")!
-    }
-
-    func startServerIfNeeded() {
-        DispatchQueue.global().async {
-            defer { DispatchQueue.main.async { self.pollAndLoad() } }
-
-            var spawnPort: Int?
-            scan: for port in [8173, 8271] {
-                switch self.probe(port: port) {
-                case .ditherlab:
-                    self.usePort(port) // reuse the existing Ditherlab server
-                    return
-                case .foreign:
-                    continue // occupied by another program, try the next port
-                case .free:
-                    spawnPort = port
-                    break scan
-                }
-            }
-            guard let port = spawnPort else { return } // both ports foreign → deadline alert
-
-            self.usePort(port)
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            p.arguments = ["python3", "scripts/serve.py", String(port),
-                           "--parent", String(ProcessInfo.processInfo.processIdentifier)]
-            p.currentDirectoryURL = URL(fileURLWithPath: projectDir)
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
-            do {
-                try p.run()
-                // assign synchronously so a fast Cmd-Q always sees the process
-                self.serverProcess.value = p
-            } catch { /* handled by the load deadline alert */ }
+    func startServerAndLoad() {
+        guard let webRoot = Bundle.main.resourceURL?.appendingPathComponent("web"),
+              FileManager.default.fileExists(atPath: webRoot.appendingPathComponent("index.html").path) else {
+            return showStartupError("The app bundle is missing its web assets — please re-download Ditherlab.")
+        }
+        let srv = StaticServer(root: webRoot)
+        do {
+            let port = try srv.start()
+            server = srv
+            appURL = URL(string: "http://127.0.0.1:\(port)/")!
+            webView.load(URLRequest(url: appURL))
+            scheduleTestHook()
+        } catch {
+            showStartupError("The local preview server could not start: \(error.localizedDescription)")
         }
     }
 
-    func pollAndLoad() {
-        DispatchQueue.global().async {
-            var ok = self.serverResponds()
-            let expired = Date() > self.loadDeadline
-            if !ok && expired { ok = self.serverResponds() } // final re-check before the fatal alert
-            DispatchQueue.main.async {
-                if ok {
-                    self.webView.load(URLRequest(url: appURL))
-                    self.scheduleTestHook()
-                } else if expired {
-                    self.showStartupError()
-                } else {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.pollAndLoad() }
-                }
-            }
-        }
-    }
-
-    func showStartupError() {
+    func showStartupError(_ message: String) {
         let alert = NSAlert()
-        alert.messageText = "Ditherlab could not start its local server"
-        alert.informativeText = """
-        Check that python3 is installed (run “xcode-select --install” in \
-        Terminal), that the Ditherlab folder still exists at \
-        \(projectDir), and that ports 8173 and 8271 are not both used by \
-        other programs (tried http://127.0.0.1:\(appPort)/).
-        """
+        alert.messageText = "Ditherlab could not start"
+        alert.informativeText = message
         alert.alertStyle = .critical
         alert.runModal()
-        if testMode { print("TEST_DOWNLOAD_FAIL: server did not start"); exit(1) }
+        if testMode { print("TEST_DOWNLOAD_FAIL: \(message)"); exit(1) }
         NSApp.terminate(nil)
     }
 

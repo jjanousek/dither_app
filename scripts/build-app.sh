@@ -1,9 +1,12 @@
 #!/bin/zsh
 # Build the native Ditherlab.app (Swift + WKWebView) into ~/Applications.
-# Needs the Xcode Command Line Tools (swiftc). Re-run after moving the project.
+# The web assets are bundled into Contents/Resources/web, so the built app is
+# fully self-contained and can be distributed (see make-dmg.sh).
+# Needs the Xcode Command Line Tools (swiftc).
 set -euo pipefail
 cd "$(dirname "$0")"
 
+VERSION="1.1.0"
 DEST="$HOME/Applications/Ditherlab.app"
 PROJECT_DIR="$(cd .. && pwd)"
 TMP="$(mktemp -d)"
@@ -21,13 +24,18 @@ done
 iconutil -c icns "$ICONSET" -o "$TMP/Ditherlab.icns"
 
 echo "→ compile"
-# literal substitution (sed would corrupt paths containing & or |)
-python3 -c 'import sys; print(open(sys.argv[1]).read().replace("__PROJECT_DIR__", sys.argv[2]), end="")' main.swift "$PROJECT_DIR" > "$TMP/main.swift"
 mkdir -p "$TMP/Ditherlab.app/Contents/MacOS" "$TMP/Ditherlab.app/Contents/Resources"
-swiftc -O -swift-version 5 -o "$TMP/Ditherlab.app/Contents/MacOS/Ditherlab" "$TMP/main.swift"
+swiftc -O -swift-version 5 -o "$TMP/Ditherlab.app/Contents/MacOS/Ditherlab" main.swift
 
 echo "→ bundle"
 cp "$TMP/Ditherlab.icns" "$TMP/Ditherlab.app/Contents/Resources/Ditherlab.icns"
+
+# self-contained web assets
+WEB="$TMP/Ditherlab.app/Contents/Resources/web"
+mkdir -p "$WEB/assets"
+cp "$PROJECT_DIR/index.html" "$WEB/"
+cp -R "$PROJECT_DIR/js" "$PROJECT_DIR/css" "$WEB/"
+cp "$PROJECT_DIR/assets/demo.jpg" "$WEB/assets/"
 cat > "$TMP/Ditherlab.app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -39,8 +47,8 @@ cat > "$TMP/Ditherlab.app/Contents/Info.plist" <<PLIST
 	<key>CFBundleExecutable</key><string>Ditherlab</string>
 	<key>CFBundleIconFile</key><string>Ditherlab</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0.0</string>
-	<key>CFBundleVersion</key><string>1</string>
+	<key>CFBundleShortVersionString</key><string>$VERSION</string>
+	<key>CFBundleVersion</key><string>2</string>
 	<key>LSMinimumSystemVersion</key><string>13.5</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSCameraUsageDescription</key>
