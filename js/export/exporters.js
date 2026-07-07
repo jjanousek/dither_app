@@ -38,14 +38,18 @@ export async function exportVideoFrameAccurate({
     onInfo?.(`Long clip: exporting the first ${Math.round(MAX_FRAMES / fps)}s`);
   }
 
-  // Encode size: NEVER fractionally resample — that shreds the dither pattern
-  // (irregular dropped rows/columns). Integer-upscale a small frame for crisp
-  // pixels; encode a large frame at its native resolution 1:1.
+  // Encode size: NEVER fractionally resample (that shreds the pattern), and
+  // integer-UPSCALE so each 1px dither cell becomes a >=2x2 block. A 1px
+  // dither is pure highest-frequency energy — the worst case for H.264's DCT,
+  // which discards exactly that. Turning cells into 2x2 blocks shifts the
+  // energy into lower frequencies that survive quantization, so the pattern
+  // stays crisp instead of blocking/ringing (nearest-neighbor upscale).
   const first = renderFrame();
   const long = Math.max(first.width, first.height);
-  const k = long <= maxWidth ? Math.max(1, Math.floor(maxWidth / long)) : 1;
-  const w = Math.max(2, Math.round(first.width * k) & ~1);
-  const h = Math.max(2, Math.round(first.height * k) & ~1);
+  let scale = Math.max(2, Math.round(1440 / long));
+  while (long * scale > 3840 && scale > 2) scale--; // cap ~4K long side (level 5.1)
+  const w = Math.max(2, (first.width * scale) & ~1);
+  const h = Math.max(2, (first.height * scale) & ~1);
 
   const frame = document.createElement('canvas');
   frame.width = w; frame.height = h;
@@ -58,16 +62,24 @@ export async function exportVideoFrameAccurate({
     output: (chunk, meta) => muxer.addChunk(chunk, meta),
     error: (e) => { encErr = e; },
   });
-  // A fine dither is a full-frame high-frequency pattern — the worst case for
-  // H.264 — so use High profile (CABAC, 8x8 transform) at a generous bitrate,
-  // or it quantizes into visible 8x8 blocks. Level 5.1 covers any HD frame.
-  const bitrate = Math.min(48e6, Math.max(8e6, Math.round(w * h * fps * 0.5)));
-  encoder.configure({
-    codec: 'avc1.640033', // High @ Level 5.1
-    width: w, height: h, bitrate, framerate: fps,
-    latencyMode: 'quality',
-    avc: { format: 'avc' },
-  });
+  // Prefer constant-QUALITY (quantizer/QP) encoding — for a hard-edged dither
+  // that tracks the canvas far better than a target bitrate — with High
+  // profile (CABAC). Fall back to a generous VBR bitrate where QP is
+  // unsupported. avc1.640033 = High @ Level 5.1 (covers up to ~4K).
+  const base = {
+    codec: 'avc1.640033', width: w, height: h, framerate: fps,
+    latencyMode: 'quality', contentHint: 'text', avc: { format: 'avc' },
+  };
+  let quantizer = null;
+  try {
+    if ((await VideoEncoder.isConfigSupported({ ...base, bitrateMode: 'quantizer' })).supported) {
+      encoder.configure({ ...base, bitrateMode: 'quantizer' });
+      quantizer = 16; // ~visually lossless for this content; lower = higher quality
+    }
+  } catch { /* fall through to VBR */ }
+  if (quantizer === null) {
+    encoder.configure({ ...base, bitrateMode: 'variable', bitrate: Math.min(48e6, Math.max(8e6, Math.round(w * h * fps * 0.25))) });
+  }
 
   const wasLooping = video.loop;
   const wasPaused = video.paused;
@@ -90,7 +102,9 @@ export async function exportVideoFrameAccurate({
       const processed = renderFrame();
       fctx.drawImage(processed, 0, 0, processed.width, processed.height, 0, 0, w, h);
       const vf = new VideoFrame(frame, { timestamp: Math.round((i * 1e6) / fps), duration: Math.round(1e6 / fps) });
-      encoder.encode(vf, { keyFrame: i % 60 === 0 });
+      const opts = { keyFrame: i % 60 === 0 };
+      if (quantizer !== null) opts.avc = { quantizer };
+      encoder.encode(vf, opts);
       vf.close();
       // backpressure: don't let the encode queue run away, and keep UI alive
       while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 4));
