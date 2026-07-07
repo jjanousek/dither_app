@@ -47,6 +47,12 @@ let fpsText = '';
 let videoFrameReady = false;
 const HAS_RVFC = typeof HTMLVideoElement !== 'undefined'
   && 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+// An async CPU-dither result landed: wake the loop for one more render. That
+// render draws whatever the CURRENT mode is (so it never blindly re-shows a
+// stale worker frame), and — because it carries contentNew=false — the CPU
+// preview presents the committed result instead of re-dispatching it.
+let cpuResultReady = false;
+engine.onCpuResult = () => { cpuResultReady = true; };
 
 // animation clock: phase in 0..1, wraps once per cycle
 let animPhase = 0;
@@ -138,7 +144,7 @@ function srcDims() {
 // ---------------------------------------------------------------------------
 // render + present
 // ---------------------------------------------------------------------------
-function renderOnce(budgetOverride = null) {
+function renderOnce(budgetOverride = null, contentNew = true) {
   const [w, h] = srcDims();
   if (!w || !h) return out;
   if (source.type === 'gen') source.gen.tick(genPhaseOverride ?? source.gen.phase);
@@ -155,7 +161,10 @@ function renderOnce(budgetOverride = null) {
     const heavyAscii = state.mode === 'ascii' && state.ascii.renderer === 'shape';
     if (cpuDither || heavyAscii) budget = MAX_LIVE_CPU_PIXELS;
   }
-  const result = engine.render(source.el, w, h, p, budgetOverride ?? budget);
+  // Only the live preview (no budget override, not exporting) may run the CPU
+  // dither in the worker; exports and thumbnails stay synchronous.
+  const allowAsync = budgetOverride === null && !exporting;
+  const result = engine.render(source.el, w, h, p, budgetOverride ?? budget, allowAsync, contentNew);
   if (result) present(result, w, h);
   return out;
 }
@@ -254,12 +263,20 @@ function loop(t) {
   // generative scenes change every tick so they always render. An active
   // animation also changes the output every tick, so it forces a render.
   const videoWork = isVideoEl ? (playing && (!HAS_RVFC || videoFrameReady)) : playing;
-  if (!dirty && !videoWork && !animating) return;
+  // Genuinely-new content vs a worker-completion wake-up. Only real content
+  // dispatches a new dither; a wake-up just presents the finished result.
+  const contentNew = dirty || videoWork || animating;
+  // During an export the exporter drives its own synchronous renders; a stale
+  // pre-export worker reply must not repaint `out` mid-frame. (recordCanvas
+  // exports still render via contentNew from playing/animating.)
+  if (exporting) cpuResultReady = false;
+  if (!contentNew && !cpuResultReady) return;
+  cpuResultReady = false;
   videoFrameReady = false;
   dirty = false;
 
   if (comparing) presentOriginal();
-  else renderOnce();
+  else renderOnce(null, contentNew);
 
   if (playing || animating) {
     if (lastFrameT) {
@@ -440,6 +457,9 @@ function setSource(next) {
   source = next;
   fpsEma = 0;
   videoFrameReady = false;
+  // new pixels, possibly same dither settings/size — force a fresh sync frame
+  // instead of briefly showing the old source's async result.
+  if (engine.cpu) engine.cpu.invalidate();
   // Drive per-frame rendering off real decoded frames for video/webcam.
   // Capture the source locally so a stale callback (fired after a source
   // switch) re-registers on its OWN, now-paused element and self-terminates
@@ -1088,5 +1108,6 @@ window.__dl = {
   setGenPhase(ph) { genPhaseOverride = ph; dirty = true; },
   clearGenPhase() { genPhaseOverride = null; dirty = true; },
   get source() { return source; },
+  engine,
   state,
 };

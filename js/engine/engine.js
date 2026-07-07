@@ -8,6 +8,7 @@ import { getBlueNoise } from './bluenoise.js';
 import { AsciiRenderer, fontSpec } from './ascii.js';
 import { CELL_EFFECTS } from '../effects/cells.js';
 import { paletteToFloat, paletteToUniform } from '../palettes.js';
+import { CpuPreview } from './cpu-preview.js';
 
 export const ALGORITHMS = [
   { id: 'floyd', name: 'Floyd–Steinberg', type: 'cpu', group: 'Error Diffusion' },
@@ -49,6 +50,11 @@ export class Engine {
     this._palKey = '';
     this._palFloat = null;
     this._palUniform = null;
+
+    // async CPU-dither preview (lazy — only the live main engine opts in)
+    this.cpu = null;
+    this.onCpuResult = null; // set by the app: fires when an async result lands
+    this._allowAsync = false; // per-render flag; only true for the live path
   }
 
   #initGL() {
@@ -114,8 +120,10 @@ export class Engine {
    * @param maxPixels optional cap on work-canvas area (video preview perf)
    * @returns canvas containing the processed frame
    */
-  render(source, srcW, srcH, p, maxPixels = Infinity) {
+  render(source, srcW, srcH, p, maxPixels = Infinity, allowAsync = false, contentNew = true) {
     if (!srcW || !srcH) return null;
+    this._allowAsync = allowAsync;
+    this._contentNew = contentNew;
 
     if (p.mode === 'ascii') return this.#renderAscii(source, srcW, srcH, p, maxPixels);
     if (p.mode !== 'dither') return this.#renderCells(source, srcW, srcH, p, maxPixels);
@@ -330,11 +338,20 @@ export class Engine {
     });
     const bias = p.threshold - 0.5;
     if (algo.type === 'cpu') {
-      errorDiffusion(img, pal.float, algo.id, {
-        strength: p.ditherStrength,
-        serpentine: p.serpentine,
-        bias,
-      });
+      const opts = { strength: p.ditherStrength, serpentine: p.serpentine, bias };
+      // Live path: run the diffusion in a worker so the UI stays responsive.
+      // Byte-identical (same errorDiffusion); exports/thumbnails never opt in.
+      if (this._allowAsync) {
+        if (!this.cpu) this.cpu = new CpuPreview(() => { if (this.onCpuResult) this.onCpuResult(); });
+        // settings signature — a change forces one synchronous, correct frame
+        const pf = pal.float;
+        let ph = pf.length;
+        for (let i = 0; i < pf.length; i++) ph = (Math.imul(ph, 31) + pf[i]) | 0;
+        const sig = `${algo.id}|${opts.strength}|${opts.serpentine}|${opts.bias}|${w}x${h}|${ph}`;
+        const committed = this.cpu.render(img, w, h, pf, algo.id, opts, sig, ctx, this._contentNew);
+        if (committed) return committed; // async handled; present the committed result
+      }
+      errorDiffusion(img, pal.float, algo.id, opts);
     } else if (algo.mode === 1) {
       // GPU-style ordered mode but WebGL unavailable — CPU fallback
       const m = algo.matrix === 'bluenoise' ? getBlueNoise() : MATRICES[algo.matrix];
