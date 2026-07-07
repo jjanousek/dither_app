@@ -41,6 +41,12 @@ let scrubbing = false;
 let fpsEma = 0;
 let lastFrameT = 0;
 let fpsText = '';
+// A playing video/webcam decodes at ~24–30 fps, but the rAF loop ticks ~60;
+// re-dithering the same frame is wasted work. requestVideoFrameCallback sets
+// this only when a genuinely new frame is decoded, so we render each once.
+let videoFrameReady = false;
+const HAS_RVFC = typeof HTMLVideoElement !== 'undefined'
+  && 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
 
 // animation clock: phase in 0..1, wraps once per cycle
 let animPhase = 0;
@@ -238,12 +244,18 @@ function loop(t) {
   if (source.type === 'gen' && genPhaseOverride === null) {
     source.gen.phase = (source.gen.phase + (dt / 1000) * source.gen.params.speed * GEN_CYCLES_PER_SEC) % 1;
   }
+  const isVideoEl = source.el instanceof HTMLVideoElement;
   const isLive = source.type !== 'image';
   const playing = isLive && genPhaseOverride === null // gen bake renders itself
-    && (source.el instanceof HTMLVideoElement
+    && (isVideoEl
       ? (!source.el.paused && !source.el.ended)
       : true); // webcam-less live sources (generated scenes) always play
-  if (!dirty && !playing && !animating) return;
+  // Only re-dither a video/webcam when a new frame actually decoded (rVFC);
+  // generative scenes change every tick so they always render. An active
+  // animation also changes the output every tick, so it forces a render.
+  const videoWork = isVideoEl ? (playing && (!HAS_RVFC || videoFrameReady)) : playing;
+  if (!dirty && !videoWork && !animating) return;
+  videoFrameReady = false;
   dirty = false;
 
   if (comparing) presentOriginal();
@@ -422,10 +434,21 @@ function setSource(next) {
     if (source.stream) source.stream.getTracks().forEach((tr) => tr.stop());
     if (source.el instanceof HTMLVideoElement && !source.stream) source.el.pause();
     if (source._seekHandler) source.el.removeEventListener('seeked', source._seekHandler);
+    if (source._rvfc != null && source.el.cancelVideoFrameCallback) source.el.cancelVideoFrameCallback(source._rvfc);
     if (source.url) URL.revokeObjectURL(source.url);
   }
   source = next;
   fpsEma = 0;
+  videoFrameReady = false;
+  // Drive per-frame rendering off real decoded frames for video/webcam.
+  // Capture the source locally so a stale callback (fired after a source
+  // switch) re-registers on its OWN, now-paused element and self-terminates
+  // rather than re-arming on the new source.
+  if (HAS_RVFC && source.el instanceof HTMLVideoElement) {
+    const s = source;
+    const pump = () => { videoFrameReady = true; s._rvfc = s.el.requestVideoFrameCallback(pump); };
+    s._rvfc = s.el.requestVideoFrameCallback(pump);
+  }
   if (source.type === 'video') {
     source.el.playbackRate = parseFloat($('speed').value) || 1;
     $('btn-play').textContent = '❚❚';

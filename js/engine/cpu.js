@@ -119,6 +119,9 @@ export function applyAdjustments(imageData, p) {
 // ---------------------------------------------------------------------------
 
 // Nearest color in flat palette [r,g,b,...] (0..255). Returns index*3.
+// The early-exit on an exact match is byte-identical: 0 is the minimum
+// possible distance, so scanning further can never change the winner, and
+// stopping at the FIRST exact match preserves first-index-wins tie behaviour.
 function nearestIndex(pal, n, r, g, b) {
   let best = 0;
   let bestD = Infinity;
@@ -130,6 +133,7 @@ function nearestIndex(pal, n, r, g, b) {
     if (dist < bestD) {
       bestD = dist;
       best = i * 3;
+      if (dist === 0) break;
     }
   }
   return best;
@@ -140,29 +144,24 @@ function nearestIndex(pal, n, r, g, b) {
 // strength: 0..1 scales how much error is propagated.
 // serpentine: alternate scan direction per row (reduces worm artifacts).
 // ---------------------------------------------------------------------------
-export function errorDiffusion(imageData, palette, kernelId, { strength = 1, serpentine = true, bias = 0 } = {}) {
-  const { kernel } = DIFFUSION_KERNELS[kernelId] || DIFFUSION_KERNELS.floyd;
-  const { width: w, height: h, data: d } = imageData;
-  const n = palette.length / 3;
-  const b = bias * 255; // threshold bias, mirrors u_bias in the shader
-
-  // Work buffers in float to carry sub-integer error.
-  const buf = new Float32Array(w * h * 3);
-  for (let i = 0, j = 0; i < d.length; i += 4, j += 3) {
-    buf[j] = d[i];
-    buf[j + 1] = d[i + 1];
-    buf[j + 2] = d[i + 2];
-  }
-
-  // Flatten the kernel into typed arrays: destructuring [dx,dy,wgt] per pixel
-  // per tap dominates the profile (this loop runs every animation frame).
-  // Weights stay doubles so the output is bit-identical to the naive loop.
+// Reusable error-accumulation buffer — a full-res export frame needs ~19 MB,
+// and re-allocating (and zero-init'ing) it every frame dominates GC on the
+// live path. The buffer is fully overwritten by the source copy below each
+// call, so reuse is byte-identical; a larger leftover buffer is harmless.
+let _edBuf = null;
+// Flattened kernel plans cached by (kernelId, width): pure precompute, no
+// change to arithmetic. Cleared if it grows unbounded (many preview sizes).
+const _edPlans = new Map();
+function edPlan(kernelId, kernel, w) {
+  const key = `${kernelId}:${w}`;
+  let plan = _edPlans.get(key);
+  if (plan) return plan;
   const taps = kernel.length;
   const kdxF = new Int32Array(taps);
   const kdxR = new Int32Array(taps);
   const kdy = new Int32Array(taps);
   const kw = new Float64Array(taps);
-  const offF = new Int32Array(taps); // linear buffer delta from the current px
+  const offF = new Int32Array(taps);
   const offR = new Int32Array(taps);
   let maxDx = 0;
   let maxDy = 0;
@@ -177,6 +176,29 @@ export function errorDiffusion(imageData, palette, kernelId, { strength = 1, ser
     if (Math.abs(dx) > maxDx) maxDx = Math.abs(dx);
     if (dy > maxDy) maxDy = dy;
   }
+  plan = { taps, kdxF, kdxR, kdy, kw, offF, offR, maxDx, maxDy };
+  if (_edPlans.size >= 128) _edPlans.clear();
+  _edPlans.set(key, plan);
+  return plan;
+}
+
+export function errorDiffusion(imageData, palette, kernelId, { strength = 1, serpentine = true, bias = 0 } = {}) {
+  const { kernel } = DIFFUSION_KERNELS[kernelId] || DIFFUSION_KERNELS.floyd;
+  const { width: w, height: h, data: d } = imageData;
+  const n = palette.length / 3;
+  const b = bias * 255; // threshold bias, mirrors u_bias in the shader
+
+  // Work buffer in float to carry sub-integer error (reused across calls).
+  const need = w * h * 3;
+  if (!_edBuf || _edBuf.length < need) _edBuf = new Float32Array(need);
+  const buf = _edBuf;
+  for (let i = 0, j = 0; i < d.length; i += 4, j += 3) {
+    buf[j] = d[i];
+    buf[j + 1] = d[i + 1];
+    buf[j + 2] = d[i + 2];
+  }
+
+  const { taps, kdxF, kdxR, kdy, kw, offF, offR, maxDx, maxDy } = edPlan(kernelId, kernel, w);
 
   for (let y = 0; y < h; y++) {
     const reverse = serpentine && (y & 1) === 1;

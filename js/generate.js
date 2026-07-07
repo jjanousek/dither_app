@@ -326,7 +326,7 @@ export class GenerativeSource {
     gl.uniform1f(this.u.u_scale, p.scale);
     gl.uniform1f(this.u.u_seed, p.seed);
     gl.uniform1i(this.u.u_scene, SCENE_INDEX[p.scene] ?? 0);
-    const flat = new Float32Array(18);
+    const flat = this._colorBuf || (this._colorBuf = new Float32Array(18)); // reused per frame
     const n = Math.min(6, p.colors.length);
     for (let i = 0; i < n; i++) {
       const [r, g, b] = hexToRgb(p.colors[i]);
@@ -334,6 +334,7 @@ export class GenerativeSource {
       flat[i * 3 + 1] = g / 255;
       flat[i * 3 + 2] = b / 255;
     }
+    for (let i = n * 3; i < 18; i++) flat[i] = 0; // match the fresh-alloc zero tail
     gl.uniform3fv(this.u.u_colors, flat);
     gl.uniform1i(this.u.u_colorCount, Math.max(2, n));
     gl.drawArrays(gl.TRIANGLES, 0, 3);
