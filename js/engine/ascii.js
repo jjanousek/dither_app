@@ -526,15 +526,18 @@ export class AsciiRenderer {
           cellFg = colorMode === 'mono' ? fgInt : mean;
           cellBg = colorMode === 'bg' ? mean : null;
         } else {
-          // binarize against the contrasting pair (nearer of min/max pixel)
+          // binarize against the contrasting pair (nearer of min/max pixel).
+          // df < db expands to a linear test in exact integer arithmetic (all
+          // channels are integer bytes): df - db = 2·dot + fSq - bSq, where
+          // dot = Σ r·(br-fr). So df < db  ⟺  2·dot < bSq - fSq — one dot
+          // product per pixel instead of two squared distances, bit-identical.
           let b0 = 0, b1 = 0;
           const fr = px[maxI * 3], fgc = px[maxI * 3 + 1], fb = px[maxI * 3 + 2];
           const br = px[minI * 3], bgc = px[minI * 3 + 1], bb = px[minI * 3 + 2];
+          const cr = br - fr, cg = bgc - fgc, cb = bb - fb;
+          const thresh = (br * br + bgc * bgc + bb * bb) - (fr * fr + fgc * fgc + fb * fb);
           for (let k = 0; k < 64; k++) {
-            const r = px[k * 3], g = px[k * 3 + 1], b = px[k * 3 + 2];
-            const df = (r - fr) ** 2 + (g - fgc) ** 2 + (b - fb) ** 2;
-            const db = (r - br) ** 2 + (g - bgc) ** 2 + (b - bb) ** 2;
-            if (df < db) {
+            if (2 * (px[k * 3] * cr + px[k * 3 + 1] * cg + px[k * 3 + 2] * cb) < thresh) {
               if (k < 32) b0 |= (1 << k) >>> 0;
               else b1 |= (1 << (k - 32)) >>> 0;
             }
