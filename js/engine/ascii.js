@@ -202,11 +202,17 @@ export class AsciiRenderer {
     const cov = new Float32Array(n * 64);
     const coverage = new Float32Array(n); // mean ink 0..1
     const pop = new Uint8Array(n);
+    // refine-loop accelerators: penMask[k] = (cov[k] > 0.45) as 0/1 (avoids the
+    // per-pixel float compare), and onList[g] = the ascending "on" pixel
+    // indices so the mean pass sums one pen side and derives the other.
+    const penMask = new Uint8Array(n * 64);
+    const onList = new Array(n);
 
     const bw = adv / 8;
     const bh = H / 8;
     for (let gi = 0; gi < n; gi++) {
       let ink = 0;
+      const on = [];
       for (let sy = 0; sy < 8; sy++) {
         for (let sx = 0; sx < 8; sx++) {
           // box-average the glyph alpha in this subcell
@@ -226,6 +232,8 @@ export class AsciiRenderer {
           cov[gi * 64 + idx] = v;
           ink += v;
           if (v > 0.45) {
+            penMask[gi * 64 + idx] = 1;
+            on.push(idx);
             if (idx < 32) bits0[gi] |= (1 << idx) >>> 0;
             else bits1[gi] |= (1 << (idx - 32)) >>> 0;
           }
@@ -233,8 +241,9 @@ export class AsciiRenderer {
       }
       coverage[gi] = ink / 64;
       pop[gi] = popcnt32(bits0[gi]) + popcnt32(bits1[gi]);
+      onList[gi] = Uint8Array.from(on);
     }
-    atlas = { glyphs, bits0, bits1, cov, coverage, pop };
+    atlas = { glyphs, bits0, bits1, cov, coverage, pop, penMask, onList };
     this._atlasCache.set(key, atlas);
     return atlas;
   }
@@ -540,7 +549,14 @@ export class AsciiRenderer {
             if (colorMode !== 'mono') insertCand(candIdx, candHam, candInv, g, 64 - hd, 1);
           }
 
-          // refine: per-pen mean colors, squared RGB error over 64 pixels
+          // refine: per-pen mean colors, squared RGB error over 64 pixels.
+          // Cell RGB totals once so each candidate sums only the "on" pen and
+          // derives the "off" side (total - on, exact for integer bytes); the
+          // error loop early-exits once its running sum can't beat the best.
+          // Both are byte-identical to the naive double loop.
+          let tr = 0, tg = 0, tb = 0;
+          for (let k = 0; k < 64; k++) { tr += px[k * 3]; tg += px[k * 3 + 1]; tb += px[k * 3 + 2]; }
+          const penMask = atlas.penMask;
           let bestErr = Infinity, bestG = candIdx[0], bestInvF = candInv[0];
           let bestFg = 0, bestBg = 0;
           for (let c = 0; c < K; c++) {
@@ -548,12 +564,16 @@ export class AsciiRenderer {
             const g = candIdx[c];
             const inv = candInv[c];
             const covBase = g * 64;
-            // pen means
-            let fr2 = 0, fg2 = 0, fb2 = 0, fn = 0, br2 = 0, bg2 = 0, bb2 = 0, bn = 0;
-            for (let k = 0; k < 64; k++) {
-              const on = (atlas.cov[covBase + k] > 0.45) !== (inv === 1);
-              if (on) { fr2 += px[k * 3]; fg2 += px[k * 3 + 1]; fb2 += px[k * 3 + 2]; fn++; }
-              else { br2 += px[k * 3]; bg2 += px[k * 3 + 1]; bb2 += px[k * 3 + 2]; bn++; }
+            const onL = atlas.onList[g], onN = onL.length;
+            let onR = 0, onG = 0, onB = 0;
+            for (let i = 0; i < onN; i++) { const k = onL[i]; onR += px[k * 3]; onG += px[k * 3 + 1]; onB += px[k * 3 + 2]; }
+            let fr2, fg2, fb2, fn, br2, bg2, bb2, bn;
+            if (inv === 0) {
+              fr2 = onR; fg2 = onG; fb2 = onB; fn = onN;
+              br2 = tr - onR; bg2 = tg - onG; bb2 = tb - onB; bn = 64 - onN;
+            } else {
+              fr2 = tr - onR; fg2 = tg - onG; fb2 = tb - onB; fn = 64 - onN;
+              br2 = onR; bg2 = onG; bb2 = onB; bn = onN;
             }
             const fR = fn ? fr2 / fn : br2 / Math.max(1, bn);
             const fG = fn ? fg2 / fn : bg2 / Math.max(1, bn);
@@ -561,11 +581,11 @@ export class AsciiRenderer {
             const bR = bn ? br2 / bn : fR, bG = bn ? bg2 / bn : fG, bB = bn ? bb2 / bn : fB;
             let err = 0;
             for (let k = 0; k < 64; k++) {
-              const on = (atlas.cov[covBase + k] > 0.45) !== (inv === 1);
               const r = px[k * 3], gg = px[k * 3 + 1], b = px[k * 3 + 2];
-              err += on
+              err += (penMask[covBase + k] ^ inv)
                 ? (r - fR) ** 2 + (gg - fG) ** 2 + (b - fB) ** 2
                 : (r - bR) ** 2 + (gg - bG) ** 2 + (b - bB) ** 2;
+              if (err >= bestErr) break;
             }
             if (err < bestErr) {
               bestErr = err;
