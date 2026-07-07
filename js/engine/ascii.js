@@ -86,6 +86,20 @@ export class AsciiRenderer {
     this.lastGrid = null; // rows of [char, fgRGB|null, bgRGB|null]
     this._atlasCache = new Map();
     this._rampCache = new Map();
+    // Bounded prefilter top-K cache: the shape prefilter's result depends only
+    // on the binarized 64-bit cell mask + colorMode + atlas, so identical masks
+    // (common across live-video frames / repeated regions) reuse it exactly.
+    const PF = 1 << 12; // 4096 slots
+    this._pfSlots = PF;
+    this._pfIdx = new Int16Array(PF * 8);
+    this._pfHam = new Uint8Array(PF * 8);
+    this._pfInv = new Uint8Array(PF * 8);
+    this._pfTag0 = new Int32Array(PF);
+    this._pfTag1 = new Int32Array(PF);
+    this._pfTagC = new Uint8Array(PF);
+    this._pfValid = new Int32Array(PF);
+    this._pfEpoch = 0;
+    this._pfAtlas = null;
   }
 
   // Drop cached glyph metrics/atlases (fonts loaded, etc.).
@@ -469,6 +483,9 @@ export class AsciiRenderer {
 
     const atlas = this.#atlas(font, shapeSet === 'blocks' ? SHAPE_BLOCKS : SHAPE_ASCII);
     const nGlyphs = atlas.glyphs.length;
+    // a different glyph atlas invalidates every cached prefilter result
+    if (this._pfAtlas !== atlas) { this._pfAtlas = atlas; this._pfEpoch++; }
+    const pfEpoch = this._pfEpoch;
 
     const lumAll = this.#lumGrid(data, W * H);
     if (autoContrast) this.#autoContrast(lumAll);
@@ -544,12 +561,27 @@ export class AsciiRenderer {
           }
           if (invertRamp) { b0 = ~b0 >>> 0; b1 = ~b1 >>> 0; }
 
-          // Hamming prefilter, keeping top-K (with inverted matches)
-          candHam.fill(65);
-          for (let g = 0; g < nGlyphs; g++) {
-            const hd = popcnt32((b0 ^ atlas.bits0[g]) >>> 0) + popcnt32((b1 ^ atlas.bits1[g]) >>> 0);
-            insertCand(candIdx, candHam, candInv, g, hd, 0);
-            if (colorMode !== 'mono') insertCand(candIdx, candHam, candInv, g, 64 - hd, 1);
+          // Hamming prefilter, keeping top-K (with inverted matches). The
+          // result is a pure function of (mask b0/b1, colorMode, atlas), so a
+          // bounded tag-verified cache reuses it exactly for recurring masks.
+          const colorFlag = colorMode !== 'mono' ? 1 : 0;
+          const key0 = b0 | 0, key1 = b1 | 0;
+          let hsh = (key0 ^ Math.imul(key1, 0x9e3779b1)) >>> 0;
+          hsh ^= hsh >>> 16; hsh = Math.imul(hsh, 0x7feb352d) >>> 0; hsh ^= hsh >>> 15;
+          const slot = hsh & (this._pfSlots - 1);
+          const base = slot * 8;
+          if (this._pfValid[slot] === pfEpoch && this._pfTag0[slot] === key0
+              && this._pfTag1[slot] === key1 && this._pfTagC[slot] === colorFlag) {
+            for (let i = 0; i < 8; i++) { candIdx[i] = this._pfIdx[base + i]; candHam[i] = this._pfHam[base + i]; candInv[i] = this._pfInv[base + i]; }
+          } else {
+            candHam.fill(65);
+            for (let g = 0; g < nGlyphs; g++) {
+              const hd = popcnt32((b0 ^ atlas.bits0[g]) >>> 0) + popcnt32((b1 ^ atlas.bits1[g]) >>> 0);
+              insertCand(candIdx, candHam, candInv, g, hd, 0);
+              if (colorFlag) insertCand(candIdx, candHam, candInv, g, 64 - hd, 1);
+            }
+            for (let i = 0; i < 8; i++) { this._pfIdx[base + i] = candIdx[i]; this._pfHam[base + i] = candHam[i]; this._pfInv[base + i] = candInv[i]; }
+            this._pfTag0[slot] = key0; this._pfTag1[slot] = key1; this._pfTagC[slot] = colorFlag; this._pfValid[slot] = pfEpoch;
           }
 
           // refine: per-pen mean colors, squared RGB error over 64 pixels.
