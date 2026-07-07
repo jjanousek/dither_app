@@ -38,12 +38,12 @@ export async function exportVideoFrameAccurate({
     onInfo?.(`Long clip: exporting the first ${Math.round(MAX_FRAMES / fps)}s`);
   }
 
-  // encode size: upscale the rendered (chunky) frame with nearest-neighbor so
-  // the dither stays crisp. Cap the LONGER side (portrait clips too) and round
-  // to even dims (H.264 needs even, and level 4.0 covers up to 1280x1280).
+  // Encode size: NEVER fractionally resample — that shreds the dither pattern
+  // (irregular dropped rows/columns). Integer-upscale a small frame for crisp
+  // pixels; encode a large frame at its native resolution 1:1.
   const first = renderFrame();
   const long = Math.max(first.width, first.height);
-  const k = long <= maxWidth ? Math.max(1, Math.floor(maxWidth / long)) : maxWidth / long;
+  const k = long <= maxWidth ? Math.max(1, Math.floor(maxWidth / long)) : 1;
   const w = Math.max(2, Math.round(first.width * k) & ~1);
   const h = Math.max(2, Math.round(first.height * k) & ~1);
 
@@ -58,10 +58,16 @@ export async function exportVideoFrameAccurate({
     output: (chunk, meta) => muxer.addChunk(chunk, meta),
     error: (e) => { encErr = e; },
   });
-  // H.264 Baseline @ Level 4.0 (0x28): no B-frames (plays everywhere), and
-  // level 4.0's 8192-macroblock limit covers any frame up to 1280x1280.
-  const bitrate = Math.min(24e6, Math.max(2e6, Math.round(w * h * fps * 0.15)));
-  encoder.configure({ codec: 'avc1.420028', width: w, height: h, bitrate, framerate: fps, avc: { format: 'avc' } });
+  // A fine dither is a full-frame high-frequency pattern — the worst case for
+  // H.264 — so use High profile (CABAC, 8x8 transform) at a generous bitrate,
+  // or it quantizes into visible 8x8 blocks. Level 5.1 covers any HD frame.
+  const bitrate = Math.min(48e6, Math.max(8e6, Math.round(w * h * fps * 0.5)));
+  encoder.configure({
+    codec: 'avc1.640033', // High @ Level 5.1
+    width: w, height: h, bitrate, framerate: fps,
+    latencyMode: 'quality',
+    avc: { format: 'avc' },
+  });
 
   const wasLooping = video.loop;
   const wasPaused = video.paused;
