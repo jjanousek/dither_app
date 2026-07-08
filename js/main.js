@@ -211,8 +211,11 @@ function present(result, srcW) {
   }
   octx.drawImage(final, 0, 0);
   // Crisp dither wants nearest-neighbour upscaling (sharp dots); a smoothed
-  // (box-resolved) result is continuous tone, so let it scale smoothly.
-  const pixelate = state.mode === 'dither' && !(state.smoothness > 0);
+  // (box-resolved) result is continuous tone, so let it scale smoothly. Only
+  // truly box-resolved output counts: if the governor pulled ss back to 1 the
+  // frame is crisp 1-bit again, so keep nearest-neighbour scaling.
+  const boxResolved = state.smoothness > 0 && (exporting ? 3 : governorSsCap) > 1;
+  const pixelate = state.mode === 'dither' && !boxResolved;
   out.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
   // not during exports: out is at export resolution and the overlay is hidden
@@ -514,13 +517,17 @@ function setSource(next) {
   source = next;
   const nowLive = next.type === 'video' || next.type === 'webcam';
   const wasLive = prevType === 'video' || prevType === 'webcam';
-  if (nowLive && !wasLive) applyVideoProfile();
+  const profileApplied = nowLive && !wasLive;
+  if (profileApplied) applyVideoProfile();
   fpsEma = 0;
   videoFrameReady = false;
   // new pixels, possibly same dither settings/size — force a fresh sync frame
   // instead of briefly showing the old source's async result.
   if (engine.cpu) engine.cpu.invalidate();
   engine.resetTemporal(); // don't ghost-blend a new clip with the old one's tail
+  // a fresh source starts un-throttled — a stale ss cap from a slow prior clip
+  // would otherwise under-supersample this source's first (or only) frame
+  governorLevel = 0; governorSsCap = 3; renderMsEma = 0;
   // Drive per-frame rendering off real decoded frames for video/webcam.
   // Capture the source locally so a stale callback (fired after a source
   // switch) re-registers on its OWN, now-paused element and self-terminates
@@ -546,6 +553,9 @@ function setSource(next) {
   updateStatus();
   rebuildPanel(); // scene controls appear only for generated sources
   dirty = true;
+  // record the auto-applied video profile as its own undo step, so the first
+  // subsequent slider edit doesn't revert the whole profile in one undo
+  if (profileApplied) commitHistory();
   setTimeout(renderPresetThumbs, 250);
   // a slow webcam can arrive with 0×0 dims and fill them in a moment later
   toast(source.width

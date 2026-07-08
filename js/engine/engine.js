@@ -345,7 +345,19 @@ export class Engine {
 
   // Forget temporal history (call on source switch / seek so a new clip
   // doesn't ghost-blend with the previous one's last frame).
-  resetTemporal() { this.histValid = false; }
+  resetTemporal() { this.#releaseHistory(); }
+
+  // Free the history ping-pong FBOs (and forget history). Called when the
+  // pre-pass is off and on source switch so idle temporal state doesn't retain
+  // multi-MB GPU allocations. #temporalPass lazily recreates them on demand.
+  #releaseHistory() {
+    const gl = this.gl;
+    if (gl && this.histA) { gl.deleteTexture(this.histA.tex); gl.deleteFramebuffer(this.histA.fbo); }
+    if (gl && this.histB) { gl.deleteTexture(this.histB.tex); gl.deleteFramebuffer(this.histB.fbo); }
+    this.histA = null;
+    this.histB = null;
+    this.histValid = false;
+  }
 
   // Upload the video frame at native resolution, mipmap it, and GPU-downsample
   // into the work FBO — replaces the per-frame Canvas2D resample. Returns the
@@ -424,13 +436,16 @@ export class Engine {
       baseTex = this.srcTex;
     }
 
-    // Pre-pass (live video/webcam): temporal EMA and/or denoise -> stabilized
-    // source, with per-pixel motion in its alpha for motion-adaptive strength.
+    // Pre-pass (any non-static source, live preview OR export): temporal EMA
+    // and/or denoise -> stabilized source, with per-pixel motion in its alpha
+    // for motion-adaptive strength. Gating on liveness (not _allowAsync) keeps
+    // the exported clip WYSIWYG with the tuned preview; the export renders at a
+    // different resolution, so the history FBO resizes and self-resets frame 0.
     let srcTexForDither = baseTex;
-    const prePassOn = this._allowAsync && !p.staticSource && this.temporalProgram
+    const prePassOn = !p.staticSource && this.temporalProgram
       && ((p.temporal || 0) > 0 || (p.videoDenoise || 0) > 0);
     if (prePassOn) srcTexForDither = this.#temporalPass(baseTex, srcW, srcH, p);
-    else this.histValid = false; // drop stale history when the pre-pass is off
+    else this.#releaseHistory(); // free history FBOs when the pre-pass is off
 
     // canvas is the OUTPUT (present) resolution; the source may be finer (ss>1)
     if (canvas.width !== w || canvas.height !== h) {

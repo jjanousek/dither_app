@@ -157,8 +157,10 @@ mat2 rot(float a) { return mat2(cos(a), -sin(a), sin(a), cos(a)); }
 
 // Dither one sample. uv samples the (already downsampled) source; pix is the
 // integer coordinate in the dither grid (== output pixel in the classic path,
-// or a finer sub-pixel coordinate when supersampling).
-vec4 ditherSample(vec2 uv, vec2 pix) {
+// or a finer sub-pixel coordinate when supersampling). gridScale is how many
+// dither-grid units make one output pixel (1 crisp, u_ss in the SS loop) — used
+// to keep the halftone lattice a fixed size in OUTPUT space regardless of ss.
+vec4 ditherSample(vec2 uv, vec2 pix, float gridScale) {
   vec4 src = texture(u_src, uv);
   vec3 c = adjust(src.rgb);
 
@@ -189,8 +191,10 @@ vec4 ditherSample(vec2 uv, vec2 pix) {
     vec3 darkest, brightest;
     paletteExtremes(darkest, brightest);
     // drift applied AFTER rotation so a whole-tile offset stays a lattice
-    // vector of the rotated pattern (seamless flow loops at any angle)
-    vec2 p = rot(u_halftoneAngle) * pix + u_matOffset;
+    // vector of the rotated pattern (seamless flow loops at any angle).
+    // pix/gridScale puts the lattice in output-pixel space so the dot size is
+    // constant whether we're sampling the crisp grid or the ss-finer grid.
+    vec2 p = rot(u_halftoneAngle) * (pix / gridScale) + u_matOffset;
     float scale = max(u_halftoneScale, 1.5);
     // + bias so raising Threshold brightens, same convention as modes 0/1/2
     float l = clamp(luma(c) + u_bias, 0.0, 1.0);
@@ -219,7 +223,7 @@ void main() {
 
   // Crisp reference: dither at the output resolution (identical to the classic
   // single-pass path when u_ss == 1).
-  vec4 crisp = ditherSample((vec2(op) + 0.5) / u_outSize, vec2(op));
+  vec4 crisp = ditherSample((vec2(op) + 0.5) / u_outSize, vec2(op), 1.0);
 
   if (u_ss <= 1 || u_smoothness <= 0.0) {
     outColor = crisp;
@@ -235,7 +239,7 @@ void main() {
     for (int i = 0; i < 3; i++) {
       if (i >= u_ss) break;
       ivec2 hp = op * u_ss + ivec2(i, j);
-      acc += ditherSample((vec2(hp) + 0.5) / hiSize, vec2(hp));
+      acc += ditherSample((vec2(hp) + 0.5) / hiSize, vec2(hp), float(u_ss));
     }
   }
   acc /= float(u_ss * u_ss);
