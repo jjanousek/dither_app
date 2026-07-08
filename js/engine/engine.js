@@ -183,9 +183,13 @@ export class Engine {
 
     // Smoothness (GPU only): dither on a finer grid and box-average down. Shrink
     // the OUTPUT grid so the supersampled source (ss*w x ss*h) stays in budget.
+    // p.ssCap lets the sustained-load governor pull SS down (3->2->1) before
+    // touching base resolution.
     let ss = 1;
     if (gpu && p.smoothness > 0) {
-      ss = p.smoothness > 0.6 ? 3 : 2;
+      ss = Math.min(p.smoothness > 0.6 ? 3 : 2, p.ssCap ?? 3);
+    }
+    if (ss > 1) {
       const outCap = Math.min(maxPixels, Math.floor(SS_SOURCE_BUDGET / (ss * ss)));
       if (w * h > outCap) {
         const k = Math.sqrt(outCap / (w * h));

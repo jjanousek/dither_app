@@ -42,6 +42,14 @@ let scrubbing = false;
 let fpsEma = 0;
 let lastFrameT = 0;
 let fpsText = '';
+// Sustained-load governor: if a smoothed video render runs slow, pull the
+// supersample factor down (3->2->1) BEFORE touching base resolution — dropping
+// resolution is the opposite of what someone complaining about grain wants.
+// present() draws the GL canvas into the 2D output, which syncs the GPU, so the
+// renderOnce wall-time is a usable (if rough) proxy for real frame cost.
+let renderMsEma = 0;
+let governorLevel = 0;   // 0 full, 1 cap ss<=2, 2 cap ss<=1
+let governorSsCap = 3;
 // A playing video/webcam decodes at ~24–30 fps, but the rAF loop ticks ~60;
 // re-dithering the same frame is wasted work. requestVideoFrameCallback sets
 // this only when a genuinely new frame is decoded, so we render each once.
@@ -133,6 +141,8 @@ const derived = () => ({
   animPhase: phaseOverride ?? animPhase,
   // still images can cache their downsampled base across animation frames
   staticSource: source?.type === 'image',
+  // exports always render at full supersampling; only the live loop degrades
+  ssCap: exporting ? 3 : governorSsCap,
 });
 
 function srcDims() {
@@ -244,6 +254,17 @@ function drawSplitOverlay() {
   cctx.drawImage(source.el, 0, 0, w * frac, h, 0, 0, w * frac, h);
 }
 
+// Adjust the supersample cap from smoothed render cost. Conservative thresholds
+// + EMA reset on each change give hysteresis so it doesn't thrash.
+function updateGovernor() {
+  if (state.mode !== 'dither' || state.smoothness <= 0 || source?.type === 'image') {
+    governorLevel = 0; governorSsCap = 3; renderMsEma = 0; return;
+  }
+  if (renderMsEma > 40 && governorLevel < 2) { governorLevel++; renderMsEma = 0; }
+  else if (renderMsEma > 0 && renderMsEma < 20 && governorLevel > 0) { governorLevel--; renderMsEma = 0; }
+  governorSsCap = [3, 2, 1][governorLevel];
+}
+
 function loop(t) {
   requestAnimationFrame(loop);
   if (!source) return;
@@ -282,8 +303,18 @@ function loop(t) {
   videoFrameReady = false;
   dirty = false;
 
-  if (comparing) presentOriginal();
-  else renderOnce(null, contentNew);
+  if (comparing) {
+    presentOriginal();
+  } else {
+    const t0 = performance.now();
+    renderOnce(null, contentNew);
+    // only track cost while actually producing new frames (not idle wake-ups)
+    if (contentNew) {
+      const rt = performance.now() - t0;
+      renderMsEma = renderMsEma ? renderMsEma * 0.85 + rt * 0.15 : rt;
+      updateGovernor();
+    }
+  }
 
   if (playing || animating) {
     if (lastFrameT) {
