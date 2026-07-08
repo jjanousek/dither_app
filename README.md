@@ -58,7 +58,9 @@ The cell modes (Dots → Mosaic) share controls for cell size, coverage, scatter
 
 No source material? Hit **Generate** (the sparkle button): six animated procedural scenes — **Mesh Gradient, Neuro Noise, Warp Field, Smoke, Voronoi Flow, Metaballs** — render straight into the pipeline like a live video source, so every dither/ASCII mode, palette, and post effect applies in real time. Each scene has its own palette, zoom, speed and seed controls, and every scene is a pure function of a loop phase, so **GIF exports are perfectly seamless loops**. Clicking Generate again cycles scenes; `?gen=<scene>` boots straight into one.
 
-![Warp Field scene dithered with the Vaporwave preset](docs/generate.png)
+![Warp Field generative scene, blue-noise dithered in the Vaporwave palette](docs/generate.png)
+
+![Smoke scene animating — every generative scene bakes into a seamless GIF loop](docs/shader.gif)
 
 ## Dithering
 
@@ -69,6 +71,8 @@ No source material? Hit **Generate** (the sparkle button): six animated procedur
 **Halftone** (procedural shader): rotating dot screen and line screen with adjustable cell scale and screen angle.
 
 Plus white noise and plain nearest-color quantization. Pixel size (1–32) sets the working resolution; threshold biases light/dark; both CPU and GPU paths share identical adjustment math and the same perceptually-weighted nearest-palette quantizer, so switching algorithms never shifts colors.
+
+A **Smoothness** control (GPU dithers) supersamples the dither and box-averages it back down to tone: at 0 it stays crisp 1-bit dots, and higher settings anti-alias the grain into smooth, finer shading — like a halftone print seen from across the room. It's the same lever for "smoother" *and* "finer grain," and it's especially good on video.
 
 ![Before/after split view with the Noir preset](docs/split.png)
 
@@ -129,14 +133,23 @@ Speed and intensity are adjustable. Because animation is a pure function of a no
 
 ## Video & webcam
 
-The full pipeline runs per frame in real time: play/pause, scrubber, playback speed (0.25–2×), and a live fps readout. CPU-bound algorithms are capped at a working-resolution budget during playback so previews stay fluid. The webcam is a first-class source — every mode and export works on it.
+The full pipeline runs per frame in real time: play/pause, scrubber, playback speed (0.25–2×), and a live fps readout. `requestVideoFrameCallback` re-dithers only on genuinely new decoded frames, and CPU-bound algorithms are capped at a working-resolution budget during playback so previews stay fluid. The webcam is a first-class source — every mode and export works on it.
+
+Loading a video (or webcam) applies a **smooth-by-default profile** tuned for moving footage — all reversible from the sliders:
+
+- **Blue Noise** as the default dither. It's temporally stable under motion, where Bayer's regular grid crawls and per-frame error diffusion flickers.
+- **Temporal** — motion-gated exponential smoothing that calms frame-to-frame "boil" in near-static areas while leaving moving regions live, so it doesn't ghost or smear.
+- **Denoise** — a light pre-dither filter that stops video-compression noise from chattering the dither threshold in flat areas.
+- **Smoothness** (above) for anti-aliased, finer grain.
+
+GPU dithers cost about the same at any resolution, so video runs at near-native fineness. On modest, fanless hardware (a MacBook Air), a sustained-load governor eases the supersampling first — never the base resolution — if the frame budget slips, and the per-frame downsample is done on the GPU to keep the CPU cool. Dithering a moving frame also eases its strength where the image is actually moving, to further cut crawl.
 
 ## Exports
 
 | Format | Notes |
 | --- | --- |
 | **PNG** | pixel-exact, source resolution, or 2× — post FX included |
-| **Video** | WebM/MP4 via MediaRecorder; records the live preview in real time and carries the source's audio track (keep the tab visible while recording) |
+| **Video** | frame-accurate **H.264/MP4** via WebCodecs (High profile, constant-quality QP) — each frame is seeked and rendered with no time pressure, so a slow dither never judders the output, and it exports exactly what you tuned (temporal/denoise/smoothness included). Crisp 1-bit and smoothed output get their own QP/upscale presets so hard edges don't ring under H.264. Falls back to real-time MediaRecorder capture (with the source's audio) where WebCodecs is unavailable |
 | **GIF** | built-in GIF89a encoder: exact colors for palettized output, weighted median-cut global palette beyond 256 colors, drift-free frame timing; animated stills bake one seamless loop |
 | **TXT / ANS / HTML** | ASCII output as plain text, ANSI truecolor (`cat file.ans` in any modern terminal), or a self-contained web page — or copy straight to the clipboard |
 
