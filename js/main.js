@@ -200,7 +200,9 @@ function present(result, srcW) {
     resized = true;
   }
   octx.drawImage(final, 0, 0);
-  const pixelate = state.mode === 'dither'; // chunky pixels stay crisp even with FX
+  // Crisp dither wants nearest-neighbour upscaling (sharp dots); a smoothed
+  // (box-resolved) result is continuous tone, so let it scale smoothly.
+  const pixelate = state.mode === 'dither' && !(state.smoothness > 0);
   out.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
   // not during exports: out is at export resolution and the overlay is hidden

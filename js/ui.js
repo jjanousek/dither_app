@@ -228,6 +228,14 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         oninput: (v) => { state.halftoneAngle = v; change(); },
       });
     }
+    if (algo.type === 'gpu') {
+      // Supersamples the dither and averages to tone: 0 = crisp 1-bit dots,
+      // higher = smoother, finer grain (great for video). GPU-only.
+      slider(eff, 'Smoothness', {
+        min: 0, max: 1, step: 0.01, value: state.smoothness, fmt: pct,
+        oninput: (v) => { state.smoothness = v; change(); },
+      });
+    }
   } else if (state.mode === 'ascii') {
     const a = state.ascii;
     select(eff, 'Renderer', {

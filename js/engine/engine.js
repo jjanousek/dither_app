@@ -36,6 +36,11 @@ export function getAlgorithm(id) {
   return ALGORITHMS.find((a) => a.id === id) || ALGORITHMS[0];
 }
 
+// Cap on the supersampled source when Smoothness > 0. Dither is evaluated at
+// ss*ss the output pixels, so we shrink the output grid to keep the source
+// within the GPU's flat-cost regime (~<=3.5MP) and the per-frame upload sane.
+const SS_SOURCE_BUDGET = 4_000_000;
+
 export class Engine {
   constructor() {
     this.work = document.createElement('canvas');
@@ -80,7 +85,8 @@ export class Engine {
     gl.useProgram(this.program);
     this.u = {};
     for (const name of [
-      'u_src', 'u_threshold', 'u_srcSize', 'u_thresholdSize', 'u_mode',
+      'u_src', 'u_threshold', 'u_srcSize', 'u_outSize', 'u_ss', 'u_smoothness',
+      'u_thresholdSize', 'u_mode',
       'u_brightness', 'u_contrast', 'u_gamma', 'u_saturation', 'u_strength',
       'u_bias', 'u_invert', 'u_palette', 'u_paletteSize',
       'u_halftoneScale', 'u_halftoneAngle', 'u_matOffset', 'u_seed',
@@ -136,15 +142,29 @@ export class Engine {
       h = Math.max(1, Math.floor(h * k));
     }
 
-    const work = this.#drawWork(source, w, h, p);
-
     const algo = getAlgorithm(p.algorithm);
     const pal = this.#palettes(p.colors);
     const effSat = p.grayscale ? 0 : p.saturation;
+    const gpu = algo.type === 'gpu' && this.gl && !this.glLost && !this.gl.isContextLost();
 
-    if (algo.type === 'gpu' && this.gl && !this.glLost && !this.gl.isContextLost()) {
-      return this.#renderGPU(work, w, h, p, algo, pal, effSat);
+    // Smoothness (GPU only): dither on a finer grid and box-average down. Shrink
+    // the OUTPUT grid so the supersampled source (ss*w x ss*h) stays in budget.
+    let ss = 1;
+    if (gpu && p.smoothness > 0) {
+      ss = p.smoothness > 0.6 ? 3 : 2;
+      const outCap = Math.min(maxPixels, Math.floor(SS_SOURCE_BUDGET / (ss * ss)));
+      if (w * h > outCap) {
+        const k = Math.sqrt(outCap / (w * h));
+        w = Math.max(1, Math.floor(w * k));
+        h = Math.max(1, Math.floor(h * k));
+      }
     }
+
+    // The work canvas holds the source at the (super)sampled resolution; the
+    // CPU path never supersamples (ss stays 1), so it still gets w x h.
+    const work = this.#drawWork(source, w * ss, h * ss, p);
+
+    if (gpu) return this.#renderGPU(work, w, h, ss, p, algo, pal, effSat);
     return this.#renderCPU(work, w, h, p, algo, pal, effSat);
   }
 
@@ -273,9 +293,10 @@ export class Engine {
     return { ox: 0, oy: 0, seed: 0 };
   }
 
-  #renderGPU(work, w, h, p, algo, pal, effSat) {
+  #renderGPU(work, w, h, ss, p, algo, pal, effSat) {
     const gl = this.gl;
     const canvas = this.glCanvas;
+    // canvas is the OUTPUT (present) resolution; the source may be finer (ss>1)
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
@@ -286,6 +307,9 @@ export class Engine {
     gl.activeTexture(gl.TEXTURE0);
     uploadTexture(gl, this.srcTex, work);
     gl.uniform1i(this.u.u_src, 0);
+    gl.uniform2f(this.u.u_outSize, w, h);
+    gl.uniform1i(this.u.u_ss, ss);
+    gl.uniform1f(this.u.u_smoothness, p.smoothness || 0);
 
     const mat = this.matrixTextures[algo.matrix] || this.matrixTextures.bayer4;
     gl.activeTexture(gl.TEXTURE1);
@@ -293,7 +317,7 @@ export class Engine {
     gl.uniform1i(this.u.u_threshold, 1);
     gl.uniform1f(this.u.u_thresholdSize, mat.size);
 
-    gl.uniform2f(this.u.u_srcSize, w, h);
+    gl.uniform2f(this.u.u_srcSize, work.width, work.height);
     gl.uniform1i(this.u.u_mode, algo.mode);
     gl.uniform1f(this.u.u_brightness, this.#animBrightness(p));
     gl.uniform1f(this.u.u_contrast, p.contrast);
