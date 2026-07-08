@@ -6,6 +6,10 @@ Drop in a photo, a video, or your webcam feed and turn it into 1-bit dither art,
 
 ![Ditherlab editor with the Game Boy preset](docs/hero.png)
 
+*Everything renders in real time — here a Vaporwave dither with an animated light sweep:*
+
+![Animated Vaporwave dither with a light sweep](docs/demo.gif)
+
 - [Quick start](#quick-start)
 - [Effect modes](#effect-modes)
 - [Generative scenes](#generative-scenes)
