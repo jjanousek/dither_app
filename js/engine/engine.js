@@ -1,8 +1,8 @@
 // Engine: routes a source frame through the right pipeline
 // (GPU uber-shader | CPU error diffusion | ASCII renderer) based on params.
 
-import { createGL, compileProgram, QUAD_VS, createTexture, uploadTexture, uploadR8 } from './gl.js';
-import { DITHER_FS, MAX_PALETTE } from './shaders.js';
+import { createGL, compileProgram, QUAD_VS, createTexture, uploadTexture, uploadR8, createFBO } from './gl.js';
+import { DITHER_FS, TEMPORAL_FS, MAX_PALETTE } from './shaders.js';
 import { applyAdjustments, errorDiffusion, orderedDither, quantize, whiteNoiseDither, halftoneDither, MATRICES, DIFFUSION_KERNELS } from './cpu.js';
 import { getBlueNoise } from './bluenoise.js';
 import { AsciiRenderer, fontSpec } from './ascii.js';
@@ -94,6 +94,23 @@ export class Engine {
       this.u[name] = gl.getUniformLocation(this.program, name);
     }
     this.srcTex = createTexture(gl);
+
+    // Temporal-smoothing pre-pass program + history ping-pong (FBOs made lazily
+    // at source resolution). If it fails to compile, temporal just no-ops.
+    try {
+      this.temporalProgram = compileProgram(gl, QUAD_VS, TEMPORAL_FS);
+      this.tu = {};
+      for (const name of ['u_src', 'u_hist', 'u_historyWeight', 'u_motionLo', 'u_motionHi', 'u_reset']) {
+        this.tu[name] = gl.getUniformLocation(this.temporalProgram, name);
+      }
+    } catch (err) {
+      console.error(err);
+      this.temporalProgram = null;
+    }
+    this.histA = null;
+    this.histB = null;
+    this.histValid = false;
+
     // Threshold matrix textures (R8, tiling)
     for (const [key, m] of Object.entries(MATRICES)) {
       const bytes = new Uint8Array(m.size * m.size);
@@ -293,9 +310,58 @@ export class Engine {
     return { ox: 0, oy: 0, seed: 0 };
   }
 
+  // Forget temporal history (call on source switch / seek so a new clip
+  // doesn't ghost-blend with the previous one's last frame).
+  resetTemporal() { this.histValid = false; }
+
+  // Motion-gated EMA on the raw downsampled frame. Renders the stabilized frame
+  // into a ping-pong FBO and returns its texture for the dither pass to consume.
+  #temporalPass(w, h, p) {
+    const gl = this.gl;
+    if (!this.histA || this.histA.w !== w || this.histA.h !== h) {
+      if (this.histA) { gl.deleteTexture(this.histA.tex); gl.deleteFramebuffer(this.histA.fbo); }
+      if (this.histB) { gl.deleteTexture(this.histB.tex); gl.deleteFramebuffer(this.histB.fbo); }
+      this.histA = createFBO(gl, w, h);
+      this.histB = createFBO(gl, w, h);
+      this.histValid = false;
+    }
+    gl.useProgram(this.temporalProgram);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.histB.fbo);
+    gl.viewport(0, 0, w, h);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
+    gl.uniform1i(this.tu.u_src, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.histA.tex);
+    gl.uniform1i(this.tu.u_hist, 1);
+    gl.uniform1f(this.tu.u_historyWeight, Math.max(0, Math.min(1, p.temporal)) * 0.8);
+    gl.uniform1f(this.tu.u_motionLo, 0.03);
+    gl.uniform1f(this.tu.u_motionHi, 0.13);
+    gl.uniform1i(this.tu.u_reset, this.histValid ? 0 : 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.histValid = true;
+    // swap: the frame we just wrote (histB) becomes the source + next read
+    const written = this.histB;
+    this.histB = this.histA;
+    this.histA = written;
+    return written.tex;
+  }
+
   #renderGPU(work, w, h, ss, p, algo, pal, effSat) {
     const gl = this.gl;
     const canvas = this.glCanvas;
+
+    gl.activeTexture(gl.TEXTURE0);
+    uploadTexture(gl, this.srcTex, work);
+
+    // Temporal smoothing pre-pass (live video/webcam only) -> stabilized source.
+    let srcTexForDither = this.srcTex;
+    const temporalOn = this._allowAsync && !p.staticSource
+      && (p.temporal || 0) > 0 && this.temporalProgram;
+    if (temporalOn) srcTexForDither = this.#temporalPass(work.width, work.height, p);
+    else this.histValid = false; // drop stale history when temporal is off
+
     // canvas is the OUTPUT (present) resolution; the source may be finer (ss>1)
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
@@ -305,7 +371,7 @@ export class Engine {
     gl.useProgram(this.program);
 
     gl.activeTexture(gl.TEXTURE0);
-    uploadTexture(gl, this.srcTex, work);
+    gl.bindTexture(gl.TEXTURE_2D, srcTexForDither);
     gl.uniform1i(this.u.u_src, 0);
     gl.uniform2f(this.u.u_outSize, w, h);
     gl.uniform1i(this.u.u_ss, ss);

@@ -485,6 +485,7 @@ function setSource(next) {
   // new pixels, possibly same dither settings/size — force a fresh sync frame
   // instead of briefly showing the old source's async result.
   if (engine.cpu) engine.cpu.invalidate();
+  engine.resetTemporal(); // don't ghost-blend a new clip with the old one's tail
   // Drive per-frame rendering off real decoded frames for video/webcam.
   // Capture the source locally so a stale callback (fired after a source
   // switch) re-registers on its OWN, now-paused element and self-terminates
@@ -860,6 +861,7 @@ function rebuildPanel() {
     state,
     mount: $('panel'),
     exportSettings,
+    isLive: source?.type === 'video' || source?.type === 'webcam',
     gen: source?.type === 'gen' ? source.gen : null,
     onGenChange: () => {
       if (source?.type === 'gen') source.name = source.gen.sceneName().toLowerCase();

@@ -136,7 +136,7 @@ const pct = (v) => `${Math.round(v * 100)}%`;
 
 // ---------- panel ----------
 
-export function buildPanel({ state, mount, onChange, exportSettings, gen = null, onGenChange = null }) {
+export function buildPanel({ state, mount, onChange, exportSettings, gen = null, onGenChange = null, isLive = false }) {
   mount.innerHTML = '';
   const refresh = () => buildPanel({ state, mount, onChange, exportSettings, gen, onGenChange });
   const change = () => onChange();
@@ -235,6 +235,14 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         min: 0, max: 1, step: 0.01, value: state.smoothness, fmt: pct,
         oninput: (v) => { state.smoothness = v; change(); },
       });
+      if (isLive) {
+        // Motion-gated temporal smoothing — calms frame-to-frame boil on video
+        // while letting moving areas stay live. Video/webcam only.
+        slider(eff, 'Temporal', {
+          min: 0, max: 1, step: 0.01, value: state.temporal, fmt: pct,
+          oninput: (v) => { state.temporal = v; change(); },
+        });
+      }
     }
   } else if (state.mode === 'ascii') {
     const a = state.ascii;

@@ -60,6 +60,19 @@ export function uploadTexture(gl, tex, source) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
 }
 
+// Off-screen render target (RGBA8). Used for the temporal-smoothing history
+// ping-pong. Returns { fbo, tex, w, h }; recreate when the size changes.
+export function createFBO(gl, w, h, { filter = gl.NEAREST } = {}) {
+  const tex = createTexture(gl, { filter });
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fbo, tex, w, h };
+}
+
 // Upload a single-channel Uint8Array as an R8 texture (threshold maps).
 export function uploadR8(gl, tex, size, bytes) {
   gl.bindTexture(gl.TEXTURE_2D, tex);

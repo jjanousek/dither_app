@@ -16,6 +16,33 @@
 
 export const MAX_PALETTE = 32;
 
+// Temporal smoothing pre-pass (video/webcam only). Motion-gated EMA on the raw
+// downsampled frame BEFORE dithering: blend toward the previous stabilized
+// frame where the image is static, and fall back to the live frame where it
+// moves (so motion doesn't smear/ghost). Feeding a temporally-denoised frame
+// into the dither is what calms the frame-to-frame "boil" of a 1-bit field.
+// Output is a 1:1 copy-orientation of u_src (no V-flip); the dither pass
+// applies its own flip when it samples this texture.
+export const TEMPORAL_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_src;    // this frame's downsampled source (NEAREST)
+uniform sampler2D u_hist;   // previous frame's stabilized result
+uniform float u_historyWeight; // 0..~0.8 max blend on fully-static pixels
+uniform float u_motionLo;      // below this delta => treat as static
+uniform float u_motionHi;      // above this delta => treat as full motion
+uniform int u_reset;           // 1 = first frame / discontinuity: no history
+void main() {
+  vec3 cur = texture(u_src, v_uv).rgb;
+  if (u_reset == 1) { outColor = vec4(cur, 1.0); return; }
+  vec3 hist = texture(u_hist, v_uv).rgb;
+  float d = max(max(abs(cur.r - hist.r), abs(cur.g - hist.g)), abs(cur.b - hist.b));
+  float motion = smoothstep(u_motionLo, u_motionHi, d);
+  float w = u_historyWeight * (1.0 - motion);
+  outColor = vec4(mix(cur, hist, w), 1.0);
+}`;
+
 export const DITHER_FS = `#version 300 es
 precision highp float;
 
