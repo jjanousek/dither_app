@@ -13,8 +13,9 @@ import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js'
 import { Viewport } from './view.js';
 import { GenerativeSource } from './generate.js';
 
-const MAX_LIVE_PIXELS = 420_000;   // GPU-dither budget for live video preview
+const MAX_LIVE_PIXELS = 420_000;   // default live budget (cells / non-shape ASCII)
 const MAX_LIVE_CPU_PIXELS = 200_000; // tighter cap for the slow CPU live paths
+const MAX_LIVE_GPU_PIXELS = 1_600_000; // GPU dithers are cheap at any size — match export fineness
 const EXPORT_PIXELS = 1_600_000;   // GIF/text exports render finer than the live preview
 const MAX_EXPORT_SIDE = 16384;     // canvas hard limits (Chromium/WebKit)
 const MAX_EXPORT_AREA = 64_000_000;
@@ -155,11 +156,15 @@ function renderOnce(budgetOverride = null, contentNew = true) {
   // CPU error-diffusion and ASCII shape-matching are the slow live paths
   // (heavy per-pixel/per-cell JS, several times slower in WebKit). Cap them
   // harder on live video/webcam so scrubbing stays smooth — exports use
-  // EXPORT_PIXELS, so their quality is unaffected.
+  // EXPORT_PIXELS, so their quality is unaffected. GPU dithers, by contrast,
+  // cost ~the same at 0.4MP or 2MP (the shader is the bottleneck, not the
+  // pixel count), so give them a much finer live budget — the dither pattern
+  // on video is then crisp instead of chunky at pixel-size 1.
   if (budgetOverride === null && capped && source.type !== 'image') {
     const cpuDither = state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'cpu';
     const heavyAscii = state.mode === 'ascii' && state.ascii.renderer === 'shape';
     if (cpuDither || heavyAscii) budget = MAX_LIVE_CPU_PIXELS;
+    else if (state.mode === 'dither') budget = MAX_LIVE_GPU_PIXELS;
   }
   // Only the live preview (no budget override, not exporting) may run the CPU
   // dither in the worker; exports and thumbnails stay synchronous.
