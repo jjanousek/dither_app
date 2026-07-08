@@ -2,7 +2,7 @@
 // (GPU uber-shader | CPU error diffusion | ASCII renderer) based on params.
 
 import { createGL, compileProgram, QUAD_VS, createTexture, uploadTexture, uploadR8, createFBO } from './gl.js';
-import { DITHER_FS, TEMPORAL_FS, MAX_PALETTE } from './shaders.js';
+import { DITHER_FS, TEMPORAL_FS, BLIT_FS, MAX_PALETTE } from './shaders.js';
 import { applyAdjustments, errorDiffusion, orderedDither, quantize, whiteNoiseDither, halftoneDither, MATRICES, DIFFUSION_KERNELS } from './cpu.js';
 import { getBlueNoise } from './bluenoise.js';
 import { AsciiRenderer, fontSpec } from './ascii.js';
@@ -111,6 +111,23 @@ export class Engine {
     this.histB = null;
     this.histValid = false;
 
+    // Direct GPU video-ingest: blit program + native-res mipmapped video
+    // texture + work FBO (all lazy). Falls back to Canvas2D if it won't compile.
+    try {
+      this.blitProgram = compileProgram(gl, QUAD_VS, BLIT_FS);
+      this.blitU = { u_src: gl.getUniformLocation(this.blitProgram, 'u_src') };
+    } catch (err) {
+      console.error(err);
+      this.blitProgram = null;
+    }
+    this.videoTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.workFBO = null;
+
     // Threshold matrix textures (R8, tiling)
     for (const [key, m] of Object.entries(MATRICES)) {
       const bytes = new Uint8Array(m.size * m.size);
@@ -175,6 +192,17 @@ export class Engine {
         w = Math.max(1, Math.floor(w * k));
         h = Math.max(1, Math.floor(h * k));
       }
+    }
+
+    // Direct GPU video ingest: skip the per-frame Canvas2D resample when the
+    // source is a video/webcam element and nothing needs Canvas2D compositing
+    // (CSS filters, or sweep/wave canvas animation). Thermal win on the Air.
+    const isVideoEl = typeof HTMLVideoElement !== 'undefined' && source instanceof HTMLVideoElement;
+    const hasFilter = p.hue || p.sepia || p.blur;
+    const canvasAnim = p.anim && (p.anim.style === 'sweep' || p.anim.style === 'wave');
+    if (gpu && isVideoEl && !hasFilter && !canvasAnim && this.blitProgram) {
+      const workTex = this.#ingestVideo(source, w * ss, h * ss);
+      return this.#renderGPU(null, w, h, ss, p, algo, pal, effSat, workTex);
     }
 
     // The work canvas holds the source at the (super)sampled resolution; the
@@ -314,9 +342,34 @@ export class Engine {
   // doesn't ghost-blend with the previous one's last frame).
   resetTemporal() { this.histValid = false; }
 
+  // Upload the video frame at native resolution, mipmap it, and GPU-downsample
+  // into the work FBO — replaces the per-frame Canvas2D resample. Returns the
+  // work texture at (w x h) for the temporal/dither passes to consume.
+  #ingestVideo(videoEl, w, h) {
+    const gl = this.gl;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoEl);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    if (!this.workFBO || this.workFBO.w !== w || this.workFBO.h !== h) {
+      if (this.workFBO) { gl.deleteTexture(this.workFBO.tex); gl.deleteFramebuffer(this.workFBO.fbo); }
+      this.workFBO = createFBO(gl, w, h);
+    }
+    gl.useProgram(this.blitProgram);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.workFBO.fbo);
+    gl.viewport(0, 0, w, h);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
+    gl.uniform1i(this.blitU.u_src, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return this.workFBO.tex;
+  }
+
   // Motion-gated EMA on the raw downsampled frame. Renders the stabilized frame
   // into a ping-pong FBO and returns its texture for the dither pass to consume.
-  #temporalPass(w, h, p) {
+  #temporalPass(baseTex, w, h, p) {
     const gl = this.gl;
     if (!this.histA || this.histA.w !== w || this.histA.h !== h) {
       if (this.histA) { gl.deleteTexture(this.histA.tex); gl.deleteFramebuffer(this.histA.fbo); }
@@ -329,7 +382,7 @@ export class Engine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.histB.fbo);
     gl.viewport(0, 0, w, h);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
+    gl.bindTexture(gl.TEXTURE_2D, baseTex);
     gl.uniform1i(this.tu.u_src, 0);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.histA.tex);
@@ -348,18 +401,25 @@ export class Engine {
     return written.tex;
   }
 
-  #renderGPU(work, w, h, ss, p, algo, pal, effSat) {
+  #renderGPU(work, w, h, ss, p, algo, pal, effSat, preTex = null) {
     const gl = this.gl;
     const canvas = this.glCanvas;
+    const srcW = w * ss, srcH = h * ss;
 
-    gl.activeTexture(gl.TEXTURE0);
-    uploadTexture(gl, this.srcTex, work);
+    // preTex = source already on the GPU (direct video ingest); otherwise
+    // upload the work canvas.
+    let baseTex = preTex;
+    if (!preTex) {
+      gl.activeTexture(gl.TEXTURE0);
+      uploadTexture(gl, this.srcTex, work);
+      baseTex = this.srcTex;
+    }
 
     // Temporal smoothing pre-pass (live video/webcam only) -> stabilized source.
-    let srcTexForDither = this.srcTex;
+    let srcTexForDither = baseTex;
     const temporalOn = this._allowAsync && !p.staticSource
       && (p.temporal || 0) > 0 && this.temporalProgram;
-    if (temporalOn) srcTexForDither = this.#temporalPass(work.width, work.height, p);
+    if (temporalOn) srcTexForDither = this.#temporalPass(baseTex, srcW, srcH, p);
     else this.histValid = false; // drop stale history when temporal is off
 
     // canvas is the OUTPUT (present) resolution; the source may be finer (ss>1)
@@ -383,7 +443,7 @@ export class Engine {
     gl.uniform1i(this.u.u_threshold, 1);
     gl.uniform1f(this.u.u_thresholdSize, mat.size);
 
-    gl.uniform2f(this.u.u_srcSize, work.width, work.height);
+    gl.uniform2f(this.u.u_srcSize, srcW, srcH);
     gl.uniform1i(this.u.u_mode, algo.mode);
     gl.uniform1f(this.u.u_brightness, this.#animBrightness(p));
     gl.uniform1f(this.u.u_contrast, p.contrast);

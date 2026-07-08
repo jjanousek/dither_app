@@ -16,6 +16,18 @@
 
 export const MAX_PALETTE = 32;
 
+// Downsample blit for direct GPU video ingest. Samples a mipmapped, native-res
+// video texture (LINEAR_MIPMAP_LINEAR) into the work FBO at the target grid
+// size — a GPU box-ish downscale that replaces the per-frame Canvas2D
+// high-quality resample (cuts CPU work/heat on a fanless Air). No V-flip: the
+// work texture keeps the same orientation as the old Canvas2D path.
+export const BLIT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_src;
+void main() { outColor = texture(u_src, v_uv); }`;
+
 // Temporal smoothing pre-pass (video/webcam only). Motion-gated EMA on the raw
 // downsampled frame BEFORE dithering: blend toward the previous stabilized
 // frame where the image is static, and fall back to the live frame where it
