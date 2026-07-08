@@ -14,7 +14,7 @@ export function canFrameExport() {
 }
 
 export async function exportVideoFrameAccurate({
-  video, renderFrame, maxWidth = 1280, name = 'dithered',
+  video, renderFrame, maxWidth = 1280, name = 'dithered', strict = true,
   onProgress = () => {}, onInfo = null, shouldAbort = null,
 }) {
   // resolve the source frame rate (fall back to 30) and duration
@@ -54,7 +54,10 @@ export async function exportVideoFrameAccurate({
   const frame = document.createElement('canvas');
   frame.width = w; frame.height = h;
   const fctx = frame.getContext('2d');
-  fctx.imageSmoothingEnabled = false; // crisp pixels
+  // Crisp 1-bit wants nearest-neighbour (sharp dots); a smoothed (tone) export
+  // is continuous, so let it upscale smoothly.
+  fctx.imageSmoothingEnabled = !strict;
+  fctx.imageSmoothingQuality = 'high';
 
   const muxer = new Mp4Muxer(w, h, fps);
   let encErr = null;
@@ -70,15 +73,20 @@ export async function exportVideoFrameAccurate({
     codec: 'avc1.640033', width: w, height: h, framerate: fps,
     latencyMode: 'quality', contentHint: 'text', avc: { format: 'avc' },
   };
+  // Hard 1-bit is adversarial for H.264 (high-freq edges -> ringing/mosquito),
+  // so strict output needs a lower QP / fatter bitrate than smoothed (tone)
+  // output, which compresses cleanly. (GPT-5.5 Pro: ~10-12 strict, ~14-16 smooth.)
   let quantizer = null;
   try {
     if ((await VideoEncoder.isConfigSupported({ ...base, bitrateMode: 'quantizer' })).supported) {
       encoder.configure({ ...base, bitrateMode: 'quantizer' });
-      quantizer = 16; // ~visually lossless for this content; lower = higher quality
+      quantizer = strict ? 12 : 16; // lower = higher quality
     }
   } catch { /* fall through to VBR */ }
   if (quantizer === null) {
-    encoder.configure({ ...base, bitrateMode: 'variable', bitrate: Math.min(48e6, Math.max(8e6, Math.round(w * h * fps * 0.25))) });
+    const bpp = strict ? 0.5 : 0.25;
+    const cap = strict ? 80e6 : 48e6;
+    encoder.configure({ ...base, bitrateMode: 'variable', bitrate: Math.min(cap, Math.max(8e6, Math.round(w * h * fps * bpp))) });
   }
 
   const wasLooping = video.loop;

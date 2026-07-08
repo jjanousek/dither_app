@@ -718,6 +718,7 @@ async function doExportVideo() {
         renderFrame: () => { renderOnce(EXPORT_PIXELS); return out; },
         maxWidth: 1280,
         name,
+        strict: !(state.mode === 'dither' && state.smoothness > 0),
         onProgress: busyProgress,
         onInfo: (msg) => toast(msg, 4000),
         shouldAbort: () => cancelled,
