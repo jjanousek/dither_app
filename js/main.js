@@ -15,7 +15,7 @@ import { GenerativeSource } from './generate.js';
 
 const MAX_LIVE_PIXELS = 420_000;   // default live budget (cells / non-shape ASCII)
 const MAX_LIVE_CPU_PIXELS = 200_000; // tighter cap for the slow CPU live paths
-const MAX_LIVE_GPU_PIXELS = 1_600_000; // GPU dithers are cheap at any size — match export fineness
+const MAX_LIVE_GPU_PIXELS = 2_250_000; // GPU dithers are cheap at any size — enough for true native 1080p (2.07MP)
 const EXPORT_PIXELS = 1_600_000;   // GIF/text exports render finer than the live preview
 const MAX_EXPORT_SIDE = 16384;     // canvas hard limits (Chromium/WebKit)
 const MAX_EXPORT_AREA = 64_000_000;
@@ -444,7 +444,22 @@ async function renderPresetThumbs() {
 // ---------------------------------------------------------------------------
 // sources
 // ---------------------------------------------------------------------------
+// GPT-5.5 Pro: for moving video, a temporally-stable blue-noise dither looks
+// far smoother than Bayer (whose regular grid crawls/moirés on pans) or
+// per-frame error diffusion (which flickers). Apply a video-friendly profile
+// when entering a live source from a still (or cold start) — not on every
+// video→video swap, so a user's per-clip tweaks carry over to the next clip.
+function applyVideoProfile() {
+  if (state.mode !== 'dither') return;
+  if (getAlgorithm(state.algorithm).type === 'cpu' || state.algorithm === 'bayer2'
+      || state.algorithm === 'bayer4' || state.algorithm === 'bayer8') {
+    state.algorithm = 'bluenoise';
+  }
+  // Stage 8 extends this with smoothness/temporal defaults.
+}
+
 function setSource(next) {
+  const prevType = source?.type;
   if (exporting) {
     // don't yank the source out from under a running export
     if (next.stream) next.stream.getTracks().forEach((tr) => tr.stop());
@@ -460,6 +475,9 @@ function setSource(next) {
     if (source.url) URL.revokeObjectURL(source.url);
   }
   source = next;
+  const nowLive = next.type === 'video' || next.type === 'webcam';
+  const wasLive = prevType === 'video' || prevType === 'webcam';
+  if (nowLive && !wasLive) applyVideoProfile();
   fpsEma = 0;
   videoFrameReady = false;
   // new pixels, possibly same dither settings/size — force a fresh sync frame
