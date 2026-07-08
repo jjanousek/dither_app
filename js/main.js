@@ -141,6 +141,8 @@ const derived = () => ({
   animPhase: phaseOverride ?? animPhase,
   // still images can cache their downsampled base across animation frames
   staticSource: source?.type === 'image',
+  // temporal/denoise pre-pass runs only for genuinely live sources
+  liveSource: source?.type === 'video' || source?.type === 'webcam',
   // exports always render at full supersampling; only the live loop degrades
   ssCap: exporting ? 3 : governorSsCap,
 });
@@ -210,12 +212,11 @@ function present(result, srcW) {
     resized = true;
   }
   octx.drawImage(final, 0, 0);
-  // Crisp dither wants nearest-neighbour upscaling (sharp dots); a smoothed
-  // (box-resolved) result is continuous tone, so let it scale smoothly. Only
-  // truly box-resolved output counts: if the governor pulled ss back to 1 the
-  // frame is crisp 1-bit again, so keep nearest-neighbour scaling.
-  const boxResolved = state.smoothness > 0 && (exporting ? 3 : governorSsCap) > 1;
-  const pixelate = state.mode === 'dither' && !boxResolved;
+  // Crisp dither wants nearest-neighbour upscaling (sharp dots); a box-resolved
+  // (tone) result should scale smoothly. Use the engine's ACTUAL last-frame
+  // state so a CPU algorithm, WebGL loss, or governor ss->1 (all crisp) keep
+  // nearest-neighbour even while state.smoothness > 0.
+  const pixelate = state.mode === 'dither' && !engine.lastBoxResolved;
   out.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
   // not during exports: out is at export resolution and the overlay is hidden
@@ -263,9 +264,12 @@ function updateGovernor() {
   if (state.mode !== 'dither' || state.smoothness <= 0 || source?.type === 'image') {
     governorLevel = 0; governorSsCap = 3; renderMsEma = 0; return;
   }
-  if (renderMsEma > 40 && governorLevel < 2) { governorLevel++; renderMsEma = 0; }
-  else if (renderMsEma > 0 && renderMsEma < 20 && governorLevel > 0) { governorLevel--; renderMsEma = 0; }
-  governorSsCap = [3, 2, 1][governorLevel];
+  // Live ss is capped at 2, so the only degrade that reduces work is ss->1
+  // (halving the grid would shrink the source below the SS budget anyway). One
+  // responsive step, with EMA reset on each change for hysteresis.
+  if (renderMsEma > 40 && governorLevel === 0) { governorLevel = 1; renderMsEma = 0; }
+  else if (renderMsEma > 0 && renderMsEma < 20 && governorLevel === 1) { governorLevel = 0; renderMsEma = 0; }
+  governorSsCap = governorLevel === 0 ? 3 : 1;
 }
 
 function loop(t) {
@@ -541,7 +545,9 @@ function setSource(next) {
     source.el.playbackRate = parseFloat($('speed').value) || 1;
     $('btn-play').textContent = '❚❚';
     // re-render when the user seeks a paused video (exporters render themselves)
-    source._seekHandler = () => { if (!exporting) dirty = true; };
+    // a seek is a temporal discontinuity — drop history so the landed frame
+    // doesn't ghost-blend with wherever we jumped from
+    source._seekHandler = () => { if (!exporting) { dirty = true; engine.invalidateTemporal(); } };
     source.el.addEventListener('seeked', source._seekHandler);
     source.el.play().catch(() => {});
   }
@@ -729,6 +735,7 @@ async function doExportVideo() {
   const isGen = source.type === 'gen';
   if (!(source.el instanceof HTMLVideoElement) && !animatedStill && !isGen) return;
   exporting = true;
+  engine.invalidateTemporal(); // frame 0 of the export must not blend with the preview
 
   let secs = parseInt(exportSettings.recordSeconds, 10) || 5;
   if (source.type === 'webcam') {
@@ -763,7 +770,7 @@ async function doExportVideo() {
         renderFrame: () => { renderOnce(EXPORT_PIXELS); return out; },
         maxWidth: 1280,
         name,
-        strict: !(state.mode === 'dither' && state.smoothness > 0),
+        strict: !(state.mode === 'dither' && state.smoothness >= 0.15),
         onProgress: busyProgress,
         onInfo: (msg) => toast(msg, 4000),
         shouldAbort: () => cancelled,
@@ -798,6 +805,7 @@ async function doExportVideo() {
 async function doExportGIF() {
   if (!source || exporting) return;
   exporting = true;
+  engine.invalidateTemporal(); // frame 0 of the export must not blend with the preview
   // 'native' = exactly the rendered frame, no resampling
   const maxWidth = exportSettings.gifSize === 'native' ? Infinity : parseInt(exportSettings.gifSize, 10);
   let cancelled = false;

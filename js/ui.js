@@ -138,7 +138,7 @@ const pct = (v) => `${Math.round(v * 100)}%`;
 
 export function buildPanel({ state, mount, onChange, exportSettings, gen = null, onGenChange = null, isLive = false }) {
   mount.innerHTML = '';
-  const refresh = () => buildPanel({ state, mount, onChange, exportSettings, gen, onGenChange });
+  const refresh = () => buildPanel({ state, mount, onChange, exportSettings, gen, onGenChange, isLive });
   const change = () => onChange();
   const changeAndRefresh = () => { onChange(); refresh(); };
 

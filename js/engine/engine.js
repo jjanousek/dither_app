@@ -37,9 +37,11 @@ export function getAlgorithm(id) {
 }
 
 // Cap on the supersampled source when Smoothness > 0. Dither is evaluated at
-// ss*ss the output pixels, so we shrink the output grid to keep the source
-// within the GPU's flat-cost regime (~<=3.5MP) and the per-frame upload sane.
-const SS_SOURCE_BUDGET = 4_000_000;
+// ss*ss the output pixels, so the output grid shrinks to keep the source within
+// a sane per-frame cost (the governor drops ss under sustained load). Smooth
+// mode therefore trades some output resolution for tone — it is NOT full native
+// like the crisp path; that is the intended "fine print" behaviour.
+const SS_SOURCE_BUDGET = 5_000_000;
 
 export class Engine {
   constructor() {
@@ -165,6 +167,7 @@ export class Engine {
     if (!srcW || !srcH) return null;
     this._allowAsync = allowAsync;
     this._contentNew = contentNew;
+    this.lastBoxResolved = false; // dither GPU path sets this true when ss>1
 
     if (p.mode === 'ascii') return this.#renderAscii(source, srcW, srcH, p, maxPixels);
     if (p.mode !== 'dither') return this.#renderCells(source, srcW, srcH, p, maxPixels);
@@ -184,11 +187,14 @@ export class Engine {
 
     // Smoothness (GPU only): dither on a finer grid and box-average down. Shrink
     // the OUTPUT grid so the supersampled source (ss*w x ss*h) stays in budget.
-    // p.ssCap lets the sustained-load governor pull SS down (3->2->1) before
-    // touching base resolution.
+    // Live preview caps ss at 2: ss=3 would (a) hit the SS budget at both 3 and
+    // 2 so the governor's 3->2 step buys nothing, and (b) cause a resolution
+    // cliff. Exports (not _allowAsync) may use ss=3 for extra tone in the file.
+    // p.ssCap lets the sustained-load governor pull ss->1 before base resolution.
     let ss = 1;
     if (gpu && p.smoothness > 0) {
-      ss = Math.min(p.smoothness > 0.6 ? 3 : 2, p.ssCap ?? 3);
+      const liveMax = this._allowAsync ? 2 : 3;
+      ss = Math.min(p.smoothness > 0.6 ? 3 : 2, p.ssCap ?? 3, liveMax);
     }
     if (ss > 1) {
       const outCap = Math.min(maxPixels, Math.floor(SS_SOURCE_BUDGET / (ss * ss)));
@@ -198,6 +204,10 @@ export class Engine {
         h = Math.max(1, Math.floor(h * k));
       }
     }
+    // Tell present() whether the on-screen result is box-resolved tone (needs
+    // smooth upscaling) or crisp dots (nearest) — based on the ACTUAL ss used,
+    // so a CPU algorithm / governor ss->1 / WebGL loss all read correctly.
+    this.lastBoxResolved = gpu && ss > 1 && p.smoothness > 0;
 
     // Direct GPU video ingest: skip the per-frame Canvas2D resample when the
     // source is a video/webcam element and nothing needs Canvas2D compositing
@@ -343,9 +353,12 @@ export class Engine {
     return { ox: 0, oy: 0, seed: 0 };
   }
 
-  // Forget temporal history (call on source switch / seek so a new clip
-  // doesn't ghost-blend with the previous one's last frame).
+  // Free the history FBOs and forget history (source switch — also reclaims GPU).
   resetTemporal() { this.#releaseHistory(); }
+
+  // Forget history but keep the FBOs (cheap, no realloc). For discontinuities
+  // where the next frame must not blend with the last: seek/scrub, export start.
+  invalidateTemporal() { this.histValid = false; }
 
   // Free the history ping-pong FBOs (and forget history). Called when the
   // pre-pass is off and on source switch so idle temporal state doesn't retain
@@ -436,13 +449,14 @@ export class Engine {
       baseTex = this.srcTex;
     }
 
-    // Pre-pass (any non-static source, live preview OR export): temporal EMA
-    // and/or denoise -> stabilized source, with per-pixel motion in its alpha
-    // for motion-adaptive strength. Gating on liveness (not _allowAsync) keeps
-    // the exported clip WYSIWYG with the tuned preview; the export renders at a
-    // different resolution, so the history FBO resizes and self-resets frame 0.
+    // Pre-pass (video/webcam only, live preview OR export): temporal EMA and/or
+    // denoise -> stabilized source, with per-pixel motion in its alpha for
+    // motion-adaptive strength. Gated on p.liveSource (not _allowAsync) so the
+    // exported clip is WYSIWYG with the tuned preview, and NOT on !staticSource
+    // (which would run on generated scenes and clobber their alpha via
+    // motion-in-alpha). The app resets history on export start / seek.
     let srcTexForDither = baseTex;
-    const prePassOn = !p.staticSource && this.temporalProgram
+    const prePassOn = !!p.liveSource && this.temporalProgram
       && ((p.temporal || 0) > 0 || (p.videoDenoise || 0) > 0);
     if (prePassOn) srcTexForDither = this.#temporalPass(baseTex, srcW, srcH, p);
     else this.#releaseHistory(); // free history FBOs when the pre-pass is off
@@ -452,6 +466,9 @@ export class Engine {
       canvas.width = w;
       canvas.height = h;
     }
+    // the pre-passes rendered into FBOs — restore the default framebuffer and
+    // the output-sized viewport for the final dither draw (defensive)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, w, h);
     gl.useProgram(this.program);
 
@@ -462,7 +479,7 @@ export class Engine {
     gl.uniform1i(this.u.u_ss, ss);
     gl.uniform1f(this.u.u_smoothness, p.smoothness || 0);
     gl.uniform1i(this.u.u_hasMotion, prePassOn ? 1 : 0);
-    gl.uniform1f(this.u.u_motionDamp, prePassOn ? 0.35 : 0);
+    gl.uniform1f(this.u.u_motionDamp, prePassOn ? 0.45 : 0); // full motion -> x0.55 strength
 
     const mat = this.matrixTextures[algo.matrix] || this.matrixTextures.bayer4;
     gl.activeTexture(gl.TEXTURE1);

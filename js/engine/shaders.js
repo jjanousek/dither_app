@@ -169,7 +169,8 @@ vec4 ditherSample(vec2 uv, vec2 pix, float gridScale) {
   // preserve the source alpha (transparent PNGs etc.).
   float motion = (u_hasMotion == 1) ? src.a : 0.0;
   float outA = (u_hasMotion == 1) ? 1.0 : src.a;
-  float strength = u_strength * mix(1.0, 0.55, u_motionDamp * motion);
+  // u_motionDamp is the max strength reduction at full motion (0.45 => x0.55)
+  float strength = u_strength * (1.0 - u_motionDamp * motion);
 
   float n = float(u_paletteSize);
   float spread = strength / max(1.0, n - 1.0) * 1.5;
