@@ -484,11 +484,15 @@ async function renderPresetThumbs() {
 // video→video swap, so a user's per-clip tweaks carry over to the next clip.
 function applyVideoProfile() {
   if (state.mode !== 'dither') return;
-  if (getAlgorithm(state.algorithm).type === 'cpu' || state.algorithm === 'bayer2'
-      || state.algorithm === 'bayer4' || state.algorithm === 'bayer8') {
+  if (getAlgorithm(state.algorithm).type === 'cpu' || state.algorithm.startsWith('bayer')) {
     state.algorithm = 'bluenoise';
   }
-  // Stage 8 extends this with smoothness/temporal defaults.
+  // GPT-5.5 Pro "Video / Smooth" starting point: smoother + finer grain out of
+  // the box (the user's request). All reversible — drag Smoothness to 0 for a
+  // crisp full-resolution 1-bit look.
+  state.smoothness = 0.5;
+  state.temporal = 0.4;
+  state.videoDenoise = 0.2;
 }
 
 function setSource(next) {
