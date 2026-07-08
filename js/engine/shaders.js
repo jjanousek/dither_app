@@ -44,15 +44,31 @@ uniform sampler2D u_hist;   // previous frame's stabilized result
 uniform float u_historyWeight; // 0..~0.8 max blend on fully-static pixels
 uniform float u_motionLo;      // below this delta => treat as static
 uniform float u_motionHi;      // above this delta => treat as full motion
+uniform float u_denoise;       // 0..1 tent-blur amount (flat-area cleanup)
+uniform vec2 u_texel;          // 1 / source size, for neighbour taps
 uniform int u_reset;           // 1 = first frame / discontinuity: no history
+// Light 3x3 tent blur — cleans video-compression noise that would otherwise
+// chatter the dither threshold in flat regions. Cheap; kept before dithering.
+vec3 denoised(vec2 uv) {
+  vec3 c0 = texture(u_src, uv).rgb;
+  if (u_denoise <= 0.0) return c0;
+  vec2 t = u_texel;
+  vec3 s = c0 * 4.0;
+  s += (texture(u_src, uv + vec2(t.x, 0.0)).rgb + texture(u_src, uv - vec2(t.x, 0.0)).rgb
+      + texture(u_src, uv + vec2(0.0, t.y)).rgb + texture(u_src, uv - vec2(0.0, t.y)).rgb) * 2.0;
+  s += texture(u_src, uv + t).rgb + texture(u_src, uv - t).rgb
+      + texture(u_src, uv + vec2(t.x, -t.y)).rgb + texture(u_src, uv + vec2(-t.x, t.y)).rgb;
+  return mix(c0, s / 16.0, u_denoise);
+}
 void main() {
-  vec3 cur = texture(u_src, v_uv).rgb;
-  if (u_reset == 1) { outColor = vec4(cur, 1.0); return; }
+  vec3 cur = denoised(v_uv);
+  // motion is carried in alpha for the dither pass (motion-adaptive strength)
+  if (u_reset == 1) { outColor = vec4(cur, 0.0); return; }
   vec3 hist = texture(u_hist, v_uv).rgb;
   float d = max(max(abs(cur.r - hist.r), abs(cur.g - hist.g)), abs(cur.b - hist.b));
   float motion = smoothstep(u_motionLo, u_motionHi, d);
   float w = u_historyWeight * (1.0 - motion);
-  outColor = vec4(mix(cur, hist, w), 1.0);
+  outColor = vec4(mix(cur, hist, w), motion);
 }`;
 
 export const DITHER_FS = `#version 300 es
@@ -89,6 +105,9 @@ uniform float u_halftoneAngle; // radians
 
 uniform vec2 u_matOffset;      // animated pattern drift (pixels)
 uniform float u_seed;          // animated noise reseed
+
+uniform float u_motionDamp;    // reduce dither strength on motion (0 = off)
+uniform int u_hasMotion;       // 1 = alpha carries per-pixel motion (pre-pass ran)
 
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
@@ -143,21 +162,28 @@ vec4 ditherSample(vec2 uv, vec2 pix) {
   vec4 src = texture(u_src, uv);
   vec3 c = adjust(src.rgb);
 
+  // The pre-pass stores per-pixel motion in alpha; damp dither strength where
+  // the frame moves (less crawl) and force opaque output. With no pre-pass,
+  // preserve the source alpha (transparent PNGs etc.).
+  float motion = (u_hasMotion == 1) ? src.a : 0.0;
+  float outA = (u_hasMotion == 1) ? 1.0 : src.a;
+  float strength = u_strength * mix(1.0, 0.55, u_motionDamp * motion);
+
   float n = float(u_paletteSize);
-  float spread = u_strength / max(1.0, n - 1.0) * 1.5;
+  float spread = strength / max(1.0, n - 1.0) * 1.5;
 
   if (u_mode == 1) {
     // Ordered dithering from tiling threshold texture (u_matOffset drifts it)
     vec2 mpix = mod(pix + u_matOffset, vec2(u_thresholdSize));
     float t = texelFetch(u_threshold, ivec2(mpix), 0).r;
     c += (t - 0.5 + u_bias) * spread * 255.0 / 255.0 * vec3(1.0);
-    return vec4(nearestPalette(clamp(c, 0.0, 1.0)), src.a);
+    return vec4(nearestPalette(clamp(c, 0.0, 1.0)), outA);
   } else if (u_mode == 2) {
     // White noise (u_seed reseeds per animation tick). floor(): sub-pixel
     // offsets would decorrelate the hash into boiling instead of drift.
     float t = hash12(pix + floor(u_matOffset) + vec2(u_seed * 91.7, u_seed * 37.3));
     c += (t - 0.5 + u_bias) * spread;
-    return vec4(nearestPalette(clamp(c, 0.0, 1.0)), src.a);
+    return vec4(nearestPalette(clamp(c, 0.0, 1.0)), outA);
   } else if (u_mode == 3 || u_mode == 4) {
     // Procedural halftone: dots (3) or lines (4)
     vec3 darkest, brightest;
@@ -179,11 +205,11 @@ vec4 ditherSample(vec2 uv, vec2 pix) {
       float width = (1.0 - l);
       v = step(abs(s - 0.5) * 2.0, width);
     }
-    return vec4(mix(brightest, darkest, v), src.a);
+    return vec4(mix(brightest, darkest, v), outA);
   }
   // Quantize only (mode 0)
   c += u_bias;
-  return vec4(nearestPalette(clamp(c, 0.0, 1.0)), src.a);
+  return vec4(nearestPalette(clamp(c, 0.0, 1.0)), outA);
 }
 
 void main() {

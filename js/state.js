@@ -22,6 +22,7 @@ export const DEFAULTS = {
   threshold: 0.5,          // 0..1 bias
   smoothness: 0,           // 0..1 GPU dithers: supersample+box-resolve to tone (0 = crisp 1-bit)
   temporal: 0,             // 0..1 video: motion-gated temporal smoothing (0 = off)
+  videoDenoise: 0,         // 0..1 video: pre-dither tent-blur denoise (flat-area cleanup)
   halftoneScale: 6,        // px, halftone modes
   halftoneAngle: 45,       // deg
   paletteId: 'bw',

@@ -90,6 +90,7 @@ export class Engine {
       'u_brightness', 'u_contrast', 'u_gamma', 'u_saturation', 'u_strength',
       'u_bias', 'u_invert', 'u_palette', 'u_paletteSize',
       'u_halftoneScale', 'u_halftoneAngle', 'u_matOffset', 'u_seed',
+      'u_motionDamp', 'u_hasMotion',
     ]) {
       this.u[name] = gl.getUniformLocation(this.program, name);
     }
@@ -100,7 +101,7 @@ export class Engine {
     try {
       this.temporalProgram = compileProgram(gl, QUAD_VS, TEMPORAL_FS);
       this.tu = {};
-      for (const name of ['u_src', 'u_hist', 'u_historyWeight', 'u_motionLo', 'u_motionHi', 'u_reset']) {
+      for (const name of ['u_src', 'u_hist', 'u_historyWeight', 'u_motionLo', 'u_motionHi', 'u_denoise', 'u_texel', 'u_reset']) {
         this.tu[name] = gl.getUniformLocation(this.temporalProgram, name);
       }
     } catch (err) {
@@ -391,9 +392,13 @@ export class Engine {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.histA.tex);
     gl.uniform1i(this.tu.u_hist, 1);
-    gl.uniform1f(this.tu.u_historyWeight, Math.max(0, Math.min(1, p.temporal)) * 0.8);
+    // temporal weight 0 when only denoise is active (still store cur -> gives a
+    // motion signal vs the previous frame for motion-adaptive strength)
+    gl.uniform1f(this.tu.u_historyWeight, Math.max(0, Math.min(1, p.temporal || 0)) * 0.8);
     gl.uniform1f(this.tu.u_motionLo, 0.03);
     gl.uniform1f(this.tu.u_motionHi, 0.13);
+    gl.uniform1f(this.tu.u_denoise, Math.max(0, Math.min(1, p.videoDenoise || 0)));
+    gl.uniform2f(this.tu.u_texel, 1 / w, 1 / h);
     gl.uniform1i(this.tu.u_reset, this.histValid ? 0 : 1);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -419,12 +424,13 @@ export class Engine {
       baseTex = this.srcTex;
     }
 
-    // Temporal smoothing pre-pass (live video/webcam only) -> stabilized source.
+    // Pre-pass (live video/webcam): temporal EMA and/or denoise -> stabilized
+    // source, with per-pixel motion in its alpha for motion-adaptive strength.
     let srcTexForDither = baseTex;
-    const temporalOn = this._allowAsync && !p.staticSource
-      && (p.temporal || 0) > 0 && this.temporalProgram;
-    if (temporalOn) srcTexForDither = this.#temporalPass(baseTex, srcW, srcH, p);
-    else this.histValid = false; // drop stale history when temporal is off
+    const prePassOn = this._allowAsync && !p.staticSource && this.temporalProgram
+      && ((p.temporal || 0) > 0 || (p.videoDenoise || 0) > 0);
+    if (prePassOn) srcTexForDither = this.#temporalPass(baseTex, srcW, srcH, p);
+    else this.histValid = false; // drop stale history when the pre-pass is off
 
     // canvas is the OUTPUT (present) resolution; the source may be finer (ss>1)
     if (canvas.width !== w || canvas.height !== h) {
@@ -440,6 +446,8 @@ export class Engine {
     gl.uniform2f(this.u.u_outSize, w, h);
     gl.uniform1i(this.u.u_ss, ss);
     gl.uniform1f(this.u.u_smoothness, p.smoothness || 0);
+    gl.uniform1i(this.u.u_hasMotion, prePassOn ? 1 : 0);
+    gl.uniform1f(this.u.u_motionDamp, prePassOn ? 0.35 : 0);
 
     const mat = this.matrixTextures[algo.matrix] || this.matrixTextures.bayer4;
     gl.activeTexture(gl.TEXTURE1);

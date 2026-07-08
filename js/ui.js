@@ -242,6 +242,12 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
           min: 0, max: 1, step: 0.01, value: state.temporal, fmt: pct,
           oninput: (v) => { state.temporal = v; change(); },
         });
+        // Pre-dither denoise — cleans compression noise that chatters the
+        // threshold in flat areas. Video/webcam only.
+        slider(eff, 'Denoise', {
+          min: 0, max: 1, step: 0.01, value: state.videoDenoise, fmt: pct,
+          oninput: (v) => { state.videoDenoise = v; change(); },
+        });
       }
     }
   } else if (state.mode === 'ascii') {
