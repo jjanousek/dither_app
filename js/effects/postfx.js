@@ -60,10 +60,11 @@ let vigH = 0;
 let vigV = -1;
 
 // Glow filter string cache (rebuilt when glow amount OR resolution factor
-// changes — the blur radius is resolution-relative)
+// OR the fast-mode divisor changes — the blur radius is resolution-relative)
 let glowFilter = '';
 let glowFilterGlow = -1;
 let glowFilterK = -1;
+let glowFilterDiv = -1;
 
 // Deterministic frame counter so video grain animates
 let frameCounter = 0;
@@ -99,25 +100,33 @@ function drawChromatic(srcCanvas, w, h, shift) {
     outCtx.globalCompositeOperation = 'source-over';
 }
 
-function drawGlow(w, h, glow, k) {
-    if (soft.width !== w || soft.height !== h) {
-        soft.width = w;
-        soft.height = h;
+function drawGlow(w, h, glow, k, fast) {
+    // Glow output is low-frequency by construction, so in fast (live) mode
+    // the blur runs on a quarter-resolution copy with the radius scaled to
+    // match — the same effective kernel at ~1/16 the raster work. Exports
+    // keep the full-resolution version.
+    const div = fast ? 4 : 1;
+    const gw = Math.max(1, Math.round(w / div));
+    const gh = Math.max(1, Math.round(h / div));
+    if (soft.width !== gw || soft.height !== gh) {
+        soft.width = gw;
+        soft.height = gh;
     }
-    if (glowFilterGlow !== glow || glowFilterK !== k) {
-        glowFilter = 'brightness(1.2) blur(' + ((4 + glow * 20) * k) + 'px)';
+    if (glowFilterGlow !== glow || glowFilterK !== k || glowFilterDiv !== div) {
+        glowFilter = 'brightness(1.2) blur(' + ((4 + glow * 20) * k / div) + 'px)';
         glowFilterGlow = glow;
         glowFilterK = k;
+        glowFilterDiv = div;
     }
-    // Bright/blurred copy of the current composite...
+    // Bright/blurred (downscaled) copy of the current composite...
     softCtx.globalCompositeOperation = 'copy';
     softCtx.filter = glowFilter;
-    softCtx.drawImage(out, 0, 0);
+    softCtx.drawImage(out, 0, 0, w, h, 0, 0, gw, gh);
     softCtx.filter = 'none';
     // ...screen-blended back over the base.
     outCtx.globalCompositeOperation = 'screen';
     outCtx.globalAlpha = Math.min(1, glow * 0.85);
-    outCtx.drawImage(soft, 0, 0);
+    outCtx.drawImage(soft, 0, 0, gw, gh, 0, 0, w, h);
     outCtx.globalAlpha = 1;
     outCtx.globalCompositeOperation = 'source-over';
 }
@@ -235,6 +244,8 @@ function drawVignette(w, h, vignette) {
  *     k = max(0.25, refH/1080), so preview and export can share the same k
  *     and post-FX intensity matches between them (N36). When null/undefined,
  *     the output canvas height is used (legacy behavior).
+ *   fast: live-preview mode — glow blurs a quarter-resolution copy (same
+ *     effective kernel, ~1/16 the raster work). Leave unset for exports.
  * @returns {HTMLCanvasElement} srcCanvas untouched when all values are
  *   0/falsy, otherwise a module-level reusable output canvas
  */
@@ -296,7 +307,7 @@ export function applyPostFX(srcCanvas, fx, opts = {}) {
     }
 
     // 2) Glow, 3) grain, 4) scanlines, 5) vignette.
-    if (glow > 0) drawGlow(w, h, glow, k);
+    if (glow > 0) drawGlow(w, h, glow, k, !!(opts && opts.fast));
     if (grain > 0) drawGrain(w, h, grain, k, grainPhase);
     if (scanlines > 0) drawScanlines(w, h, scanlines);
     if (vignette > 0) drawVignette(w, h, vignette);

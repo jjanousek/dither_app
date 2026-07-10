@@ -16,6 +16,7 @@ import { GenerativeSource } from './generate.js';
 const MAX_LIVE_PIXELS = 420_000;   // default live budget (cells / non-shape ASCII)
 const MAX_LIVE_CPU_PIXELS = 200_000; // tighter cap for the slow CPU live paths
 const MAX_LIVE_GPU_PIXELS = 2_250_000; // GPU dithers are cheap at any size — enough for true native 1080p (2.07MP)
+const LIVE_FX_PIXELS = 2_250_000;  // cap on the live post-FX compositing area (Canvas2D raster)
 const EXPORT_PIXELS = 1_600_000;   // GIF/text exports render finer than the live preview
 const MAX_EXPORT_SIDE = 16384;     // canvas hard limits (Chromium/WebKit)
 const MAX_EXPORT_AREA = 64_000_000;
@@ -42,13 +43,31 @@ let scrubbing = false;
 let fpsEma = 0;
 let lastFrameT = 0;
 let fpsText = '';
-// Sustained-load governor: if a smoothed video render runs slow, pull the
-// supersample factor down (3->2->1) BEFORE touching base resolution — dropping
+// Sustained-load governor: if a smoothed video render can't keep up, pull the
+// supersample factor down BEFORE touching base resolution — dropping
 // resolution is the opposite of what someone complaining about grain wants.
-// present() draws the GL canvas into the 2D output, which syncs the GPU, so the
-// renderOnce wall-time is a usable (if rough) proxy for real frame cost.
+// Two signals, because neither alone sees everything:
+// - renderMsEma (main-thread wall time of renderOnce) catches CPU-bound loads
+//   (software decode, CSS filters, CPU dither paths). It does NOT see GPU
+//   cost: on Chromium, drawImage(glCanvas) only queues a deferred GPU-side
+//   copy, so a GPU-saturated frame still measures a few ms here.
+// - dropped-frame ratio from rVFC metadata catches GPU-bound loads: when the
+//   GPU falls behind, rAF (and with it rVFC) is throttled by compositor
+//   backpressure, callbacks coalesce, and presentedFrames jumps by >1 per
+//   callback — i.e. video frames were composited that we never re-dithered.
+//   Measuring the ratio (not a frame rate) keeps a healthy 24fps clip looking
+//   healthy on a 60Hz display.
+// Dwell timers on both edges so a single hitchy frame never flips quality.
 let renderMsEma = 0;
-let governorLevel = 0;   // 0 full, 1 cap ss<=2, 2 cap ss<=1
+let pumpFramesEma = 0;   // EMA of presentedFrames per rVFC callback (1 = we see every frame)
+let lastPumpT = 0;
+let govSlowMs = 0;       // time spent continuously in the "falling behind" state
+let govFastMs = 0;       // time spent continuously in the "keeping up" state
+let govLastT = 0;        // governor's own wall clock — dwell must survive >250ms frames
+let govMuteMs = 0;       // time at level 1 with bad cadence but cheap renders
+let govCadenceMuted = false; // dropping ss didn't clear the drops -> display/decode-limited
+let govRecoverMs = 1500; // recovery dwell; doubles per degrade to damp slow flip-flop
+let governorLevel = 0;   // 0 full, 1 cap ss<=1
 let governorSsCap = 3;
 // A playing video/webcam decodes at ~24–30 fps, but the rAF loop ticks ~60;
 // re-dithering the same frame is wasted work. requestVideoFrameCallback sets
@@ -181,29 +200,60 @@ function renderOnce(budgetOverride = null, contentNew = true) {
   // Only the live preview (no budget override, not exporting) may run the CPU
   // dither in the worker; exports and thumbnails stay synchronous.
   const allowAsync = budgetOverride === null && !exporting;
+  // Live-loop render vs one-shot (export/copy) render. Realtime canvas
+  // recordings capture the live loop, so they must keep the exact live
+  // presentation; frame-exact exporters pass a budget override and get the
+  // uncapped, deterministic rendition.
+  p.liveRender = budgetOverride === null;
   const result = engine.render(source.el, w, h, p, budgetOverride ?? budget, allowAsync, contentNew);
-  if (result) present(result, w, h);
+  if (result) present(result, w, h, budgetOverride !== null);
   return out;
 }
 
-function present(result, srcW) {
+// offline = a one-shot frame-exact render (export/copy). NOT the same as the
+// `exporting` flag: realtime canvas recordings (MediaRecorder capturing `out`)
+// run through the live loop with exporting=true, and the presented canvas must
+// keep its exact live size/appearance — a mid-stream resize glitches the
+// recording.
+function present(result, srcW, offline = false) {
   const fxOn = Object.values(state.fx).some((v) => v > 0);
   let final = result;
   if (fxOn) {
+    // applied/ideal upscale ratio — compensates refH when the budget forces a
+    // smaller fx canvas, so grain/chromatic/glow geometry stays proportional
+    let fxScaleRatio = 1;
     if (state.mode === 'dither') {
       // upscale first so scanlines/grain/vignette are crisp over the pixels
-      const scale = Math.min(2, Math.max(1, srcW / result.width));
-      const W = Math.round(result.width * scale);
-      const H = Math.round(result.height * scale);
-      if (upCanvas.width !== W || upCanvas.height !== H) {
-        upCanvas.width = W;
-        upCanvas.height = H;
+      const idealScale = Math.min(2, Math.max(1, srcW / result.width));
+      let scale = idealScale;
+      // Live budget: the whole post-FX chain composites at this size every
+      // frame — a 2x upscale of a 2MP result would mean ~8MP of 2D raster
+      // work per frame. Over budget, run fx at the result's own resolution.
+      // Frame-exact exports keep the full source-resolution upscale.
+      if (!offline && result.width * result.height * scale * scale > LIVE_FX_PIXELS) scale = 1;
+      fxScaleRatio = scale / idealScale;
+      // At scale 1 the blit is a plain copy — skip it, except for chromatic
+      // aberration, where copying once turns 3 reads of a GL-backed canvas
+      // into 1 GL read + 3 cheap 2D reads.
+      if (scale > 1 || +state.fx.chromatic > 0) {
+        const W = Math.round(result.width * scale);
+        const H = Math.round(result.height * scale);
+        if (upCanvas.width !== W || upCanvas.height !== H) {
+          upCanvas.width = W;
+          upCanvas.height = H;
+        }
+        upCtx.imageSmoothingEnabled = false;
+        upCtx.drawImage(result, 0, 0, W, H);
+        final = upCanvas;
       }
-      upCtx.imageSmoothingEnabled = false;
-      upCtx.drawImage(result, 0, 0, W, H);
-      final = upCanvas;
     }
-    final = applyPostFX(final, state.fx, { grainPhase: currentGrainPhase(), refH: srcDims()[1] || final.height });
+    // refH scaled by the forgone upscale keeps the capped live rendition's
+    // fx geometry proportionally identical to the uncapped export (N36)
+    final = applyPostFX(final, state.fx, {
+      grainPhase: currentGrainPhase(),
+      refH: (srcDims()[1] || final.height) * fxScaleRatio,
+      fast: !offline,
+    });
   }
   let resized = false;
   if (out.width !== final.width || out.height !== final.height) {
@@ -258,17 +308,53 @@ function drawSplitOverlay() {
   cctx.drawImage(source.el, 0, 0, w * frac, h, 0, 0, w * frac, h);
 }
 
-// Adjust the supersample cap from smoothed render cost. Conservative thresholds
-// + EMA reset on each change give hysteresis so it doesn't thrash.
+// Adjust the supersample cap from the two load signals. Live ss is capped at
+// 2, so the only degrade that reduces work is ss->1. A level change requires
+// the bad/good state to persist for a dwell period (recovery needs a longer
+// one), so one hitchy frame — or one lucky one — never flips the quality.
 function updateGovernor() {
   if (state.mode !== 'dither' || state.smoothness <= 0 || source?.type === 'image') {
-    governorLevel = 0; governorSsCap = 3; renderMsEma = 0; return;
+    governorLevel = 0; governorSsCap = 3; renderMsEma = 0;
+    govSlowMs = 0; govFastMs = 0; govMuteMs = 0; govLastT = 0;
+    govCadenceMuted = false; govRecoverMs = 1500;
+    return;
   }
-  // Live ss is capped at 2, so the only degrade that reduces work is ss->1
-  // (halving the grid would shrink the source below the SS budget anyway). One
-  // responsive step, with EMA reset on each change for hysteresis.
-  if (renderMsEma > 40 && governorLevel === 0) { governorLevel = 1; renderMsEma = 0; }
-  else if (renderMsEma > 0 && renderMsEma < 20 && governorLevel === 1) { governorLevel = 0; renderMsEma = 0; }
+  // Self-clocked dwell: the loop's dt is zeroed after >250ms gaps (hidden-tab
+  // guard), which would starve the dwell exactly under the heaviest load, and
+  // rAF ticks that skip rendering don't call this at all. Clamp so a long
+  // pause can't dump a lump into the accumulators.
+  const now = performance.now();
+  const gdt = govLastT ? Math.min(1000, now - govLastT) : 0;
+  govLastT = now;
+  // Cadence (~1 = every decoded frame rendered, >1.35 = skipping over a
+  // quarter) is only meaningful while frames are actually being presented —
+  // the pump freezes on pause/ended, leaving a stale value behind.
+  const cadenceFresh = now - lastPumpT < 500;
+  const rawBad = cadenceFresh && pumpFramesEma > 1.35;
+  if (cadenceFresh && pumpFramesEma > 0 && pumpFramesEma < 1.15) govCadenceMuted = false;
+  // If ss=1 didn't clear the drops while renders stay cheap, the misses are
+  // display/decode-limited (e.g. a 60fps clip under a 30Hz-throttled rAF) —
+  // no ss level can help, so stop acting on cadence until it recovers.
+  if (governorLevel === 1 && rawBad && renderMsEma > 0 && renderMsEma < 20) {
+    govMuteMs += gdt;
+    if (govMuteMs > 2000) govCadenceMuted = true;
+  } else {
+    govMuteMs = 0;
+  }
+  const cadenceBad = rawBad && !govCadenceMuted;
+  const cadenceGood = govCadenceMuted || !cadenceFresh || pumpFramesEma < 1.15;
+  if (governorLevel === 0) {
+    if (renderMsEma > 40 || cadenceBad) { govSlowMs += gdt; govFastMs = 0; }
+    else govSlowMs = Math.max(0, govSlowMs - gdt);
+    if (govSlowMs > 700) {
+      governorLevel = 1; govSlowMs = 0; renderMsEma = 0;
+      govRecoverMs = Math.min(30000, govRecoverMs * 2); // damp slow flip-flop
+    }
+  } else {
+    if (renderMsEma < 20 && cadenceGood) { govFastMs += gdt; govSlowMs = 0; }
+    else govFastMs = Math.max(0, govFastMs - gdt);
+    if (govFastMs > govRecoverMs) { governorLevel = 0; govFastMs = 0; renderMsEma = 0; }
+  }
   governorSsCap = governorLevel === 0 ? 3 : 1;
 }
 
@@ -315,8 +401,11 @@ function loop(t) {
   } else {
     const t0 = performance.now();
     renderOnce(null, contentNew);
-    // only track cost while actually producing new frames (not idle wake-ups)
-    if (contentNew) {
+    // Only track cost while producing new LIVE frames — not idle wake-ups,
+    // and not export renders: recordCanvas exports run through this loop with
+    // export cost profiles (sync CPU dither, ss=3) the governor must not
+    // train on. derived() masks its output during exports anyway.
+    if (contentNew && !exporting) {
       const rt = performance.now() - t0;
       renderMsEma = renderMsEma ? renderMsEma * 0.85 + rt * 0.15 : rt;
       updateGovernor();
@@ -532,13 +621,27 @@ function setSource(next) {
   // a fresh source starts un-throttled — a stale ss cap from a slow prior clip
   // would otherwise under-supersample this source's first (or only) frame
   governorLevel = 0; governorSsCap = 3; renderMsEma = 0;
+  pumpFramesEma = 0; lastPumpT = 0; govSlowMs = 0; govFastMs = 0;
+  govLastT = 0; govMuteMs = 0; govCadenceMuted = false; govRecoverMs = 1500;
   // Drive per-frame rendering off real decoded frames for video/webcam.
   // Capture the source locally so a stale callback (fired after a source
   // switch) re-registers on its OWN, now-paused element and self-terminates
   // rather than re-arming on the new source.
   if (HAS_RVFC && source.el instanceof HTMLVideoElement) {
     const s = source;
-    const pump = () => { videoFrameReady = true; s._rvfc = s.el.requestVideoFrameCallback(pump); };
+    const pump = (now, meta) => {
+      videoFrameReady = true;
+      // Governor signal: presentedFrames jumping by >1 between callbacks means
+      // video frames were composited that we never re-dithered (rAF throttled
+      // or renders too slow). Ignore pause/seek/hidden gaps.
+      if (lastPumpT && meta && now - lastPumpT < 500) {
+        const frames = Math.max(1, meta.presentedFrames - (s._lastPresented || 0));
+        pumpFramesEma = pumpFramesEma ? pumpFramesEma * 0.85 + frames * 0.15 : frames;
+      }
+      if (meta) s._lastPresented = meta.presentedFrames;
+      lastPumpT = now;
+      s._rvfc = s.el.requestVideoFrameCallback(pump);
+    };
     s._rvfc = s.el.requestVideoFrameCallback(pump);
   }
   if (source.type === 'video') {

@@ -87,7 +87,7 @@ export class Engine {
     gl.useProgram(this.program);
     this.u = {};
     for (const name of [
-      'u_src', 'u_threshold', 'u_srcSize', 'u_outSize', 'u_ss', 'u_smoothness',
+      'u_src', 'u_threshold', 'u_outSize', 'u_ss', 'u_smoothness',
       'u_thresholdSize', 'u_mode',
       'u_brightness', 'u_contrast', 'u_gamma', 'u_saturation', 'u_strength',
       'u_bias', 'u_invert', 'u_palette', 'u_paletteSize',
@@ -96,7 +96,9 @@ export class Engine {
     ]) {
       this.u[name] = gl.getUniformLocation(this.program, name);
     }
-    this.srcTex = createTexture(gl);
+    // LINEAR: the temporal pass may minify this into a native-clamped history
+    // FBO on the canvas-upload path; 1:1 texel-center reads are unchanged.
+    this.srcTex = createTexture(gl, { filter: gl.LINEAR });
 
     // Temporal-smoothing pre-pass program + history ping-pong (FBOs made lazily
     // at source resolution). If it fails to compile, temporal just no-ops.
@@ -155,6 +157,16 @@ export class Engine {
     return { float: this._palFloat, uniform: this._palUniform, size: Math.min(colors.length, MAX_PALETTE) };
   }
 
+  // Settings signature for the async CPU preview — a change forces one
+  // synchronous, correct frame. Must stay identical to what the dispatch in
+  // #renderCPU uses, so the busy-skip in render() never misjudges staleness.
+  #cpuSig(algo, p, pal, w, h) {
+    const pf = pal.float;
+    let ph = pf.length;
+    for (let i = 0; i < pf.length; i++) ph = (Math.imul(ph, 31) + pf[i]) | 0;
+    return `${algo.id}|${p.ditherStrength}|${p.serpentine}|${p.threshold - 0.5}|${w}x${h}|${ph}`;
+  }
+
   /**
    * Process one frame.
    * @param source CanvasImageSource (img/video/canvas)
@@ -184,6 +196,24 @@ export class Engine {
     const pal = this.#palettes(p.colors);
     const effSat = p.grayscale ? 0 : p.saturation;
     const gpu = algo.type === 'gpu' && this.gl && !this.glLost && !this.gl.isContextLost();
+
+    // Live CPU error-diffusion fast paths. (a) A worker-completion wake-up in
+    // steady state (nothing pending, settings unchanged — any change would
+    // have set dirty and arrived with contentNew=true) only needs to PRESENT
+    // the committed result: skip the whole ingest/adjust pipeline that would
+    // otherwise run just to be handed back the same canvas. (b) A new frame
+    // while the worker is still busy on unchanged settings would be dropped
+    // AFTER full prep anyway (cpu-preview keeps the latest committed result
+    // and re-dispatches on reply) — mark it pending and skip the prep too.
+    if (algo.type === 'cpu' && this._allowAsync && this.cpu
+        && this.cpu.state === 'ready' && this.cpu.committedEpoch === this.cpu.epoch) {
+      if (!contentNew && !this.cpu.pending) return this.cpu.committed;
+      if (this.cpu.busy && this.cpu.cw === w && this.cpu.ch === h
+          && this.cpu.sig === this.#cpuSig(algo, p, pal, w, h)) {
+        if (contentNew) this.cpu.pending = true;
+        return this.cpu.committed;
+      }
+    }
 
     // Smoothness (GPU only): dither on a finer grid and box-average down. Shrink
     // the OUTPUT grid so the supersampled source (ss*w x ss*h) stays in budget.
@@ -215,16 +245,29 @@ export class Engine {
     const isVideoEl = typeof HTMLVideoElement !== 'undefined' && source instanceof HTMLVideoElement;
     const hasFilter = p.hue || p.sepia || p.blur;
     const canvasAnim = p.anim && (p.anim.style === 'sweep' || p.anim.style === 'wave');
+    // Never process video on a grid finer than the video itself: the
+    // supersampled grid (w*ss) can exceed native size (pixel size 1 +
+    // smoothness), where finer buffers hold only interpolated pixels — the
+    // dither pass gets identical values by sampling a native-res buffer with
+    // LINEAR filtering, and the ingest/temporal passes shade far fewer pixels.
+    // Computed for BOTH GPU paths so the temporal history FBOs keep one size
+    // (and keep their history) when a CSS filter or sweep/wave flips the path.
+    let texW = w * ss, texH = h * ss;
+    if (isVideoEl) {
+      const k = Math.min(1, srcW / texW, srcH / texH);
+      texW = Math.max(1, Math.round(texW * k));
+      texH = Math.max(1, Math.round(texH * k));
+    }
     if (gpu && isVideoEl && !hasFilter && !canvasAnim && this.blitProgram) {
-      const workTex = this.#ingestVideo(source, w * ss, h * ss);
-      return this.#renderGPU(null, w, h, ss, p, algo, pal, effSat, workTex);
+      const workTex = this.#ingestVideo(source, texW, texH);
+      return this.#renderGPU(null, w, h, ss, p, algo, pal, effSat, workTex, texW, texH);
     }
 
     // The work canvas holds the source at the (super)sampled resolution; the
     // CPU path never supersamples (ss stays 1), so it still gets w x h.
     const work = this.#drawWork(source, w * ss, h * ss, p);
 
-    if (gpu) return this.#renderGPU(work, w, h, ss, p, algo, pal, effSat);
+    if (gpu) return this.#renderGPU(work, w, h, ss, p, algo, pal, effSat, null, texW, texH);
     return this.#renderCPU(work, w, h, p, algo, pal, effSat);
   }
 
@@ -242,6 +285,26 @@ export class Engine {
       work.height = h;
     }
     const ctx = this.workCtx;
+    // Video/webcam into a willReadFrequently (software) canvas is the CPU-path
+    // bottleneck: drawImage must download + convert the full native decoded
+    // frame (~8MB at 1080p) and run a software resample proportional to the
+    // NATIVE pixel count, on the main thread, every frame. Downsample on the
+    // GPU instead and read back only the small w×h result. CSS filters still
+    // need the Canvas2D path (ctx.filter), sweep/wave run after via #animCanvas.
+    // Live loop only (p.liveRender): exports keep the deterministic Canvas2D
+    // 'high' resample. Downsample only: a magnified grid (GPU sweep/wave with
+    // supersampling) would read back MORE pixels than the video has.
+    const isVideoEl = typeof HTMLVideoElement !== 'undefined' && source instanceof HTMLVideoElement;
+    if (p.liveRender && isVideoEl && !(p.hue || p.sepia || p.blur)
+        && w <= (source.videoWidth || 0) && h <= (source.videoHeight || 0)
+        && this.gl && !this.glLost && !this.gl.isContextLost() && this.blitProgram) {
+      const px = this.#readbackVideo(source, w, h);
+      if (px) {
+        ctx.putImageData(px, 0, 0);
+        this.#animCanvas(p, w, h);
+        return work;
+      }
+    }
     if (p.staticSource) {
       const key = `${w}x${h}|${this.#filterString(p)}`;
       if (this.baseSrc !== source || this.baseKey !== key) {
@@ -377,14 +440,26 @@ export class Engine {
   // work texture at (w x h) for the temporal/dither passes to consume.
   #ingestVideo(videoEl, w, h) {
     const gl = this.gl;
+    const vw = videoEl.videoWidth || w;
+    const vh = videoEl.videoHeight || h;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoEl);
-    gl.generateMipmap(gl.TEXTURE_2D);
+    // Skip the mip chain only where a single LINEAR tap genuinely suffices:
+    // its 2x2-texel footprint covers strides up to ~1.3x, and at an
+    // exactly-aligned 2x the destination-texel-center tap IS the 2x2 box
+    // average. Fractional strides in between (budget-scaled grids, e.g. a 4K
+    // clip capped to ~1.9x) under-filter without mips and shimmer on motion.
+    const exact2 = vw === w * 2 && vh === h * 2;
+    const minify = !(exact2 || (vw <= w * 1.3 && vh <= h * 1.3));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, minify ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    if (minify) gl.generateMipmap(gl.TEXTURE_2D);
     if (!this.workFBO || this.workFBO.w !== w || this.workFBO.h !== h) {
       if (this.workFBO) { gl.deleteTexture(this.workFBO.tex); gl.deleteFramebuffer(this.workFBO.fbo); }
-      this.workFBO = createFBO(gl, w, h);
+      // LINEAR: the dither pass may sample this buffer on a grid finer than
+      // its own resolution (native clamp); on-texel-center taps are unchanged.
+      this.workFBO = createFBO(gl, w, h, { filter: gl.LINEAR });
     }
     gl.useProgram(this.blitProgram);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.workFBO.fbo);
@@ -397,6 +472,31 @@ export class Engine {
     return this.workFBO.tex;
   }
 
+  // GPU-assisted ingest for the CPU paths (error diffusion / ASCII / cells):
+  // blit the native video frame into the small work FBO and read back only the
+  // w×h pixels. The readPixels sync is cheap here — the GL queue holds nothing
+  // but the trivial blit — and it replaces a native-res software readback +
+  // high-quality software resample on the main thread. Returns a reusable
+  // ImageData (rows come back top-first: FBO row 0 = uv 0 = video top row,
+  // matching the Canvas2D orientation), or null so the caller falls back.
+  #readbackVideo(videoEl, w, h) {
+    const gl = this.gl;
+    try {
+      this.#ingestVideo(videoEl, w, h);
+      if (!this._readImg || this._readImg.width !== w || this._readImg.height !== h) {
+        this._readImg = new ImageData(w, h);
+        this._readView = new Uint8Array(this._readImg.data.buffer);
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.workFBO.fbo);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, this._readView);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return this._readImg;
+    } catch {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return null;
+    }
+  }
+
   // Motion-gated EMA on the raw downsampled frame. Renders the stabilized frame
   // into a ping-pong FBO and returns its texture for the dither pass to consume.
   #temporalPass(baseTex, w, h, p) {
@@ -404,8 +504,10 @@ export class Engine {
     if (!this.histA || this.histA.w !== w || this.histA.h !== h) {
       if (this.histA) { gl.deleteTexture(this.histA.tex); gl.deleteFramebuffer(this.histA.fbo); }
       if (this.histB) { gl.deleteTexture(this.histB.tex); gl.deleteFramebuffer(this.histB.fbo); }
-      this.histA = createFBO(gl, w, h);
-      this.histB = createFBO(gl, w, h);
+      // LINEAR for the same reason as the work FBO: the dither pass may sample
+      // the stabilized frame on a finer grid than the buffer's own resolution.
+      this.histA = createFBO(gl, w, h, { filter: gl.LINEAR });
+      this.histB = createFBO(gl, w, h, { filter: gl.LINEAR });
       this.histValid = false;
     }
     gl.useProgram(this.temporalProgram);
@@ -435,10 +537,13 @@ export class Engine {
     return written.tex;
   }
 
-  #renderGPU(work, w, h, ss, p, algo, pal, effSat, preTex = null) {
+  // texW/texH = actual resolution of the source texture. Equal to the fine
+  // grid (w*ss) for canvas uploads; the direct video ingest clamps them to the
+  // video's native size (no point shading interpolated pixels — the dither
+  // pass samples by UV and LINEAR filtering reproduces the upscale exactly).
+  #renderGPU(work, w, h, ss, p, algo, pal, effSat, preTex = null, texW = w * ss, texH = h * ss) {
     const gl = this.gl;
     const canvas = this.glCanvas;
-    const srcW = w * ss, srcH = h * ss;
 
     // preTex = source already on the GPU (direct video ingest); otherwise
     // upload the work canvas.
@@ -458,7 +563,7 @@ export class Engine {
     let srcTexForDither = baseTex;
     const prePassOn = !!p.liveSource && this.temporalProgram
       && ((p.temporal || 0) > 0 || (p.videoDenoise || 0) > 0);
-    if (prePassOn) srcTexForDither = this.#temporalPass(baseTex, srcW, srcH, p);
+    if (prePassOn) srcTexForDither = this.#temporalPass(baseTex, texW, texH, p);
     else this.#releaseHistory(); // free history FBOs when the pre-pass is off
 
     // canvas is the OUTPUT (present) resolution; the source may be finer (ss>1)
@@ -487,7 +592,6 @@ export class Engine {
     gl.uniform1i(this.u.u_threshold, 1);
     gl.uniform1f(this.u.u_thresholdSize, mat.size);
 
-    gl.uniform2f(this.u.u_srcSize, srcW, srcH);
     gl.uniform1i(this.u.u_mode, algo.mode);
     gl.uniform1f(this.u.u_brightness, this.#animBrightness(p));
     gl.uniform1f(this.u.u_contrast, p.contrast);
@@ -537,12 +641,8 @@ export class Engine {
       // Byte-identical (same errorDiffusion); exports/thumbnails never opt in.
       if (this._allowAsync) {
         if (!this.cpu) this.cpu = new CpuPreview(() => { if (this.onCpuResult) this.onCpuResult(); });
-        // settings signature — a change forces one synchronous, correct frame
-        const pf = pal.float;
-        let ph = pf.length;
-        for (let i = 0; i < pf.length; i++) ph = (Math.imul(ph, 31) + pf[i]) | 0;
-        const sig = `${algo.id}|${opts.strength}|${opts.serpentine}|${opts.bias}|${w}x${h}|${ph}`;
-        const committed = this.cpu.render(img, w, h, pf, algo.id, opts, sig, ctx, this._contentNew);
+        const sig = this.#cpuSig(algo, p, pal, w, h);
+        const committed = this.cpu.render(img, w, h, pal.float, algo.id, opts, sig, ctx, this._contentNew);
         if (committed) return committed; // async handled; present the committed result
       }
       errorDiffusion(img, pal.float, algo.id, opts);

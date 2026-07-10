@@ -96,20 +96,34 @@ export function applyAdjustments(imageData, p) {
     }
   } else {
     // float-space curve so saturated pixels match the GPU path exactly
+    // (Math.pow(v, 1) === v, so skipping it at gamma 1 is byte-identical)
+    const usePow = ig !== 1;
     const curve = (v) => {
       v = Math.min(1, Math.max(0, v / 255));
       v = (v - 0.5) * cf + 0.5 + brightness;
       v = Math.min(1, Math.max(0, v));
-      v = Math.pow(v, ig);
+      if (usePow) v = Math.pow(v, ig);
       if (invert) v = 1 - v;
       return v * 255;
     };
-    for (let i = 0; i < d.length; i += 4) {
-      const r = d[i], g = d[i + 1], b = d[i + 2];
-      const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-      d[i] = curve(l + (r - l) * saturation);
-      d[i + 1] = curve(l + (g - l) * saturation);
-      d[i + 2] = curve(l + (b - l) * saturation);
+    if (saturation === 0) {
+      // grayscale: all three channels collapse to curve(luma) — one curve()
+      // call per pixel instead of three identical ones (this branch runs on
+      // the main thread every live frame whenever Grayscale is on)
+      for (let i = 0; i < d.length; i += 4) {
+        const v = curve(0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]);
+        d[i] = v;
+        d[i + 1] = v;
+        d[i + 2] = v;
+      }
+    } else {
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        const l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        d[i] = curve(l + (r - l) * saturation);
+        d[i + 1] = curve(l + (g - l) * saturation);
+        d[i + 2] = curve(l + (b - l) * saturation);
+      }
     }
   }
 }

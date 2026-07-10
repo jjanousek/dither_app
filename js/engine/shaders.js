@@ -77,9 +77,11 @@ precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
 
-uniform sampler2D u_src;        // downsampled source frame (NEAREST), at u_ss * u_outSize
+uniform sampler2D u_src;        // downsampled source frame (LINEAR), nominally
+                                // u_ss * u_outSize but possibly clamped to the
+                                // video's native size — sampled by UV, so the
+                                // grid math below never needs its resolution
 uniform sampler2D u_threshold;  // tiling threshold map (R8, REPEAT)
-uniform vec2 u_srcSize;         // source texture resolution in pixels
 uniform vec2 u_outSize;         // output (present) resolution in pixels
 uniform int u_ss;               // supersample factor (1 = classic path)
 uniform float u_smoothness;     // 0 = crisp 1-bit, 1 = fully box-averaged tone
@@ -223,7 +225,10 @@ void main() {
   ivec2 op = ivec2(floor(uvOut * u_outSize));
 
   // Crisp reference: dither at the output resolution (identical to the classic
-  // single-pass path when u_ss == 1).
+  // single-pass path when u_ss == 1). At even u_ss this tap lands on a texel
+  // CORNER of the finer source; the LINEAR sampler reads that as the exact 2x2
+  // box mean — deterministic, unlike the old NEAREST corner pick which was
+  // FP/driver-dependent (and closer to the box-downsampled classic source).
   vec4 crisp = ditherSample((vec2(op) + 0.5) / u_outSize, vec2(op), 1.0);
 
   if (u_ss <= 1 || u_smoothness <= 0.0) {
