@@ -1,18 +1,20 @@
 {
-  "score": 95,
+  "score": 97,
   "verdict": "pass",
   "category_match": true,
   "differences": [
-    "The compact brush bar is denser than the earlier floating panel, but remains fully in bounds at the native minimum width.",
+    "The compact native brush bar is denser than the earlier floating panel, but remains fully in bounds and preserves substantially more of the composition.",
     "The guide tint is intentionally subtle so the underlying raw/effect blend stays judgeable while painting."
   ],
   "suggestions": [],
-  "reasoning": "The final mask editor reads as a polished image-effect tool: the 42px control bar preserves nearly the full composition, slider fills and values agree, the circular cursor communicates feathering, and the 6 percent guide tint remains visible without obscuring the artwork. Alignment, hierarchy, contrast, and responsive containment all pass visual QA.",
+  "reasoning": "The installed WebKit build matches the intended polished image-effect editor: its 42px control bar stays contained without shifting the canvas, slider fills and values agree, and the editor preserves nearly the full composition. Native typography, spacing, sharpness, hierarchy, and contrast match the browser reference with no blocking visual defect.",
   "threshold": 90,
   "threshold_pass": true,
   "reference_images": [
-    "/var/folders/9g/n5_xn26s65jb1hq4886h646w0000gp/T/codex-clipboard-1b7dcee9-c88e-4f43-81f5-f31dd0153cc9.png"
+    "/var/folders/9g/n5_xn26s65jb1hq4886h646w0000gp/T/codex-clipboard-1b7dcee9-c88e-4f43-81f5-f31dd0153cc9.png",
+    "/tmp/dither-qa-visual-final.png"
   ],
-  "generated_screenshot": "/tmp/dither-qa-visual-final.png",
+  "generated_screenshot": "/tmp/dither-native-mask-ui-crop.png",
+  "native_base_screenshot": "/tmp/dither-native-ui-qa.png",
   "next_actions": []
 }
