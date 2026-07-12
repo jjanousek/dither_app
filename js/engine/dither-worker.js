@@ -9,5 +9,7 @@ self.onmessage = (e) => {
   const img = { width: w, height: h, data: new Uint8ClampedArray(buffer) };
   errorDiffusion(img, palette, kernelId, opts);
   // transfer the pixel buffer back (palette is small — left cloned)
-  self.postMessage({ buffer: img.data.buffer, w, h, epoch }, [img.data.buffer]);
+  const response = { buffer: img.data.buffer, w, h, epoch };
+  if (Object.prototype.hasOwnProperty.call(e.data, 'token')) response.token = e.data.token;
+  self.postMessage(response, [img.data.buffer]);
 };

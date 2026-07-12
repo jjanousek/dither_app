@@ -1,6 +1,6 @@
 # Ditherlab Effect Mask — Consolidated Implementation Specification
 
-**Status:** proposed; implementation has not started
+**Status:** implemented and verified against the acceptance paths in this document
 
 **Prepared:** 2026-07-12
 

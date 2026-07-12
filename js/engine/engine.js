@@ -63,6 +63,65 @@ export class Engine {
     this.cpu = null;
     this.onCpuResult = null; // set by the app: fires when an async result lands
     this._allowAsync = false; // per-render flag; only true for the live path
+    this._detailRequest = null;
+    this.lastAsciiGridInfo = null;
+  }
+
+  /**
+   * Detailed rendering contract used by the Effect Mask frame-bundle layer.
+   * Legacy render() remains canvas-returning and does not allocate this result
+   * structure. Every canvas in this result is borrowed and may be mutated by a
+   * later Engine/CpuPreview call; consumers must copy before retaining it.
+   */
+  renderDetailed(source, srcW, srcH, p, {
+    maxPixels = Infinity,
+    maxOutputPixels = maxPixels,
+    maxOutputSide = Infinity,
+    allowAsync = false,
+    contentNew = true,
+    makeAcceptedJob = null,
+  } = {}) {
+    if (this._detailRequest) throw new Error('Engine.renderDetailed() is not re-entrant');
+    const finiteOutputPixels = Number.isFinite(maxOutputPixels) && maxOutputPixels > 0
+      ? maxOutputPixels
+      : Infinity;
+    const renderPixels = Math.min(maxPixels, finiteOutputPixels);
+    const detail = {
+      maxOutputPixels: finiteOutputPixels,
+      maxOutputSide: Number.isFinite(maxOutputSide) && maxOutputSide > 0 ? maxOutputSide : Infinity,
+      makeAcceptedJob,
+      renderedResult: null,
+      acceptedJob: null,
+      cpuHandled: false,
+    };
+    const committedResult = this.cpu?.takeCommittedResult?.() ?? null;
+    this._detailRequest = detail;
+    try {
+      const legacyCanvas = this.render(
+        source,
+        srcW,
+        srcH,
+        p,
+        renderPixels,
+        allowAsync,
+        contentNew,
+      );
+      return {
+        legacyCanvas,
+        renderedResult: detail.renderedResult,
+        committedResult,
+        acceptedJob: detail.acceptedJob,
+      };
+    } finally {
+      this._detailRequest = null;
+    }
+  }
+
+  #recordRendered(canvas, descriptor) {
+    if (this._detailRequest && canvas) {
+      this._detailRequest.renderedResult = { canvas, descriptor };
+    }
+    return canvas;
   }
 
   #initGL() {
@@ -200,14 +259,39 @@ export class Engine {
     this._allowAsync = allowAsync;
     this._contentNew = contentNew;
     this.lastBoxResolved = false; // dither GPU path sets this true when ss>1
+    this.lastAsciiGridInfo = null;
 
-    if (p.mode === 'ascii') return this.#renderAscii(source, srcW, srcH, p, maxPixels);
-    if (p.mode !== 'dither') return this.#renderCells(source, srcW, srcH, p, maxPixels);
+    if (p.mode === 'ascii') {
+      const canvas = this.#renderAscii(source, srcW, srcH, p, maxPixels);
+      if (!this._detailRequest) return canvas;
+      return this.#recordRendered(canvas, {
+        width: canvas.width,
+        height: canvas.height,
+        samplingKind: 'continuous',
+        asciiGridInfo: this.lastAsciiGridInfo,
+      });
+    }
+    if (p.mode !== 'dither') {
+      const canvas = this.#renderCells(source, srcW, srcH, p, maxPixels);
+      if (!this._detailRequest) return canvas;
+      return this.#recordRendered(canvas, {
+        width: canvas.width,
+        height: canvas.height,
+        samplingKind: 'continuous',
+        asciiGridInfo: null,
+      });
+    }
 
     let w = Math.max(1, Math.round(srcW / p.pixelSize));
     let h = Math.max(1, Math.round(srcH / p.pixelSize));
     if (w * h > maxPixels) {
       const k = Math.sqrt(maxPixels / (w * h));
+      w = Math.max(1, Math.floor(w * k));
+      h = Math.max(1, Math.floor(h * k));
+    }
+    const maxOutputSide = this._detailRequest?.maxOutputSide ?? Infinity;
+    if (Math.max(w, h) > maxOutputSide) {
+      const k = maxOutputSide / Math.max(w, h);
       w = Math.max(1, Math.floor(w * k));
       h = Math.max(1, Math.floor(h * k));
     }
@@ -286,15 +370,39 @@ export class Engine {
     }
     if (gpu && isVideoEl && !hasFilter && !canvasAnim && this.blitProgram) {
       const workTex = this.#ingestVideo(source, texW, texH);
-      return this.#renderGPU(null, w, h, ss, p, algo, pal, effSat, workTex, texW, texH);
+      const canvas = this.#renderGPU(null, w, h, ss, p, algo, pal, effSat, workTex, texW, texH);
+      if (!this._detailRequest) return canvas;
+      return this.#recordRendered(canvas, {
+        width: w,
+        height: h,
+        samplingKind: this.lastBoxResolved ? 'continuous' : 'crisp',
+        asciiGridInfo: null,
+      });
     }
 
     // The work canvas holds the source at the (super)sampled resolution; the
     // CPU path never supersamples (ss stays 1), so it still gets w x h.
     const work = this.#drawWork(source, w * ss, h * ss, p);
 
-    if (gpu) return this.#renderGPU(work, w, h, ss, p, algo, pal, effSat, null, texW, texH);
-    return this.#renderCPU(work, w, h, p, algo, pal, effSat);
+    if (gpu) {
+      const canvas = this.#renderGPU(work, w, h, ss, p, algo, pal, effSat, null, texW, texH);
+      if (!this._detailRequest) return canvas;
+      return this.#recordRendered(canvas, {
+        width: w,
+        height: h,
+        samplingKind: this.lastBoxResolved ? 'continuous' : 'crisp',
+        asciiGridInfo: null,
+      });
+    }
+    const canvas = this.#renderCPU(work, w, h, p, algo, pal, effSat);
+    if (this._detailRequest?.cpuHandled) return canvas;
+    if (!this._detailRequest) return canvas;
+    return this.#recordRendered(canvas, {
+      width: w,
+      height: h,
+      samplingKind: 'crisp',
+      asciiGridInfo: null,
+    });
   }
 
   // Downsample the source into the shared work canvas, applying the CSS-filter
@@ -670,8 +778,35 @@ export class Engine {
       if (this._allowAsync) {
         if (!this.cpu) this.cpu = new CpuPreview(() => { if (this.onCpuResult) this.onCpuResult(); });
         const sig = this.#cpuSig(algo, p, pal, w, h);
-        const committed = this.cpu.render(img, w, h, pal.float, algo.id, opts, sig, ctx, this._contentNew);
-        if (committed) return committed; // async handled; present the committed result
+        const detail = this._detailRequest
+          ? {
+            descriptor: { width: w, height: h, samplingKind: 'crisp', asciiGridInfo: null },
+            makeAcceptedJob: this._detailRequest.makeAcceptedJob,
+          }
+          : null;
+        const preview = this.cpu.render(
+          img,
+          w,
+          h,
+          pal.float,
+          algo.id,
+          opts,
+          sig,
+          ctx,
+          this._contentNew,
+          detail,
+        );
+        if (preview) {
+          if (this._detailRequest) {
+            this._detailRequest.cpuHandled = true;
+            this._detailRequest.acceptedJob = preview.acceptedJob;
+            if (preview.rendered) {
+              this._detailRequest.renderedResult = { canvas: preview.canvas, descriptor: detail.descriptor };
+            }
+            return preview.canvas;
+          }
+          return preview; // async handled; present the committed result
+        }
       }
       errorDiffusion(img, pal.float, algo.id, opts);
     } else if (algo.mode === 1) {
@@ -753,6 +888,18 @@ export class Engine {
     if (p.liveRender && isFinite(maxPixels) && outputArea > maxPixels * 2) {
       renderCellH = Math.max(4, Math.floor(cellH * Math.sqrt((maxPixels * 2) / outputArea)));
     }
+    if (this._detailRequest) {
+      const currentScale = renderCellH / cellH;
+      const currentW = cols * cellW * currentScale;
+      const currentH = rows * renderCellH;
+      const k = Math.min(
+        1,
+        Math.sqrt(this._detailRequest.maxOutputPixels / Math.max(1, currentW * currentH)),
+        this._detailRequest.maxOutputSide / Math.max(1, currentW),
+        this._detailRequest.maxOutputSide / Math.max(1, currentH),
+      );
+      if (k < 1) renderCellH = Math.max(1, Math.floor(renderCellH * k));
+    }
 
     this.#drawWork(source, w, h, p);
     const img = this.workCtx.getImageData(0, 0, w, h);
@@ -763,7 +910,7 @@ export class Engine {
       saturation: p.grayscale ? 0 : p.saturation,
       invert: p.invert,
     });
-    return this.ascii.render(img, {
+    const canvas = this.ascii.render(img, {
       renderer,
       chars: a.chars,
       cellSize: renderCellH,
@@ -779,6 +926,16 @@ export class Engine {
       shapeSet: a.shapeSet || 'ascii',
       captureMetadata: a.captureMetadata !== false,
     });
+    // Export adapters need the raster/grid relationship even when they use
+    // the synchronous legacy render API. This four-number descriptor is
+    // independent of AsciiRenderer's optional text/grid metadata capture.
+    this.lastAsciiGridInfo = {
+      cols,
+      rows,
+      rasterWidth: canvas.width,
+      rasterHeight: canvas.height,
+    };
+    return canvas;
   }
 
   #renderCells(source, srcW, srcH, p, maxPixels = Infinity) {
@@ -792,6 +949,20 @@ export class Engine {
       const k = Math.sqrt((maxPixels * 2) / (cols * rows * cell * cell));
       cols = Math.max(1, Math.floor(cols * k));
       rows = Math.max(1, Math.floor(rows * k));
+    }
+    if (this._detailRequest) {
+      const currentW = cols * cell;
+      const currentH = rows * cell;
+      const k = Math.min(
+        1,
+        Math.sqrt(this._detailRequest.maxOutputPixels / Math.max(1, currentW * currentH)),
+        this._detailRequest.maxOutputSide / Math.max(1, currentW),
+        this._detailRequest.maxOutputSide / Math.max(1, currentH),
+      );
+      if (k < 1) {
+        cols = Math.max(1, Math.floor(cols * k));
+        rows = Math.max(1, Math.floor(rows * k));
+      }
     }
 
     this.#drawWork(source, cols, rows, p);

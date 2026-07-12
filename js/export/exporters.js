@@ -3,7 +3,7 @@
 import { GifEncoder } from './gif.js';
 import { Mp4Muxer } from './mp4.js';
 
-const MAX_MP4_SAMPLE_BYTES = 256 * 1024 * 1024;
+export const MAX_MP4_SAMPLE_BYTES = 256 * 1024 * 1024;
 const SEEK_TIMEOUT_MS = 4000;
 export const GIF_RETAINED_PIXEL_BUDGET = 60_000_000;
 
@@ -83,23 +83,76 @@ export function canFrameExport() {
 // which discards exactly that. Turning cells into 2x2 blocks shifts the
 // energy into lower frequencies that survive quantization, so the pattern
 // stays crisp instead of blocking/ringing (nearest-neighbor upscale).
-async function makeH264Encoder(first, fps, strict) {
-  const long = Math.max(first.width, first.height);
+export function planH264Target(width, height) {
+  const long = Math.max(width, height);
   // Use the quality-preserving >=2x enlargement whenever the source grid fits.
   // Very wide ASCII/cell renders use 1x rather than exceeding H.264 level 5.1.
   let scale = long > 1920 ? 1 : Math.max(2, Math.round(1440 / long));
   while (long * scale > 3840 && scale > 1) scale--;
   if (long * scale > 3840) throw unsupportedH264('Video frame is wider than the 3840px H.264 limit');
-  const w = Math.max(2, (first.width * scale) & ~1);
-  const h = Math.max(2, (first.height * scale) & ~1);
+  const w = Math.max(2, (width * scale) & ~1);
+  const h = Math.max(2, (height * scale) & ~1);
+  return { width: w, height: h, scale };
+}
 
-  const frame = document.createElement('canvas');
-  frame.width = w; frame.height = h;
-  const fctx = frame.getContext('2d');
-  // Crisp 1-bit wants nearest-neighbour (sharp dots); a smoothed (tone) export
-  // is continuous, so let it upscale smoothly.
-  fctx.imageSmoothingEnabled = !strict;
-  fctx.imageSmoothingQuality = 'high';
+function checkedH264Target(target, fallback) {
+  const width = target?.width ?? target?.w ?? fallback.width;
+  const height = target?.height ?? target?.h ?? fallback.height;
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 2 || height < 2
+      || (width & 1) || (height & 1) || width > 3840 || height > 3840) {
+    throw unsupportedH264('Final video target must use even dimensions from 2 to 3840 pixels per side');
+  }
+  return { width, height, scale: target?.scale ?? fallback.scale };
+}
+
+function normalizeRenderedFrame(value) {
+  if (value && value.canvas && typeof value.canvas.width === 'number'
+      && typeof value.canvas.height === 'number') {
+    return { canvas: value.canvas, meta: value.meta ?? null };
+  }
+  return { canvas: value, meta: null };
+}
+
+async function addH264Frame(enc, rendered, index, time, strict, finalizeFrame) {
+  if (!finalizeFrame) return enc.add(rendered.canvas, index);
+  const finalized = await finalizeFrame(rendered.canvas, {
+    width: enc.w,
+    height: enc.h,
+    index,
+    time,
+    strict,
+    frameMeta: rendered.meta,
+  });
+  const finalCanvas = finalized?.canvas ?? finalized;
+  const release = finalized?.canvas ? finalized.release : null;
+  try {
+    return await enc.addFinal(finalCanvas, index);
+  } finally {
+    release?.();
+  }
+}
+
+async function makeH264Encoder(first, fps, strict, requestedTarget = null) {
+  const target = checkedH264Target(requestedTarget, planH264Target(first.width, first.height));
+  const w = target.width;
+  const h = target.height;
+
+  // The staging canvas is legacy-only and allocated lazily. Masked callers pass
+  // an already-final target to addFinal(), which must not draw or rescale it.
+  let frame = null;
+  let fctx = null;
+  const legacyFrame = () => {
+    if (!frame) {
+      frame = document.createElement('canvas');
+      frame.width = w; frame.height = h;
+      fctx = frame.getContext('2d');
+      // Crisp 1-bit wants nearest-neighbour (sharp dots); a smoothed (tone)
+      // export is continuous, so let it upscale smoothly.
+      fctx.imageSmoothingEnabled = !strict;
+      fctx.imageSmoothingQuality = 'high';
+    }
+    return frame;
+  };
 
   // Prefer constant-QUALITY (quantizer/QP) encoding — for a hard-edged dither
   // that tracks the canvas far better than a target bitrate — with High
@@ -152,6 +205,15 @@ async function makeH264Encoder(first, fps, strict) {
   }
 
   const keyEvery = Math.max(1, Math.round(fps * 2)); // ~2s GOP at any rate
+  const encodeCanvas = async (canvas, i) => {
+    const vf = new VideoFrame(canvas, { timestamp: Math.round((i * 1e6) / fps), duration: Math.round(1e6 / fps) });
+    const opts = { keyFrame: i % keyEvery === 0 };
+    if (quantizer !== null) opts.avc = { quantizer };
+    encoder.encode(vf, opts);
+    vf.close();
+    while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 4));
+    return !muxer.limitReached;
+  };
   return {
     w,
     h,
@@ -159,14 +221,17 @@ async function makeH264Encoder(first, fps, strict) {
     limitReached: () => muxer.limitReached,
     // Draw + encode one frame; awaits encoder backpressure (keeps UI alive).
     async add(processed, i) {
+      const staging = legacyFrame();
       fctx.drawImage(processed, 0, 0, processed.width, processed.height, 0, 0, w, h);
-      const vf = new VideoFrame(frame, { timestamp: Math.round((i * 1e6) / fps), duration: Math.round(1e6 / fps) });
-      const opts = { keyFrame: i % keyEvery === 0 };
-      if (quantizer !== null) opts.avc = { quantizer };
-      encoder.encode(vf, opts);
-      vf.close();
-      while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 4));
-      return !muxer.limitReached;
+      return encodeCanvas(staging, i);
+    },
+    // Encode an already-final canvas 1:1. No staging canvas, drawImage, or
+    // smoothing policy is involved in this path.
+    async addFinal(final, i) {
+      if (!final || final.width !== w || final.height !== h) {
+        throw new Error(`Final video frame must be exactly ${w}x${h}`);
+      }
+      return encodeCanvas(final, i);
     },
     async finish() {
       await encoder.flush();
@@ -204,6 +269,7 @@ function snapFps(measured) {
 export async function exportVideoFrameAccurate({
   video, renderFrame, name = 'dithered', strict = true, sourceFps = 0,
   onFrameTime = null, onProgress = () => {}, onInfo = null, shouldAbort = null,
+  planFinalTarget = null, finalizeFrame = null,
 }) {
   const originalTime = video.currentTime;
   const wasLooping = video.loop;
@@ -250,21 +316,27 @@ export async function exportVideoFrameAccurate({
     // arbitrary pre-export playback position.
     await seekMedia(video, 0);
     onFrameTime?.(0);
-    const first = renderFrame();
+    const firstRendered = normalizeRenderedFrame(renderFrame());
+    const first = firstRendered.canvas;
     // strict may be a thunk evaluated after the sizing render, so the caller
     // can read the engine's ACTUAL crisp-vs-tone state for this export
     // (raw state.smoothness lies for CPU algorithms and lost WebGL).
     const strictVal = typeof strict === 'function' ? !!strict() : strict;
-    enc = await makeH264Encoder(first, fps, strictVal);
+    const defaultTarget = planH264Target(first.width, first.height);
+    const requestedTarget = planFinalTarget
+      ? await planFinalTarget({ first, frameMeta: firstRendered.meta, defaultTarget, strict: strictVal, fps, maxSampleBytes: MAX_MP4_SAMPLE_BYTES })
+      : defaultTarget;
+    enc = await makeH264Encoder(first, fps, strictVal, requestedTarget);
 
-    await enc.add(first, 0); // frame 0 is already rendered — encode it as-is
+    await addH264Frame(enc, firstRendered, 0, 0, strictVal, finalizeFrame);
     onProgress(1 / frameCount);
     for (let i = 1; i < frameCount; i++) {
       if (shouldAbort && shouldAbort()) throw new Error('cancelled');
       if (enc.err()) throw enc.err();
       await seekMedia(video, Math.min(duration - 1e-3, i / fps));
       onFrameTime?.(i / fps);
-      if (!(await enc.add(renderFrame(), i))) {
+      const rendered = normalizeRenderedFrame(renderFrame());
+      if (!(await addH264Frame(enc, rendered, i, i / fps, strictVal, finalizeFrame))) {
         onInfo?.('Video capped when compressed frames reached 256 MB (memory safety)');
         break;
       }
@@ -291,19 +363,26 @@ export async function exportVideoFrameAccurate({
 export async function exportLoopFrameAccurate({
   renderFrame, setPhase, count, fps, name = 'dithered', strict = true,
   onProgress = () => {}, onInfo = null, shouldAbort = null,
+  planFinalTarget = null, finalizeFrame = null,
 }) {
   setPhase(0);
-  const first = renderFrame();
+  const firstRendered = normalizeRenderedFrame(renderFrame());
+  const first = firstRendered.canvas;
   const strictVal = typeof strict === 'function' ? !!strict() : strict;
-  const enc = await makeH264Encoder(first, fps, strictVal);
+  const defaultTarget = planH264Target(first.width, first.height);
+  const requestedTarget = planFinalTarget
+    ? await planFinalTarget({ first, frameMeta: firstRendered.meta, defaultTarget, strict: strictVal, fps, maxSampleBytes: MAX_MP4_SAMPLE_BYTES })
+    : defaultTarget;
+  const enc = await makeH264Encoder(first, fps, strictVal, requestedTarget);
   try {
-    await enc.add(first, 0);
+    await addH264Frame(enc, firstRendered, 0, 0, strictVal, finalizeFrame);
     onProgress(1 / count);
     for (let i = 1; i < count; i++) {
       if (shouldAbort && shouldAbort()) throw new Error('cancelled');
       if (enc.err()) throw enc.err();
       setPhase(i / count);
-      if (!(await enc.add(renderFrame(), i))) {
+      const rendered = normalizeRenderedFrame(renderFrame());
+      if (!(await addH264Frame(enc, rendered, i, i / fps, strictVal, finalizeFrame))) {
         onInfo?.('Video capped when compressed frames reached 256 MB (memory safety)');
         break;
       }
@@ -580,11 +659,9 @@ export class VideoExporter {
 // ---------------------------------------------------------------------------
 export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, name = 'dithered', onProgress = () => {}, onInfo = null, animate = null, liveDuration = 0, shouldAbort = null, smooth = false, postProcess = null, onSized = null }) {
   const originalTime = video?.currentTime ?? 0;
-  const first = renderFrame();
+  const firstRendered = normalizeRenderedFrame(renderFrame());
+  const first = firstRendered.canvas;
   if (typeof smooth === 'function') smooth = !!smooth();
-  // the sizing render ran at the arbitrary pre-export playback position; let
-  // the caller drop temporal history again so frame 0 doesn't blend with it
-  onSized?.();
   // Dither patterns don't survive fractional resampling — nearest-neighbor at
   // a ratio like 0.876 drops irregular rows/columns and shreds the pattern.
   // Snap to a whole-number divisor of the frame instead, picking the divisor
@@ -598,6 +675,24 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
   }
   const w = Math.max(1, Math.floor(first.width / div));
   const h = Math.max(1, Math.floor(first.height / div));
+  const normalizedCrop = {
+    u0: 0,
+    v0: 0,
+    u1: (w * div) / first.width,
+    v1: (h * div) / first.height,
+  };
+  const sizePlan = {
+    targetWidth: w,
+    targetHeight: h,
+    divisor: div,
+    normalizedCrop,
+    firstWidth: first.width,
+    firstHeight: first.height,
+    frameMeta: firstRendered.meta,
+  };
+  // The sizing render ran at the arbitrary pre-export playback position. Let
+  // the caller validate the exact plan and drop temporal history before frame 0.
+  onSized?.(sizePlan);
 
   // Memory bound for baked loops (the video path has its own below): at large
   // sizes, retaining every frame would exhaust the tab. Sampling the same
@@ -652,8 +747,11 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
   };
   // one captured frame: render -> decimate -> optional post-FX at GIF size
   const capture = () => {
-    const px = grab(renderFrame());
-    return postProcess ? postProcess(px, w, h) : px;
+    const rendered = normalizeRenderedFrame(renderFrame());
+    const px = grab(rendered.canvas);
+    return postProcess
+      ? postProcess(px, w, h, { ...sizePlan, frameMeta: rendered.meta })
+      : px;
   };
 
   const enc = new GifEncoder(w, h, { fps });
@@ -698,7 +796,9 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
       return blob;
     }
     // Single image -> single-frame GIF
-    enc.addFrame(postProcess ? postProcess(grab(first), w, h) : grab(first));
+    enc.addFrame(postProcess
+      ? postProcess(grab(first), w, h, sizePlan)
+      : grab(first));
     const blob = await enc.finish(shouldAbort);
     downloadBlob(blob, `${name}.gif`);
     return blob;

@@ -5,7 +5,7 @@ import { Engine, getAlgorithm } from './engine/engine.js';
 import { createState, applyParams, resetState, DEFAULTS } from './state.js';
 import { getPalette } from './palettes.js';
 import { RAMPS, FONTS } from './engine/ascii.js';
-import { applyPostFX } from './effects/postfx.js';
+import { applyPostFX, estimatePostFXBytes, releasePostFXBuffers } from './effects/postfx.js';
 import { PRESETS, shuffleParams } from './presets.js';
 import { loadFile, openWebcam, demoImage, demoPhoto, bindDropAndPaste } from './sources.js';
 import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob, canFrameExport, exportVideoFrameAccurate, exportLoopFrameAccurate } from './export/exporters.js';
@@ -13,6 +13,27 @@ import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js'
 import { Viewport } from './view.js';
 import { GenerativeSource } from './generate.js';
 import { LIVE_CPU_DITHER_BUDGETS, liveCpuDitherBudget } from './preview-policy.js';
+import {
+  MASK_LIMITS,
+  MaskRevisionStore,
+  createStroke,
+  simplifyStrokePoints,
+} from './mask/model.js';
+import {
+  MaskRasterizer,
+  CONTINUOUS_QUANTIZATION,
+  estimateRasterAllocationBytes,
+} from './mask/rasterizer.js';
+import { MaskCompositor } from './mask/compositor.js';
+import { MaskEditor } from './mask/tools.js';
+import {
+  FrameBundleManager,
+  MAX_MASK_PREVIEW_AREA,
+  MAX_MASK_PREVIEW_SIDE,
+  MAX_MASK_SUBSYSTEM_PREVIEW_BYTES,
+  estimateMaskSubsystemPeakBytes,
+  grainPhaseForFrame,
+} from './frame-bundle.js';
 
 const MAX_LIVE_PIXELS = LIVE_CPU_DITHER_BUDGETS.balanced; // cells / non-shape ASCII
 const MAX_LIVE_CPU_PIXELS = LIVE_CPU_DITHER_BUDGETS.coarse; // shape ASCII / coarse CPU dither
@@ -22,6 +43,9 @@ const LIVE_FX_PIXELS = 2_250_000;  // cap on the live post-FX compositing area (
 const EXPORT_PIXELS = 1_600_000;   // GIF/text exports render finer than the live preview
 const MAX_EXPORT_SIDE = 16384;     // canvas hard limits (Chromium/WebKit)
 const MAX_EXPORT_AREA = 64_000_000;
+const MAX_MASKED_EXPORT_AREA = 12_000_000;
+const MAX_MASKED_EXPORT_SIDE = 8_192;
+const MAX_MASKED_EXPORT_WORKING_BYTES = 512 * 1024 * 1024;
 const canRecord = typeof HTMLCanvasElement !== 'undefined'
   && typeof HTMLCanvasElement.prototype.captureStream === 'function'
   && !!window.MediaRecorder;
@@ -35,12 +59,36 @@ const cctx = cmp.getContext('2d');
 const engine = new Engine();
 const thumbEngine = new Engine();
 const state = createState();
+const maskStore = new MaskRevisionStore();
+const maskRasterizer = new MaskRasterizer();
+const maskCompositor = new MaskCompositor();
+const frameBundles = new FrameBundleManager({ applyPostFX });
+let maskRevisionId = maskStore.createInitial();
 const EXPORT_DEFAULTS = Object.freeze({ pngSize: 'source', gifSize: '480', recordSeconds: '5', txtFormat: 'plain' });
 const exportSettings = { ...EXPORT_DEFAULTS };
 
 let source = null;
 let sourceLoadToken = 0;
 let dirty = true;
+let maskDirty = false;
+let overlayDirty = true;
+let maskDraft = null;
+let liveMaskSession = null;
+let liveDraftStrokeId = null;
+let draftEffectCanvas = null;
+let sourceEpoch = 0;
+let frameId = 0;
+let effectRevision = 0;
+let transportRevision = 0;
+let maskPriming = false;
+let maskPrimingPromise = null;
+let maskPrimeGeneration = 0;
+let maskPrimeGuard = null;
+let activeExportMaskRasterizer = null;
+let activeMaskedVideoPlan = null;
+let effectRenderMs = 0;
+let bundleBuildMs = 0;
+let maskCompositeMs = 0;
 let comparing = false;
 let exporting = false;
 let scrubbing = false;
@@ -135,6 +183,36 @@ const view = new Viewport({
 });
 view.onSplitDrag = () => drawSplitOverlay();
 
+const maskEditor = new MaskEditor({
+  view,
+  callbacks: {
+    onBeginDiscreteEdit: () => commitHistory(),
+    onDraftChanged: (draft) => setMaskDraft(draft),
+    onStrokeCommitted: (stroke) => commitMaskStroke(stroke),
+    onStrokeRolledBack: () => rollbackMaskDraft(),
+    onPlacementRequested: (placement) => commitMaskProposal(maskStore.proposePlacement(maskRevisionId, placement)),
+    onClearPaintRequested: () => commitMaskProposal(maskStore.proposeClear(maskRevisionId)),
+    onEffectEverywhereRequested: () => commitMaskProposal(maskStore.proposeEffectEverywhere(maskRevisionId)),
+    onOriginalEverywhereRequested: () => commitMaskProposal(maskStore.proposeOriginalEverywhere(maskRevisionId)),
+    onEditingChanged: () => {
+      overlayDirty = true;
+      syncMaskEditor();
+    },
+    onCompareRequested: (active) => {
+      comparing = !!active;
+      if (!comparing && frameBundles.current && maskIsActive()) {
+        presentMaskedBundle();
+      } else {
+        dirty = true;
+      }
+    },
+    onMaskRepaintRequested: () => {
+      overlayDirty = true;
+      if (maskDraft && frameBundles.current) maskDirty = true;
+    },
+  },
+});
+
 $('zoom-in').onclick = () => view.zoomBy(1.25);
 $('zoom-out').onclick = () => view.zoomBy(1 / 1.25);
 $('zoom-fit').onclick = () => view.fit();
@@ -144,7 +222,6 @@ $('zoom-100').onclick = () => view.actualSize();
 $('btn-split').onclick = () => {
   view.setSplit(!view.splitOn);
   $('btn-split').classList.toggle('active', view.splitOn);
-  cmp.hidden = !view.splitOn;
   dirty = true;
 };
 
@@ -183,9 +260,765 @@ function srcDims() {
 }
 
 // ---------------------------------------------------------------------------
+// effect mask model, owned bundles, and final composition
+// ---------------------------------------------------------------------------
+function currentMaskRevision() {
+  return maskStore.get(maskRevisionId);
+}
+
+function maskUniformCoverage() {
+  return maskStore.uniformEffectCoverage(maskRevisionId);
+}
+
+function maskBypassed() {
+  return maskUniformCoverage() === 1 && !maskDraft;
+}
+
+function maskIsActive() {
+  return !maskBypassed();
+}
+
+function sourceIsMoving() {
+  return source?.type === 'video'
+    || source?.type === 'webcam'
+    || source?.type === 'animated-image'
+    || source?.type === 'gen';
+}
+
+function syncMaskEditor() {
+  if (!source) return;
+  const [sourceWidth, sourceHeight] = srcDims();
+  maskEditor.sync({
+    revisionId: maskRevisionId,
+    placement: currentMaskRevision()?.placement || 'outside',
+    uniformCoverage: maskUniformCoverage(),
+    sourceWidth,
+    sourceHeight,
+    outputWidth: out.width,
+    outputHeight: out.height,
+    mode: state.mode,
+    sourceIsMoving: sourceIsMoving(),
+  });
+}
+
+function maskQuantization(bundle) {
+  return bundle?.asciiGridInfo
+    ? { kind: 'ascii-grid', ...bundle.asciiGridInfo }
+    : CONTINUOUS_QUANTIZATION;
+}
+
+function maskRasterRequest(bundle, coverageKind = 'effect') {
+  return {
+    sourceEpoch,
+    sourceWidth: bundle.sourceWidth,
+    sourceHeight: bundle.sourceHeight,
+    revision: currentMaskRevision(),
+    width: bundle.targetWidth,
+    height: bundle.targetHeight,
+    normalizedCrop: bundle.normalizedCrop,
+    coverageKind,
+    quantization: coverageKind === 'effect' ? maskQuantization(bundle) : CONTINUOUS_QUANTIZATION,
+  };
+}
+
+function ensureDraftEffectCanvas(selectionCanvas, placement) {
+  const width = selectionCanvas.width;
+  const height = selectionCanvas.height;
+  if (!draftEffectCanvas) draftEffectCanvas = document.createElement('canvas');
+  if (draftEffectCanvas.width !== width || draftEffectCanvas.height !== height) {
+    draftEffectCanvas.width = width;
+    draftEffectCanvas.height = height;
+  }
+  const context = draftEffectCanvas.getContext('2d');
+  context.save();
+  try {
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.globalAlpha = 1;
+    context.filter = 'none';
+    if (placement === 'inside') {
+      context.globalCompositeOperation = 'copy';
+      context.drawImage(selectionCanvas, 0, 0, width, height);
+    } else {
+      context.globalCompositeOperation = 'copy';
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, width, height);
+      context.globalCompositeOperation = 'destination-out';
+      context.drawImage(selectionCanvas, 0, 0, width, height);
+    }
+  } finally {
+    context.restore();
+  }
+  return draftEffectCanvas;
+}
+
+function releaseDraftEffectCanvas() {
+  if (!draftEffectCanvas) return;
+  draftEffectCanvas.width = 0;
+  draftEffectCanvas.height = 0;
+  draftEffectCanvas = null;
+}
+
+function ensureLiveMaskSessionSize(width, height) {
+  if (!maskDraft || !liveMaskSession) return;
+  const selection = liveMaskSession.selectionCanvas();
+  if (selection.width === width && selection.height === height) return;
+  liveMaskSession.rollback();
+  liveMaskSession = null;
+  const session = startLiveMaskSession(maskDraft);
+  session?.applySegment({
+    id: liveDraftStrokeId,
+    operation: maskDraft.operation,
+    radiusShortNorm: maskDraft.radiusShortNorm,
+    feather: maskDraft.feather,
+    points: Float32Array.from(maskDraft.points),
+  });
+}
+
+function setOutputSize(width, height) {
+  let resized = false;
+  if (out.width !== width || out.height !== height) {
+    out.width = width;
+    out.height = height;
+    resized = true;
+  }
+  maskEditor.onOutputResized(width, height);
+  if (resized) view.contentResized();
+  return resized;
+}
+
+function presentMaskedBundle(bundle = frameBundles.current) {
+  if (!bundle) return false;
+  const started = performance.now();
+  const uniform = maskDraft ? null : maskUniformCoverage();
+  if (uniform !== 0 && uniform !== 1) {
+    try {
+      prepareMaskedPreviewMemory({ width: bundle.targetWidth, height: bundle.targetHeight }, {
+        prospectiveSurfaceCount: 0,
+        includeRasterTransient: !liveMaskSession,
+        plannedOutputBytes: bundle.targetWidth * bundle.targetHeight * 8,
+      });
+    } catch (error) {
+      console.warn('masked composition memory:', error);
+      toast('Mask preview reduced by memory limit');
+      return false;
+    }
+  }
+  setOutputSize(bundle.targetWidth, bundle.targetHeight);
+  ensureLiveMaskSessionSize(bundle.targetWidth, bundle.targetHeight);
+  if (uniform === 0) {
+    maskCompositor.copyRaw({ raw: bundle.rawTarget, destination: out });
+  } else if (uniform === 1) {
+    octx.save();
+    try {
+      octx.globalCompositeOperation = 'copy';
+      octx.drawImage(bundle.processedTarget, 0, 0, out.width, out.height);
+    } finally {
+      octx.restore();
+    }
+  } else {
+    let effectCoverage;
+    if (maskDraft && liveMaskSession) {
+      effectCoverage = ensureDraftEffectCanvas(
+        liveMaskSession.selectionCanvas(),
+        currentMaskRevision().placement,
+      );
+    } else {
+      effectCoverage = maskRasterizer.rasterFor(maskRasterRequest(bundle));
+      if (effectCoverage.width !== bundle.targetWidth || effectCoverage.height !== bundle.targetHeight) {
+        console.warn('Discarding stale mask raster', {
+          expected: [bundle.targetWidth, bundle.targetHeight],
+          actual: [effectCoverage.width, effectCoverage.height],
+        });
+        maskRasterizer.invalidateRevision(maskRevisionId);
+        effectCoverage = maskRasterizer.rasterFor(maskRasterRequest(bundle));
+      }
+    }
+    if (bundle.processedTarget.width !== bundle.targetWidth
+        || bundle.processedTarget.height !== bundle.targetHeight
+        || bundle.rawTarget.width !== bundle.targetWidth
+        || bundle.rawTarget.height !== bundle.targetHeight
+        || effectCoverage.width !== bundle.processedTarget.width
+        || effectCoverage.height !== bundle.processedTarget.height) {
+      console.warn('Skipping inconsistent masked bundle', {
+        target: [bundle.targetWidth, bundle.targetHeight],
+        processed: [bundle.processedTarget.width, bundle.processedTarget.height],
+        raw: [bundle.rawTarget.width, bundle.rawTarget.height],
+        mask: [effectCoverage.width, effectCoverage.height],
+        draft: !!maskDraft,
+      });
+      return false;
+    }
+    maskCompositor.compose({
+      processed: bundle.processedTarget,
+      raw: bundle.rawTarget,
+      effectCoverage,
+      destination: out,
+    });
+  }
+  out.classList.remove('pixelated');
+  if (view.splitOn && !view.splitSuppressed && !comparing && !exporting) drawSplitOverlay();
+  maskDirty = false;
+  maskCompositeMs = performance.now() - started;
+  overlayDirty = true;
+  syncMaskEditor();
+  return true;
+}
+
+function updateMaskOverlay() {
+  overlayDirty = false;
+  if (!maskEditor.editing || !source || !out.width || !out.height) {
+    maskEditor.setOverlayRaster(null);
+    return;
+  }
+  try {
+    if (liveMaskSession) {
+      maskEditor.setOverlayRaster(liveMaskSession.selectionCanvas());
+      return;
+    }
+    const [sourceWidth, sourceHeight] = srcDims();
+    prepareMaskedPreviewMemory({ width: out.width, height: out.height }, {
+      prospectiveSurfaceCount: 0,
+      includeRasterTransient: true,
+      plannedOutputBytes: canvasBackingBytes(out) + canvasBackingBytes($('mask-overlay')),
+    });
+    const selection = maskRasterizer.rasterFor({
+      sourceEpoch,
+      sourceWidth,
+      sourceHeight,
+      revision: currentMaskRevision(),
+      width: out.width,
+      height: out.height,
+      normalizedCrop: { u0: 0, v0: 0, u1: 1, v1: 1 },
+      coverageKind: 'selection',
+      quantization: CONTINUOUS_QUANTIZATION,
+    });
+    maskEditor.setOverlayRaster(selection);
+  } catch (error) {
+    console.warn('mask overlay:', error);
+  }
+}
+
+function startLiveMaskSession(draft) {
+  const [sourceWidth, sourceHeight] = srcDims();
+  if (!sourceWidth || !sourceHeight || !out.width || !out.height) return null;
+  if (liveDraftStrokeId == null) liveDraftStrokeId = maskStore.nextStrokeId();
+  draft.id = liveDraftStrokeId;
+  try {
+    prepareMaskedPreviewMemory({ width: out.width, height: out.height }, {
+      prospectiveSurfaceCount: 0,
+      includeRasterTransient: true,
+    });
+    liveMaskSession = maskRasterizer.beginLiveEdit({
+      sourceEpoch,
+      sourceWidth,
+      sourceHeight,
+      revision: currentMaskRevision(),
+      width: out.width,
+      height: out.height,
+      normalizedCrop: { u0: 0, v0: 0, u1: 1, v1: 1 },
+    });
+  } catch (error) {
+    liveMaskSession = null;
+    toast(`Mask unavailable: ${error.message}`);
+  }
+  return liveMaskSession;
+}
+
+function setMaskDraft(draft) {
+  const needsFirstPrime = !!draft && maskBypassed() && !frameBundles.current;
+  maskDraft = draft;
+  if (draft) {
+    if (liveDraftStrokeId == null) liveDraftStrokeId = maskStore.nextStrokeId();
+    draft.id = liveDraftStrokeId;
+    const session = liveMaskSession || startLiveMaskSession(draft);
+    if (!session) {
+      maskDraft = null;
+      liveDraftStrokeId = null;
+      overlayDirty = true;
+      queueMicrotask(() => maskEditor.cancelDraft());
+      return;
+    }
+    if (session) {
+      session.applySegment({
+        id: draft.id,
+        operation: draft.operation,
+        radiusShortNorm: draft.radiusShortNorm,
+        feather: draft.feather,
+        points: Float32Array.from(draft.points),
+      });
+    }
+  }
+  overlayDirty = true;
+  if (frameBundles.current) maskDirty = true;
+  if (needsFirstPrime) {
+    void primeMaskPreview({
+      activationRevisionId: maskRevisionId,
+      onFailure: () => maskEditor.cancelDraft(),
+    });
+  }
+}
+
+function rollbackMaskDraft() {
+  liveMaskSession?.rollback();
+  liveMaskSession = null;
+  releaseDraftEffectCanvas();
+  liveDraftStrokeId = null;
+  maskDraft = null;
+  maskDirty = !!frameBundles.current;
+  overlayDirty = true;
+}
+
+function historyMaskRoots(extraRevisionId = null) {
+  const roots = new Set([maskRevisionId]);
+  if (extraRevisionId != null) roots.add(extraRevisionId);
+  for (const snapshot of history.stack) {
+    try {
+      const parsed = JSON.parse(snapshot);
+      if (Number.isSafeInteger(parsed?.m)) roots.add(parsed.m);
+    } catch { /* an old plain-state snapshot has no mask root */ }
+  }
+  return roots;
+}
+
+function pruneMaskHistory() {
+  maskStore.prune(historyMaskRoots());
+}
+
+function discardFailedMaskHistoryRevision(revisionId) {
+  if (history.index < 0 || history.stack.length < 2) return;
+  try {
+    const current = JSON.parse(history.stack[history.index]);
+    if (current?.m !== revisionId) return;
+  } catch {
+    return;
+  }
+  history.stack.splice(history.index, 1);
+  history.index = Math.max(0, history.index - 1);
+  updateUndoButtons();
+}
+
+function commitMaskProposal(proposal, { addHistory = true } = {}) {
+  if (!proposal?.changed) {
+    syncMaskEditor();
+    return false;
+  }
+  const beforeRevisionId = maskRevisionId;
+  const revision = maskStore.commit(proposal);
+  maskRevisionId = revision.revisionId;
+  const after = maskUniformCoverage();
+  if (revision.strokeCount >= MASK_LIMITS.softStrokes
+      || revision.pointPairs >= MASK_LIMITS.softPointPairs) {
+    console.info('Effect Mask is near its complexity limit', {
+      strokes: revision.strokeCount,
+      pointPairs: revision.pointPairs,
+    });
+  }
+
+  if (proposal.kind === 'stroke' && liveMaskSession) liveMaskSession.commit(revision);
+  else liveMaskSession?.rollback();
+  liveMaskSession = null;
+  releaseDraftEffectCanvas();
+  liveDraftStrokeId = null;
+  maskDraft = null;
+
+  if (['clear', 'effect-everywhere', 'original-everywhere', 'reset'].includes(proposal.kind)) {
+    maskRasterizer.releaseAll();
+  }
+  maskDirty = after !== 1 && !!frameBundles.current;
+  overlayDirty = true;
+  syncMaskEditor();
+  if (addHistory) commitHistory();
+  pruneMaskHistory();
+
+  if (after === 1) {
+    frameBundles.invalidate('mask bypass restored');
+    if (engine.cpu) engine.cpu.invalidate();
+    maskCompositor.release();
+    dirty = true;
+  } else if (!frameBundles.current) {
+    void primeMaskPreview({
+      activationRevisionId: revision.revisionId,
+      onFailure: () => {
+        if (maskRevisionId !== revision.revisionId) return;
+        maskEditor.cancelDraft();
+        maskRevisionId = beforeRevisionId;
+        if (addHistory) discardFailedMaskHistoryRevision(revision.revisionId);
+        maskRasterizer.releaseAll();
+        maskCompositor.release();
+        frameBundles.invalidate('failed mask activation rolled back');
+        if (engine.cpu) engine.cpu.invalidate();
+        maskDirty = false;
+        overlayDirty = true;
+        dirty = true;
+        syncMaskEditor();
+        pruneMaskHistory();
+        return true;
+      },
+    });
+  }
+  return true;
+}
+
+function commitMaskStroke(strokeLike) {
+  try {
+    const [sourceWidth, sourceHeight] = srcDims();
+    const points = simplifyStrokePoints(strokeLike.points, {
+      sourceWidth,
+      sourceHeight,
+      tolerancePx: strokeLike.radiusShortNorm * Math.min(sourceWidth, sourceHeight) / 16,
+    });
+    const stroke = createStroke({
+      ...strokeLike,
+      id: strokeLike.id ?? liveDraftStrokeId ?? maskStore.nextStrokeId(),
+      points,
+    });
+    commitMaskProposal(maskStore.proposeStroke(maskRevisionId, stroke));
+  } catch (error) {
+    rollbackMaskDraft();
+    toast(error.code === 'MASK_COMPLEXITY_LIMIT'
+      ? 'Mask complexity limit reached · clear the selection to continue'
+      : `Mask edit failed: ${error.message}`);
+  }
+}
+
+function maskedPreviewAreaLimit() {
+  const fxOn = Object.values(state.fx).some((value) => +value > 0);
+  return fxOn || maskDraft ? 1_600_000 : MAX_MASK_PREVIEW_AREA;
+}
+
+function canvasBackingBytes(canvas) {
+  return canvas?.width > 0 && canvas?.height > 0 ? canvas.width * canvas.height * 4 : 0;
+}
+
+function prepareMaskedPreviewMemory(targetPlan, {
+  prospectiveSurfaceCount = 3,
+  currentBundle = undefined,
+  inFlightRaw = undefined,
+  includeRasterTransient = false,
+  processedBytes = 0,
+  plannedOutputBytes = null,
+} = {}) {
+  const width = targetPlan.width;
+  const height = targetPlan.height;
+  const targetBytes = width * height * 4;
+  const overlay = $('mask-overlay');
+  const liveDraftBytes = liveMaskSession
+    ? targetBytes * 2 // Float32 selection + RGBA8 live canvas
+    : 0;
+  const draftCanvasBytes = draftEffectCanvas ? targetBytes : 0;
+  const transientRasterBytes = includeRasterTransient && !liveMaskSession
+    ? estimateRasterAllocationBytes(width, height).totalBytes
+    : 0;
+  const accountedCurrent = currentBundle === undefined ? frameBundles.current : currentBundle;
+  const accountedInFlight = inFlightRaw === undefined
+    ? (frameBundles.inFlight?.rawTarget || null)
+    : inFlightRaw;
+  const outputBytes = plannedOutputBytes ?? (canvasBackingBytes(out) + canvasBackingBytes(overlay));
+  const estimate = estimateMaskSubsystemPeakBytes({
+    targetPlan,
+    currentBundle: accountedCurrent,
+    inFlightRaw: accountedInFlight,
+    prospectiveSurfaceCount,
+    rasterCacheBytes: maskRasterizer.cacheBytes,
+    outputBytes,
+    draftBytes: liveDraftBytes + draftCanvasBytes,
+    transientRasterBytes,
+    compositorBytes: maskCompositor.estimateScratchBytes(width, height),
+    postFXBytes: estimatePostFXBytes(width, height, state.fx, { fast: true }),
+    // Engine work/result surfaces are borrowed, but still resident while the
+    // owned bundle is built. Count both conservatively at their actual size.
+    otherBytes: Math.max(0, processedBytes) * 2,
+    previewByteLimit: MAX_MASK_SUBSYSTEM_PREVIEW_BYTES,
+  });
+  maskRasterizer.trimToBytes(estimate.rasterCacheAllowanceBytes);
+  const afterTrim = estimateMaskSubsystemPeakBytes({
+    targetPlan,
+    currentBundle: accountedCurrent,
+    inFlightRaw: accountedInFlight,
+    prospectiveSurfaceCount,
+    rasterCacheBytes: maskRasterizer.cacheBytes,
+    outputBytes,
+    draftBytes: liveDraftBytes + draftCanvasBytes,
+    transientRasterBytes,
+    compositorBytes: maskCompositor.estimateScratchBytes(width, height),
+    postFXBytes: estimatePostFXBytes(width, height, state.fx, { fast: true }),
+    otherBytes: Math.max(0, processedBytes) * 2,
+    previewByteLimit: MAX_MASK_SUBSYSTEM_PREVIEW_BYTES,
+  });
+  if (!afterTrim.fitsAfterRasterTrim) {
+    const error = new Error(`masked preview needs ${Math.ceil(afterTrim.nonCacheBytes / 1048576)} MiB`);
+    error.code = 'MASK_PREVIEW_MEMORY_LIMIT';
+    throw error;
+  }
+  return afterTrim.accountedExtraBytesAfterTrim;
+}
+
+function assertMaskedCompositionFeasible(targetPlan) {
+  const targetBytes = targetPlan.width * targetPlan.height * 4;
+  // Model the post-publication phase separately: the old bundle has been
+  // released, the new two-surface pair is resident, and raster/compositor
+  // scratch must fit before publication is allowed to replace the old pair.
+  prepareMaskedPreviewMemory(targetPlan, {
+    currentBundle: null,
+    inFlightRaw: null,
+    prospectiveSurfaceCount: 2,
+    includeRasterTransient: !liveMaskSession,
+    plannedOutputBytes: targetBytes * 2, // output + editor overlay
+  });
+}
+
+function resolveMaskedTarget(descriptor, sourceWidth, sourceHeight, maxArea = maskedPreviewAreaLimit()) {
+  return frameBundles.resolveTarget({
+    sourceWidth,
+    sourceHeight,
+    processedWidth: descriptor.width,
+    processedHeight: descriptor.height,
+    samplingKind: descriptor.samplingKind,
+    maxArea,
+    maxSide: MAX_MASK_PREVIEW_SIDE,
+  });
+}
+
+function maskedToken(descriptor, targetPlan, acceptedFrameId = frameId) {
+  return {
+    sourceEpoch,
+    frameId: acceptedFrameId,
+    effectRevision,
+    targetRevision: targetPlan.targetRevision,
+    samplingKind: descriptor.samplingKind,
+  };
+}
+
+function maskedPostFXPlan(token, sourceHeight, fast = true) {
+  return {
+    fx: { ...state.fx },
+    grainPhase: currentGrainPhase() ?? grainPhaseForFrame(token.frameId),
+    refH: sourceHeight,
+    fast,
+  };
+}
+
+function handleDetailedMaskedRender(detail, sourceWidth, sourceHeight, maxArea = maskedPreviewAreaLimit()) {
+  const started = performance.now();
+  let published = null;
+  if (detail.committedResult) {
+    try {
+      const accepted = frameBundles.inFlight;
+      let refreshedExtraPeakBytes = null;
+      if (accepted) {
+        assertMaskedCompositionFeasible(accepted.targetPlan);
+        refreshedExtraPeakBytes = prepareMaskedPreviewMemory(accepted.targetPlan, {
+          prospectiveSurfaceCount: 2,
+          inFlightRaw: accepted.rawTarget,
+          processedBytes: canvasBackingBytes(detail.committedResult.canvas),
+        });
+      }
+      published = frameBundles.commitAsync({
+        committedResult: detail.committedResult,
+        extraPeakBytes: refreshedExtraPeakBytes,
+        currentGenerations: {
+          sourceEpoch,
+          effectRevision,
+          targetRevision: frameBundles.targetRevision,
+          samplingKind: detail.committedResult.token?.samplingKind,
+        },
+      }) || published;
+    } catch (error) {
+      console.warn('masked CPU commit:', error);
+      frameBundles.invalidate('masked CPU commit rejected', { releaseCurrent: false });
+    }
+  }
+
+  if (detail.renderedResult) {
+    const { canvas, descriptor } = detail.renderedResult;
+    const targetPlan = resolveMaskedTarget(descriptor, sourceWidth, sourceHeight, maxArea);
+    const token = maskedToken(descriptor, targetPlan);
+    try {
+      assertMaskedCompositionFeasible(targetPlan);
+      const extraPeakBytes = prepareMaskedPreviewMemory(targetPlan, {
+        prospectiveSurfaceCount: 3,
+        processedBytes: canvasBackingBytes(canvas),
+      });
+      published = frameBundles.buildSynchronous({
+        borrowedProcessed: canvas,
+        descriptor,
+        token,
+        targetPlan,
+        rawSource: source.el,
+        sourceWidth,
+        sourceHeight,
+        postFXPlan: maskedPostFXPlan(token, sourceHeight, true),
+        extraPeakBytes,
+      });
+    } catch (error) {
+      console.warn('masked bundle:', error);
+      if (error.code === 'MASK_PREVIEW_MEMORY_LIMIT') toast('Mask preview reduced by memory limit');
+    }
+  }
+
+  if (detail.acceptedJob?.token) {
+    try {
+      const extraPeakBytes = prepareMaskedPreviewMemory(detail.acceptedJob.targetPlan, {
+        // Reserve for the accepted raw plus the later processed/FX commit.
+        prospectiveSurfaceCount: 3,
+        processedBytes: (detail.acceptedJob.descriptor?.width || 0)
+          * (detail.acceptedJob.descriptor?.height || 0) * 4,
+      });
+      frameBundles.acceptAsync({
+        acceptedJob: detail.acceptedJob,
+        rawSource: source.el,
+        sourceWidth,
+        sourceHeight,
+        postFXPlan: maskedPostFXPlan(detail.acceptedJob.token, sourceHeight, true),
+        extraPeakBytes,
+      });
+    } catch (error) {
+      console.warn('masked CPU accept:', error);
+    }
+  }
+
+  bundleBuildMs = performance.now() - started;
+  if (published) presentMaskedBundle(published);
+  else if (maskDirty && frameBundles.current) presentMaskedBundle();
+  return published;
+}
+
+function resolveLiveRenderBudget() {
+  let budget = MAX_LIVE_PIXELS;
+  const cpuDither = state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'cpu';
+  const heavyAscii = state.mode === 'ascii' && state.ascii.renderer === 'shape';
+  const videoMoving = source?.el instanceof HTMLVideoElement
+    && (!source.el.paused && !source.el.ended);
+  const inherentlyMoving = source?.type === 'webcam'
+    || source?.type === 'gen'
+    || source?.type === 'animated-image';
+  const moving = videoMoving || inherentlyMoving || isAnimating();
+  if (moving && cpuDither) budget = liveCpuDitherBudget(state.pixelSize);
+  else if (moving && heavyAscii) budget = MAX_LIVE_CPU_PIXELS;
+  else if (!moving && state.mode !== 'dither') budget = MAX_STILL_PREVIEW_PIXELS;
+  else if (state.mode === 'dither') budget = MAX_LIVE_GPU_PIXELS;
+  return budget;
+}
+
+function cancelMaskPriming() {
+  maskPrimeGeneration++;
+  maskPriming = false;
+  maskPrimingPromise = null;
+  maskPrimeGuard = null;
+  maskEditor.setPriming(false);
+}
+
+function primeMaskPreview({
+  activationRevisionId = maskRevisionId,
+  onFailure = null,
+  preserveCurrentUntilPublish = false,
+} = {}) {
+  if (maskPrimingPromise) {
+    if (onFailure) {
+      maskPrimeGuard = {
+        ...maskPrimeGuard,
+        activationRevisionId,
+        onFailure,
+      };
+    }
+    return maskPrimingPromise;
+  }
+  if (!source || !maskIsActive()) return Promise.resolve(false);
+
+  const generation = ++maskPrimeGeneration;
+  const sourceAtStart = source;
+  const liveBudget = resolveLiveRenderBudget(); // capture before pausing video
+  const video = source.el instanceof HTMLVideoElement ? source.el : null;
+  const wasPlaying = !!video && !video.paused && !video.ended;
+  const startingTransportRevision = transportRevision;
+  maskPrimeGuard = { generation, activationRevisionId, onFailure };
+  maskPriming = true;
+  maskEditor.setPriming(true);
+
+  let promise;
+  promise = (async () => {
+    if (wasPlaying && source.type !== 'webcam') video.pause();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    if (generation !== maskPrimeGeneration || source !== sourceAtStart) return false;
+    let lastError = null;
+    const initialArea = maskedPreviewAreaLimit();
+    const areas = [...new Set([
+      initialArea,
+      Math.max(400_000, Math.floor(initialArea / 2)),
+      400_000,
+    ])];
+    for (const maskTargetArea of areas) {
+      try {
+        if (engine.cpu) engine.cpu.invalidate();
+        const priorBundle = frameBundles.current;
+        frameBundles.invalidate('mask priming', { releaseCurrent: !preserveCurrentUntilPublish });
+        renderOnce({
+          budget: Math.min(liveBudget, maskTargetArea),
+          maskTargetArea,
+          contentNew: true,
+          allowAsync: false,
+          liveRender: true,
+          offline: false,
+        });
+        const landed = frameBundles.current;
+        if (!landed || (preserveCurrentUntilPublish && landed === priorBundle)
+            || !presentMaskedBundle(landed)) {
+          throw new Error('could not build a paired frame');
+        }
+        return true;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error('could not build a paired frame');
+  })().catch((error) => {
+    if (generation !== maskPrimeGeneration) return false;
+    const guard = maskPrimeGuard;
+    let failureHandled = false;
+    if (guard?.generation === generation
+        && (!guard.activationRevisionId || maskRevisionId === guard.activationRevisionId)) {
+      failureHandled = guard.onFailure?.() === true;
+    }
+    if (!failureHandled) frameBundles.invalidate('mask priming failed');
+    maskDirty = false;
+    overlayDirty = true;
+    dirty = true;
+    toast(`Mask unavailable: ${error.message}`);
+    return false;
+  }).finally(() => {
+    if (generation !== maskPrimeGeneration) return;
+    if (wasPlaying && source === sourceAtStart && transportRevision === startingTransportRevision) {
+      video.play().catch(() => {});
+      if (source.type === 'video') $('btn-play').textContent = '❚❚';
+    }
+    if (maskPrimingPromise === promise) maskPrimingPromise = null;
+    maskPrimeGuard = null;
+    maskPriming = false;
+    maskEditor.setPriming(false);
+    syncMaskEditor();
+  });
+  maskPrimingPromise = promise;
+  return promise;
+}
+
+// ---------------------------------------------------------------------------
 // render + present
 // ---------------------------------------------------------------------------
 function renderOnce(budgetOverride = null, contentNew = true, noFx = false, captureMetadata = false) {
+  const options = budgetOverride && typeof budgetOverride === 'object'
+    ? budgetOverride
+    : {
+      budget: budgetOverride,
+      contentNew,
+      noFx,
+      captureMetadata,
+    };
+  const explicitBudget = options.budget ?? null;
+  contentNew = options.contentNew ?? true;
+  noFx = !!options.noFx;
+  captureMetadata = !!options.captureMetadata;
+  const processedOnly = !!options.processedOnly || noFx || captureMetadata;
+  const offline = options.offline ?? explicitBudget !== null;
   const [w, h] = srcDims();
   if (!w || !h) return out;
   if (source.type === 'gen') source.gen.tick(genPhaseOverride ?? source.gen.phase);
@@ -202,30 +1035,45 @@ function renderOnce(budgetOverride = null, contentNew = true, noFx = false, capt
   // cost ~the same at 0.4MP or 2MP (the shader is the bottleneck, not the
   // pixel count), so give them a much finer live budget — the dither pattern
   // on video is then crisp instead of chunky at pixel-size 1.
-  if (budgetOverride === null) {
-    const cpuDither = state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'cpu';
-    const heavyAscii = state.mode === 'ascii' && state.ascii.renderer === 'shape';
-    const videoMoving = source.el instanceof HTMLVideoElement
-      && (!source.el.paused && !source.el.ended);
-    const inherentlyMoving = source.type === 'webcam'
-      || source.type === 'gen'
-      || source.type === 'animated-image';
-    const moving = videoMoving || inherentlyMoving || isAnimating();
-    if (moving && cpuDither) budget = liveCpuDitherBudget(state.pixelSize);
-    else if (moving && heavyAscii) budget = MAX_LIVE_CPU_PIXELS;
-    else if (!moving && state.mode !== 'dither') budget = MAX_STILL_PREVIEW_PIXELS;
-    else if (state.mode === 'dither') budget = MAX_LIVE_GPU_PIXELS;
-  }
+  if (explicitBudget === null) budget = resolveLiveRenderBudget();
   // Only the live preview (no budget override, not exporting) may run the CPU
   // dither in the worker; exports and thumbnails stay synchronous.
-  const allowAsync = budgetOverride === null && !exporting;
+  const allowAsync = options.allowAsync ?? (explicitBudget === null && !exporting);
   // Live-loop render vs one-shot (export/copy) render. Realtime canvas
   // recordings capture the live loop, so they must keep the exact live
   // presentation; frame-exact exporters pass a budget override and get the
   // uncapped, deterministic rendition.
-  p.liveRender = budgetOverride === null;
-  const result = engine.render(source.el, w, h, p, budgetOverride ?? budget, allowAsync, contentNew);
-  if (result) present(result, w, budgetOverride !== null, noFx);
+  p.liveRender = options.liveRender ?? explicitBudget === null;
+  const renderBudget = explicitBudget ?? budget;
+  if (contentNew) frameId++;
+
+  if (!processedOnly && maskIsActive()) {
+    const maskTargetArea = options.maskTargetArea ?? maskedPreviewAreaLimit();
+    const acceptedFrameId = frameId;
+    const renderStarted = performance.now();
+    const detail = engine.renderDetailed(source.el, w, h, p, {
+      maxPixels: renderBudget,
+      maxOutputPixels: maskTargetArea,
+      maxOutputSide: MAX_MASK_PREVIEW_SIDE,
+      allowAsync,
+      contentNew,
+      makeAcceptedJob: (descriptor) => {
+        const targetPlan = resolveMaskedTarget(descriptor, w, h, maskTargetArea);
+        return {
+          token: maskedToken(descriptor, targetPlan, acceptedFrameId),
+          targetPlan,
+        };
+      },
+    });
+    effectRenderMs = performance.now() - renderStarted;
+    handleDetailedMaskedRender(detail, w, h, maskTargetArea);
+    return out;
+  }
+
+  const renderStarted = performance.now();
+  const result = engine.render(source.el, w, h, p, renderBudget, allowAsync, contentNew);
+  effectRenderMs = performance.now() - renderStarted;
+  if (result) present(result, w, offline, noFx);
   return out;
 }
 
@@ -283,6 +1131,7 @@ function present(result, srcW, offline = false, noFx = false) {
     resized = true;
   }
   octx.drawImage(final, 0, 0);
+  maskEditor.onOutputResized(out.width, out.height);
   // Crisp dither wants nearest-neighbour upscaling (sharp dots); a box-resolved
   // (tone) result should scale smoothly. Use the engine's ACTUAL last-frame
   // state so a CPU algorithm, WebGL loss, or governor ss->1 (all crisp) keep
@@ -290,9 +1139,11 @@ function present(result, srcW, offline = false, noFx = false) {
   const pixelate = state.mode === 'dither' && !engine.lastBoxResolved;
   out.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
+  syncMaskEditor();
+  overlayDirty = true;
   // not during exports: out is at export resolution and the overlay is hidden
   // behind the busy screen anyway
-  if (view.splitOn && !comparing && !exporting) drawSplitOverlay();
+  if (view.splitOn && !view.splitSuppressed && !comparing && !exporting) drawSplitOverlay();
 }
 
 function presentOriginal() {
@@ -308,8 +1159,12 @@ function presentOriginal() {
 
 // Draw the untouched source over the left part of the frame (split view).
 function drawSplitOverlay() {
-  if (!source) return;
-  const [srcW, srcH] = srcDims();
+  if (!source || !view.splitOn || view.splitSuppressed) return;
+  const pairedRaw = maskIsActive() ? frameBundles.current?.rawTarget : null;
+  const [sourceWidth, sourceHeight] = srcDims();
+  const raw = pairedRaw || source.el;
+  const srcW = pairedRaw?.width || sourceWidth;
+  const srcH = pairedRaw?.height || sourceHeight;
   const w = out.width;
   const h = out.height;
   if (!srcW || !srcH || !w || !h) return;
@@ -324,7 +1179,7 @@ function drawSplitOverlay() {
   cctx.clearRect(0, 0, w, h);
   const frac = view.splitFrac;
   if (frac <= 0) return;
-  cctx.drawImage(source.el, 0, 0, srcW * frac, srcH, 0, 0, w * frac, h);
+  cctx.drawImage(raw, 0, 0, srcW * frac, srcH, 0, 0, w * frac, h);
 }
 
 // Adjust the supersample cap from the two load signals. Live ss is capped at
@@ -380,6 +1235,7 @@ function updateGovernor() {
 function loop(t) {
   requestAnimationFrame(loop);
   if (!source) return;
+  if (overlayDirty) updateMaskOverlay();
   const rawDt = lastLoopT ? t - lastLoopT : 16;
   lastLoopT = t;
   // recordings must track wall time even when rAF is throttled; otherwise
@@ -410,22 +1266,29 @@ function loop(t) {
   // pre-export worker reply must not repaint `out` mid-frame. (recordCanvas
   // exports still render via contentNew from playing/animating.)
   if (exporting) cpuResultReady = false;
-  if (!contentNew && !cpuResultReady) return;
+  const cpuWake = cpuResultReady;
+  if (!contentNew && !cpuWake && !maskDirty) return;
   cpuResultReady = false;
   videoFrameReady = false;
   dirty = false;
 
   if (comparing) {
     presentOriginal();
+  } else if (maskDirty && !contentNew && !cpuWake && frameBundles.current) {
+    presentMaskedBundle();
   } else {
     const t0 = performance.now();
+    const maskedRender = maskIsActive();
     renderOnce(null, contentNew);
     // Only track cost while producing new LIVE frames — not idle wake-ups,
     // and not export renders: recordCanvas exports run through this loop with
     // export cost profiles (sync CPU dither, ss=3) the governor must not
     // train on. derived() masks its output during exports anyway.
     if (contentNew && !exporting) {
-      const rt = performance.now() - t0;
+      // The masked path tracks Engine work separately so the compositor can
+      // never train the renderer supersampling governor. Preserve the legacy
+      // wall-time signal exactly while the mask is bypassed.
+      const rt = maskedRender ? effectRenderMs : performance.now() - t0;
       renderMsEma = renderMsEma ? renderMsEma * 0.85 + rt * 0.15 : rt;
       updateGovernor();
     }
@@ -488,10 +1351,16 @@ function updateUndoButtons() {
   $('btn-redo').disabled = history.index >= history.stack.length - 1;
 }
 
-// snapshots capture the app state AND the active generative-scene params,
-// so undo/redo can revert scene edits too
+// Mask vectors live in their own immutable revision graph. History stores only
+// a stable revision ID alongside settings and source-bound generative params.
 function snapshotStr() {
-  return JSON.stringify({ s: state, g: source?.type === 'gen' ? source.gen.params : null });
+  return JSON.stringify({
+    s: state,
+    g: source?.type === 'gen'
+      ? { sourceEpoch, params: source.gen.params }
+      : null,
+    m: maskRevisionId,
+  });
 }
 
 function commitHistory() {
@@ -503,6 +1372,12 @@ function commitHistory() {
   history.stack.push(snap);
   if (history.stack.length > 100) history.stack.shift();
   history.index = history.stack.length - 1;
+  while (history.stack.length > 1
+      && maskStore.reachableBytes(historyMaskRoots()) > 16 * 1024 * 1024) {
+    history.stack.shift();
+    history.index--;
+  }
+  pruneMaskHistory();
   updateUndoButtons();
 }
 
@@ -512,36 +1387,81 @@ function pushHistory() {
   histTimer = setTimeout(commitHistory, 350);
 }
 
-function restoreSnapshot(snap) {
+function restoreSnapshot(snap, {
+  skipPrime = false,
+  preserveCurrentBundle = false,
+  onPrimeFailure = null,
+} = {}) {
+  const beforeCoverage = maskUniformCoverage();
+  maskEditor.cancelDraft();
   const parsed = JSON.parse(snap);
   resetState(state);
   applyParams(state, parsed.s || parsed);
-  if (parsed.g && source?.type === 'gen') {
-    Object.assign(source.gen.params, parsed.g);
+  if (Number.isSafeInteger(parsed.m) && maskStore.has(parsed.m)) maskRevisionId = parsed.m;
+  if (parsed.g?.sourceEpoch === sourceEpoch && parsed.g.params && source?.type === 'gen') {
+    Object.assign(source.gen.params, parsed.g.params);
     source.name = source.gen.sceneName().toLowerCase();
   }
+  effectRevision++;
+  frameBundles.invalidate('history restore', { releaseCurrent: !preserveCurrentBundle });
+  if (engine.cpu) engine.cpu.invalidate();
   clearActivePreset($('preset-strip')); // the restored state may not match the highlighted card
   rebuildPanel();
   updateExportButtons();
   updateUndoButtons();
   updateStatus();
+  syncMaskEditor();
+  maskDirty = false;
+  overlayDirty = true;
   dirty = true;
+  if (!maskIsActive()) {
+    frameBundles.invalidate('history restored bypass');
+  } else if (!skipPrime
+      && (beforeCoverage === 1 || !frameBundles.current || preserveCurrentBundle)) {
+    void primeMaskPreview({
+      activationRevisionId: maskRevisionId,
+      preserveCurrentUntilPublish: preserveCurrentBundle,
+      onFailure: onPrimeFailure,
+    });
+  }
 }
 
 function undo() {
+  if (maskPriming) return;
   commitHistory(); // land any pending debounced change first
   if (history.index > 0) {
+    const rollbackIndex = history.index;
+    const rollbackSnapshot = history.stack[rollbackIndex];
     history.index--;
-    restoreSnapshot(history.stack[history.index]);
+    restoreSnapshot(history.stack[history.index], {
+      preserveCurrentBundle: true,
+      onPrimeFailure: () => {
+        history.index = rollbackIndex;
+        restoreSnapshot(rollbackSnapshot, { skipPrime: true, preserveCurrentBundle: true });
+        if (frameBundles.current && maskIsActive()) presentMaskedBundle();
+        return true;
+      },
+    });
     updateUndoButtons();
   }
 }
 
 function redo() {
+  if (maskPriming) return;
   if (histTimer) commitHistory();
   if (history.index < history.stack.length - 1) {
+    const rollbackIndex = history.index;
+    const rollbackSnapshot = history.stack[rollbackIndex];
     history.index++;
-    restoreSnapshot(history.stack[history.index]);
+    restoreSnapshot(history.stack[history.index], {
+      preserveCurrentBundle: true,
+      onPrimeFailure: () => {
+        history.index = rollbackIndex;
+        restoreSnapshot(rollbackSnapshot, { skipPrime: true, preserveCurrentBundle: true });
+        if (frameBundles.current && maskIsActive()) presentMaskedBundle();
+        return true;
+      },
+    });
     updateUndoButtons();
   }
 }
@@ -652,8 +1572,31 @@ function setSource(next) {
     toast('Export in progress — cancel it first');
     return;
   }
+  cancelMaskPriming();
+  if (source) {
+    maskEditor.beforeSourceChange();
+    commitHistory();
+  }
+  const keptMask = maskIsActive();
   disposeSource(source);
   source = next;
+  sourceEpoch++;
+  frameId = 0;
+  effectRevision++;
+  transportRevision++;
+  frameBundles.invalidate('source replacement');
+  maskRasterizer.releaseAll();
+  maskCompositor.release();
+  releasePostFXBuffers();
+  liveMaskSession = null;
+  liveDraftStrokeId = null;
+  maskDraft = null;
+  maskDirty = false;
+  overlayDirty = true;
+  if (keptMask) {
+    octx.clearRect(0, 0, out.width, out.height);
+    cctx.clearRect(0, 0, cmp.width, cmp.height);
+  }
   const nowLive = next.type === 'video' || next.type === 'webcam';
   const wasLive = prevType === 'video' || prevType === 'webcam';
   const profileApplied = nowLive && !wasLive;
@@ -709,6 +1652,8 @@ function setSource(next) {
     // doesn't ghost-blend with wherever we jumped from
     source._seekHandler = () => {
       if (!exporting) {
+        transportRevision++;
+        frameBundles.invalidate('seek');
         dirty = true;
         engine.invalidateTemporal();
         updateVideoTime(source.el);
@@ -724,15 +1669,19 @@ function setSource(next) {
   updateExportButtons();
   updateStatus();
   rebuildPanel(); // scene controls appear only for generated sources
+  syncMaskEditor();
   dirty = true;
   // record the auto-applied video profile as its own undo step, so the first
   // subsequent slider edit doesn't revert the whole profile in one undo
   if (profileApplied) commitHistory();
   setTimeout(renderPresetThumbs, 250);
   // a slow webcam can arrive with 0×0 dims and fill them in a moment later
-  toast(source.width
-    ? `${source.name || source.type} · ${source.width}×${source.height}`
-    : `${source.name || source.type} — starting…`);
+  if (keptMask) toast('Mask kept · Clear paint or Effect everywhere to remove', 4000);
+  else {
+    toast(source.width
+      ? `${source.name || source.type} · ${source.width}×${source.height}`
+      : `${source.name || source.type} — starting…`);
+  }
 }
 
 async function openFile(file) {
@@ -782,12 +1731,302 @@ function hideBusy() {
 }
 $('busy-cancel').onclick = () => busyCancel && busyCancel();
 
+function lockMaskForExport() {
+  activeExportMaskRasterizer?.releaseAll();
+  activeExportMaskRasterizer = maskIsActive() ? new MaskRasterizer() : null;
+  if (maskIsActive() && frameBundles.targetPlan && !frameBundles.targetLocked) {
+    frameBundles.lockTarget();
+  }
+  maskEditor.setLocked(true);
+  overlayDirty = true;
+}
+
+async function beginExport() {
+  if (!source || exporting) return false;
+  // Set this before committing a draft so every other source/settings action
+  // is gated while that commit's required priming render settles.
+  exporting = true;
+  try {
+    maskEditor.beforeExport();
+    if (maskPrimingPromise) await maskPrimingPromise;
+    if (maskIsActive() && !frameBundles.current) {
+      await primeMaskPreview({ activationRevisionId: maskRevisionId });
+    }
+    if (maskIsActive() && !frameBundles.current) {
+      throw new Error('Effect Mask could not establish a paired preview frame');
+    }
+    lockMaskForExport();
+    return true;
+  } catch (error) {
+    exporting = false;
+    unlockMaskAfterExport();
+    toast(`Export preparation failed: ${error.message}`);
+    return false;
+  }
+}
+
+function unlockMaskAfterExport() {
+  activeExportMaskRasterizer?.releaseAll();
+  activeExportMaskRasterizer = null;
+  activeMaskedVideoPlan = null;
+  frameBundles.unlockTarget();
+  maskEditor.setLocked(false);
+  overlayDirty = true;
+  syncMaskEditor();
+}
+
 // ---------------------------------------------------------------------------
 // exports
 // ---------------------------------------------------------------------------
+function createOwnedCanvas(width, height, label = 'canvas') {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  if (canvas.width !== width || canvas.height !== height || !canvas.getContext('2d')) {
+    canvas.width = 0;
+    canvas.height = 0;
+    throw new Error(`${label} allocation failed at ${width}×${height}`);
+  }
+  return canvas;
+}
+
+function releaseOwnedCanvas(canvas) {
+  if (!canvas) return;
+  canvas.width = 0;
+  canvas.height = 0;
+}
+
+function exportDescriptor(result) {
+  return {
+    width: result.width,
+    height: result.height,
+    samplingKind: state.mode === 'dither' && !engine.lastBoxResolved ? 'crisp' : 'continuous',
+    asciiGridInfo: state.mode === 'ascii' ? engine.lastAsciiGridInfo : null,
+  };
+}
+
+function renderProcessedForExport(budget, {
+  captureMetadata = false,
+  maxOutputPixels = budget,
+  maxOutputSide = MAX_MASKED_EXPORT_SIDE,
+} = {}) {
+  const [sourceWidth, sourceHeight] = srcDims();
+  if (source.type === 'gen') source.gen.tick(genPhaseOverride ?? source.gen.phase);
+  const params = derived(captureMetadata);
+  params.liveRender = false;
+  const detail = engine.renderDetailed(source.el, sourceWidth, sourceHeight, params, {
+    maxPixels: budget,
+    maxOutputPixels,
+    maxOutputSide,
+    allowAsync: false,
+    contentNew: true,
+  });
+  const result = detail.renderedResult?.canvas || detail.legacyCanvas;
+  if (!result) throw new Error('renderer produced no frame');
+  if (result.width > maxOutputSide || result.height > maxOutputSide
+      || result.width * result.height > maxOutputPixels) {
+    throw new Error(`renderer exceeded masked export bounds at ${result.width}×${result.height}`);
+  }
+  return {
+    canvas: result,
+    descriptor: detail.renderedResult?.descriptor || exportDescriptor(result),
+  };
+}
+
+function maskedPreviewResidentBytes() {
+  const bundle = frameBundles.current;
+  const bundleBytes = canvasBackingBytes(bundle?.rawTarget) + canvasBackingBytes(bundle?.processedTarget);
+  const inFlightBytes = canvasBackingBytes(frameBundles.inFlight?.rawTarget);
+  const overlayBytes = canvasBackingBytes($('mask-overlay'));
+  const target = bundle
+    ? { width: bundle.targetWidth, height: bundle.targetHeight }
+    : null;
+  const compositorBytes = target
+    ? maskCompositor.estimateScratchBytes(target.width, target.height)
+    : 0;
+  const postFXBytes = target
+    ? estimatePostFXBytes(target.width, target.height, state.fx, { fast: true })
+    : 0;
+  return bundleBytes + inFlightBytes + canvasBackingBytes(out) + overlayBytes
+    + maskRasterizer.cacheBytes + compositorBytes + postFXBytes;
+}
+
+function capMaskedDimensions(width, height, {
+  reserveBytes = 0,
+  surfaceCount = 16,
+  label = 'export',
+} = {}) {
+  const remainingBytes = Math.max(
+    1,
+    MAX_MASKED_EXPORT_WORKING_BYTES - reserveBytes - maskedPreviewResidentBytes(),
+  );
+  const byteArea = Math.max(1, Math.floor(remainingBytes / (surfaceCount * 4)));
+  const area = Math.min(MAX_MASKED_EXPORT_AREA, byteArea);
+  const scale = Math.min(
+    1,
+    MAX_MASKED_EXPORT_SIDE / width,
+    MAX_MASKED_EXPORT_SIDE / height,
+    Math.sqrt(area / (width * height)),
+  );
+  const capped = {
+    width: Math.max(1, Math.floor(width * scale)),
+    height: Math.max(1, Math.floor(height * scale)),
+    capped: scale < 1,
+  };
+  if (capped.capped) toast(`${label} capped to ${capped.width}×${capped.height} (masked memory limit)`);
+  return capped;
+}
+
+
+function crispExportTarget(descriptor, capped, { even = false } = {}) {
+  if (descriptor.samplingKind !== 'crisp') {
+    return {
+      width: capped.width,
+      height: capped.height,
+      normalizedCrop: { u0: 0, v0: 0, u1: 1, v1: 1 },
+      processedCrop: { x: 0, y: 0, width: descriptor.width, height: descriptor.height },
+      integerScale: null,
+    };
+  }
+  const k = Math.floor(Math.min(capped.width / descriptor.width, capped.height / descriptor.height));
+  if (k < 1) throw new Error('masked export target is smaller than the crisp render grid');
+  let cropWidth = descriptor.width;
+  let cropHeight = descriptor.height;
+  if (even && (cropWidth * k) % 2) cropWidth--;
+  if (even && (cropHeight * k) % 2) cropHeight--;
+  if (cropWidth < 1 || cropHeight < 1) throw new Error('crisp video grid is too small for an even H.264 frame');
+  return {
+    width: cropWidth * k,
+    height: cropHeight * k,
+    normalizedCrop: {
+      u0: 0,
+      v0: 0,
+      u1: cropWidth / descriptor.width,
+      v1: cropHeight / descriptor.height,
+    },
+    processedCrop: { x: 0, y: 0, width: cropWidth, height: cropHeight },
+    integerScale: k,
+  };
+}
+
+function buildMaskedExportFrame({
+  processed,
+  descriptor,
+  width,
+  height,
+  normalizedCrop = { u0: 0, v0: 0, u1: 1, v1: 1 },
+  processedCrop = { x: 0, y: 0, width: processed?.width, height: processed?.height },
+  processedAlreadyTarget = false,
+  grainPhase = currentGrainPhase() ?? 0,
+  refH = null,
+  fast = false,
+} = {}) {
+  const [sourceWidth, sourceHeight] = srcDims();
+  const rawTarget = createOwnedCanvas(width, height, 'raw export target');
+  const processedStage = createOwnedCanvas(width, height, 'processed export target');
+  let processedTarget = processedStage;
+  let finalCanvas = null;
+  const compositor = new MaskCompositor();
+  try {
+    const rawContext = rawTarget.getContext('2d');
+    rawContext.imageSmoothingEnabled = true;
+    rawContext.imageSmoothingQuality = 'high';
+    rawContext.drawImage(
+      source.el,
+      normalizedCrop.u0 * sourceWidth,
+      normalizedCrop.v0 * sourceHeight,
+      (normalizedCrop.u1 - normalizedCrop.u0) * sourceWidth,
+      (normalizedCrop.v1 - normalizedCrop.v0) * sourceHeight,
+      0,
+      0,
+      width,
+      height,
+    );
+
+    const processedContext = processedStage.getContext('2d');
+    processedContext.imageSmoothingEnabled = descriptor.samplingKind === 'continuous';
+    processedContext.imageSmoothingQuality = 'high';
+    if (processedAlreadyTarget) processedContext.drawImage(processed, 0, 0, width, height);
+    else {
+      const scaleX = width / processedCrop.width;
+      const scaleY = height / processedCrop.height;
+      if (descriptor.samplingKind === 'crisp'
+          && (!Number.isSafeInteger(scaleX) || scaleX < 1 || scaleX !== scaleY)) {
+        throw new Error('crisp masked export requires one whole-number pixel scale');
+      }
+      processedContext.drawImage(
+        processed,
+        processedCrop.x,
+        processedCrop.y,
+        processedCrop.width,
+        processedCrop.height,
+        0,
+        0,
+        width,
+        height,
+      );
+    }
+
+    const fxResult = applyPostFX(processedStage, state.fx, {
+      grainPhase,
+      refH: refH ?? sourceHeight,
+      fast,
+    });
+    if (fxResult !== processedStage) {
+      processedTarget = createOwnedCanvas(width, height, 'owned post-FX export target');
+      processedTarget.getContext('2d').drawImage(fxResult, 0, 0);
+    }
+
+    finalCanvas = createOwnedCanvas(width, height, 'final masked export');
+    const uniform = maskUniformCoverage();
+    if (uniform === 0) {
+      compositor.copyRaw({ raw: rawTarget, destination: finalCanvas });
+    } else if (uniform === 1) {
+      finalCanvas.getContext('2d').drawImage(processedTarget, 0, 0);
+    } else {
+      const quantization = descriptor.asciiGridInfo
+        ? { kind: 'ascii-grid', ...descriptor.asciiGridInfo }
+        : CONTINUOUS_QUANTIZATION;
+      const effectCoverage = (activeExportMaskRasterizer || maskRasterizer).rasterFor({
+        sourceEpoch,
+        sourceWidth,
+        sourceHeight,
+        revision: currentMaskRevision(),
+        width,
+        height,
+        normalizedCrop,
+        coverageKind: 'effect',
+        quantization,
+      });
+      compositor.compose({
+        processed: processedTarget,
+        raw: rawTarget,
+        effectCoverage,
+        destination: finalCanvas,
+      });
+    }
+
+    const release = () => {
+      compositor.release();
+      releaseOwnedCanvas(rawTarget);
+      releaseOwnedCanvas(processedStage);
+      if (processedTarget !== processedStage) releaseOwnedCanvas(processedTarget);
+      releaseOwnedCanvas(finalCanvas);
+    };
+    return { canvas: finalCanvas, release };
+  } catch (error) {
+    compositor.release();
+    releaseOwnedCanvas(rawTarget);
+    releaseOwnedCanvas(processedStage);
+    if (processedTarget !== processedStage) releaseOwnedCanvas(processedTarget);
+    releaseOwnedCanvas(finalCanvas);
+    throw error;
+  }
+}
+
 async function doExportPNG() {
   if (!source || exporting) return;
-  exporting = true; // block source swaps / concurrent exports mid-encode
+  if (!(await beginExport())) return;
   const exportName = `${source.name || 'ditherlab'}-${state.mode}.png`;
   // deterministic bake: an animated still exports its reference frame, not
   // whatever instant the clock happened to be at when the button was clicked
@@ -797,6 +2036,48 @@ async function doExportPNG() {
     const [w, h] = srcDims();
     toast('Rendering…');
     await new Promise((r) => setTimeout(r, 30)); // let toast paint before a heavy CPU pass
+    if (maskIsActive()) {
+      const requestedArea = Math.min(MAX_MASKED_EXPORT_AREA, Math.max(1, w * h));
+      const preliminaryWidth = state.mode === 'dither' && exportSettings.pngSize === 'source2x' ? w * 2 : w;
+      const preliminaryHeight = state.mode === 'dither' && exportSettings.pngSize === 'source2x' ? h * 2 : h;
+      const preliminaryCap = capMaskedDimensions(preliminaryWidth, preliminaryHeight, { label: 'PNG' });
+      const processed = renderProcessedForExport(
+        state.mode === 'dither'
+          ? Math.min(requestedArea, preliminaryCap.width * preliminaryCap.height)
+          : Math.min(requestedArea / 2, preliminaryCap.width * preliminaryCap.height),
+      );
+      let W = processed.canvas.width;
+      let H = processed.canvas.height;
+      if (state.mode === 'dither') {
+        if (exportSettings.pngSize === 'source') { W = w; H = h; }
+        if (exportSettings.pngSize === 'source2x') { W = w * 2; H = h * 2; }
+      } else if (exportSettings.pngSize === 'source2x') {
+        W = processed.canvas.width * 2;
+        H = processed.canvas.height * 2;
+      }
+      const capped = capMaskedDimensions(W, H, { label: 'PNG' });
+      const target = crispExportTarget(processed.descriptor, capped);
+      W = target.width;
+      H = target.height;
+      const finalized = buildMaskedExportFrame({
+        processed: processed.canvas,
+        descriptor: processed.descriptor,
+        width: W,
+        height: H,
+        normalizedCrop: target.normalizedCrop,
+        processedCrop: target.processedCrop,
+        grainPhase: currentGrainPhase() ?? 0,
+      });
+      try {
+        const blob = await new Promise((resolve) => finalized.canvas.toBlob(resolve, 'image/png'));
+        if (!blob) throw new Error('image too large for this browser');
+        downloadBlob(blob, exportName);
+        toast(`PNG exported · ${W}×${H}`);
+      } finally {
+        finalized.release();
+      }
+      return;
+    }
     const p = derived();
     // Apply the browser's area bound before rendering, not after allocating a
     // potentially enormous work canvas/error buffer. Cell effects may produce
@@ -858,6 +2139,7 @@ async function doExportPNG() {
   } finally {
     if (pinPhase) phaseOverride = null;
     exporting = false;
+    unlockMaskAfterExport();
     dirty = true;
   }
 }
@@ -880,6 +2162,7 @@ function recordCanvasSeconds(secs, filename) {
       stream.getTracks().forEach((tr) => tr.stop());
       hideBusy();
       exporting = false;
+      unlockMaskAfterExport();
       if (cancelled) {
         toast('Recording cancelled');
         return;
@@ -904,6 +2187,7 @@ function recordCanvasSeconds(secs, filename) {
     clearInterval(iv);
     hideBusy();
     exporting = false;
+    unlockMaskAfterExport();
     toast(`Recording failed: ${err.message}`);
   }
 }
@@ -922,13 +2206,72 @@ function mp4RenderBudget() {
   return Math.min(gpuAlgo ? 2_200_000 : EXPORT_PIXELS, longSideArea);
 }
 
+function renderMp4Frame(masked) {
+  if (!masked) {
+    renderOnce(mp4RenderBudget());
+    return out;
+  }
+  const rendered = renderProcessedForExport(mp4RenderBudget());
+  return {
+    canvas: rendered.canvas,
+    meta: {
+      descriptor: rendered.descriptor,
+      grainPhase: currentGrainPhase() ?? 0,
+    },
+  };
+}
+
+function planMaskedMp4Target({ first, frameMeta, defaultTarget, maxSampleBytes }) {
+  const capped = capMaskedDimensions(defaultTarget.width, defaultTarget.height, {
+    reserveBytes: maxSampleBytes,
+    label: 'Video',
+  });
+  const descriptor = frameMeta?.descriptor || exportDescriptor(first);
+  activeMaskedVideoPlan = crispExportTarget(descriptor, capped, { even: true });
+  if (descriptor.samplingKind !== 'crisp') {
+    activeMaskedVideoPlan.width = Math.max(2, activeMaskedVideoPlan.width & ~1);
+    activeMaskedVideoPlan.height = Math.max(2, activeMaskedVideoPlan.height & ~1);
+  }
+  return {
+    width: activeMaskedVideoPlan.width,
+    height: activeMaskedVideoPlan.height,
+    scale: activeMaskedVideoPlan.integerScale ?? defaultTarget.scale,
+  };
+}
+
+function finalizeMp4Frame(processed, { width, height, frameMeta }) {
+  return buildMaskedExportFrame({
+    processed,
+    descriptor: frameMeta?.descriptor || exportDescriptor(processed),
+    width,
+    height,
+    normalizedCrop: activeMaskedVideoPlan?.normalizedCrop,
+    processedCrop: activeMaskedVideoPlan?.processedCrop,
+    grainPhase: frameMeta?.grainPhase ?? currentGrainPhase() ?? 0,
+  });
+}
+
+function abortVideoExport(error) {
+  phaseOverride = null;
+  genPhaseOverride = null;
+  engine.invalidateTemporal();
+  dirty = true;
+  hideBusy();
+  if (exporting) {
+    exporting = false;
+    unlockMaskAfterExport();
+  }
+  toast(`Video export failed: ${error?.message || error}`);
+}
+
 async function doExportVideo() {
   if (!source || exporting) return;
   const isAnimatedImage = source.type === 'animated-image';
   const animatedStill = source.type === 'image' && isAnimating();
   const isGen = source.type === 'gen';
   if (!(source.el instanceof HTMLVideoElement) && !isAnimatedImage && !animatedStill && !isGen) return;
-  exporting = true;
+  if (!(await beginExport())) return;
+  const maskedExport = maskIsActive();
   engine.invalidateTemporal(); // frame 0 of the export must not blend with the preview
 
   let secs = parseInt(exportSettings.recordSeconds, 10) || 5;
@@ -963,7 +2306,7 @@ async function doExportVideo() {
       showBusy('Rendering video (frame-accurate)…', () => { cancelled = true; });
       try {
         await exportLoopFrameAccurate({
-          renderFrame: () => { renderOnce(mp4RenderBudget()); return out; },
+          renderFrame: () => renderMp4Frame(maskedExport),
           setPhase: (f) => {
             if (isGen) genPhaseOverride = (f * genCycles) % 1;
             if (effCycles) phaseOverride = (f * effCycles) % 1;
@@ -972,6 +2315,8 @@ async function doExportVideo() {
           fps,
           name,
           strict: strictFn,
+          planFinalTarget: maskedExport ? planMaskedMp4Target : null,
+          finalizeFrame: maskedExport ? finalizeMp4Frame : null,
           onProgress: busyProgress,
           onInfo: (msg) => toast(msg, 4000),
           shouldAbort: () => cancelled,
@@ -990,13 +2335,19 @@ async function doExportVideo() {
       hideBusy();
       if (!fallbackToRecorder) {
         exporting = false;
+        unlockMaskAfterExport();
         return;
       }
       toast('H.264 unavailable — using real-time recorder', 4000);
       // The failed frame-accurate attempt resized `out` for export. Restore the
       // stable live bitmap before captureStream() starts; resizing a captured
       // canvas mid-recording can glitch or truncate the first frames.
-      renderOnce();
+      try {
+        renderOnce();
+      } catch (error) {
+        abortVideoExport(error);
+        return;
+      }
     }
     recordCanvasSeconds(secs, name);
     return;
@@ -1015,12 +2366,14 @@ async function doExportVideo() {
     try {
       await exportVideoFrameAccurate({
         video: source.el,
-        renderFrame: () => { renderOnce(mp4RenderBudget()); return out; },
+        renderFrame: () => renderMp4Frame(maskedExport),
         name,
         strict: strictFn,
         // true source rate from playback (rVFC mediaTime deltas) — sampling
         // 24fps footage on a 30fps grid bakes 2:3 pulldown judder into the file
         sourceFps: source._frameDurEma ? 1 / source._frameDurEma : 0,
+        planFinalTarget: maskedExport ? planMaskedMp4Target : null,
+        finalizeFrame: maskedExport ? finalizeMp4Frame : null,
         // pattern animation pinned to the VIDEO timeline, not wall clock (the
         // live loop would otherwise advance it while the exporter awaits) —
         // also stops the loop's concurrent renders during the export
@@ -1042,10 +2395,16 @@ async function doExportVideo() {
     hideBusy();
     if (!fallbackToRecorder) {
       exporting = false;
+      unlockMaskAfterExport();
       return;
     }
     toast('H.264 unavailable — using real-time recorder', 4000);
-    renderOnce();
+    try {
+      renderOnce();
+    } catch (error) {
+      abortVideoExport(error);
+      return;
+    }
   }
 
   // Fallback (no WebCodecs): real-time capture, keeps audio.
@@ -1069,11 +2428,13 @@ async function doExportVideo() {
   dirty = true;
   hideBusy();
   exporting = false;
+  unlockMaskAfterExport();
 }
 
 async function doExportGIF() {
   if (!source || exporting) return;
-  exporting = true;
+  if (!(await beginExport())) return;
+  const maskedExport = maskIsActive();
   engine.invalidateTemporal(); // frame 0 of the export must not blend with the preview
   // 'native' = exactly the rendered frame, no resampling
   const maxWidth = exportSettings.gifSize === 'native' ? Infinity : parseInt(exportSettings.gifSize, 10);
@@ -1126,7 +2487,16 @@ async function doExportGIF() {
   const fxOn = Object.values(state.fx).some((v) => v > 0);
   let fxCanvas = null;
   let fxCtx = null;
-  const postProcess = fxOn ? (pixels, gw, gh) => {
+  const gifPostFXRefH = (gw, gh, sizeMeta = null) => {
+    const descriptor = sizeMeta?.frameMeta?.descriptor;
+    const renderedWidth = descriptor?.width || out.width;
+    const renderedHeight = descriptor?.height || out.height;
+    const scale = state.mode === 'dither'
+      ? Math.min(2, Math.max(1, srcDims()[0] / Math.max(1, renderedWidth)))
+      : 1;
+    return (srcDims()[1] || gh) * (gh / Math.max(1, renderedHeight * scale));
+  };
+  const postProcess = (fxOn || maskedExport) ? (pixels, gw, gh, sizeMeta = null) => {
     if (!fxCanvas) {
       fxCanvas = document.createElement('canvas');
       fxCtx = fxCanvas.getContext('2d', { willReadFrequently: true });
@@ -1136,12 +2506,32 @@ async function doExportGIF() {
       fxCanvas.height = gh;
     }
     fxCtx.putImageData(new ImageData(pixels, gw, gh), 0, 0);
+    if (maskedExport) {
+      const finalized = buildMaskedExportFrame({
+        processed: fxCanvas,
+        descriptor: sizeMeta?.frameMeta?.descriptor || {
+          width: gw,
+          height: gh,
+          samplingKind: state.mode === 'dither' && !engine.lastBoxResolved ? 'crisp' : 'continuous',
+          asciiGridInfo: engine.lastAsciiGridInfo,
+        },
+        width: gw,
+        height: gh,
+        normalizedCrop: sizeMeta?.normalizedCrop || { u0: 0, v0: 0, u1: 1, v1: 1 },
+        processedAlreadyTarget: true,
+        grainPhase: sizeMeta?.frameMeta?.grainPhase ?? currentGrainPhase() ?? 0,
+        refH: gifPostFXRefH(gw, gh, sizeMeta),
+      });
+      try {
+        return finalized.canvas.getContext('2d', { willReadFrequently: true })
+          .getImageData(0, 0, gw, gh).data;
+      } finally {
+        finalized.release();
+      }
+    }
     // present() would show this render at out.height * scale with refH=srcH;
     // scale refH by our (smaller) canvas so the fx read proportionally alike
-    const scale = state.mode === 'dither'
-      ? Math.min(2, Math.max(1, srcDims()[0] / out.width))
-      : 1;
-    const refH = (srcDims()[1] || gh) * (gh / (out.height * scale));
+    const refH = gifPostFXRefH(gw, gh, sizeMeta);
     const final = applyPostFX(fxCanvas, state.fx, { grainPhase: currentGrainPhase(), refH });
     return final.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, gw, gh).data;
   } : null;
@@ -1153,7 +2543,20 @@ async function doExportGIF() {
       liveDuration,
       // GIF has no H.264 1920px long-side restriction. Keep the established
       // 1.6MP export budget so wide/native GIFs are not needlessly softened.
-      renderFrame: () => { renderOnce(EXPORT_PIXELS, true, fxOn); return out; },
+      renderFrame: () => {
+        if (maskedExport) {
+          const rendered = renderProcessedForExport(EXPORT_PIXELS);
+          return {
+            canvas: rendered.canvas,
+            meta: {
+              descriptor: rendered.descriptor,
+              grainPhase: currentGrainPhase() ?? 0,
+            },
+          };
+        }
+        renderOnce(EXPORT_PIXELS, true, fxOn);
+        return out;
+      },
       fps,
       maxWidth,
       // dither wants exact pixels UNLESS the render is box-resolved tone
@@ -1180,6 +2583,7 @@ async function doExportGIF() {
   dirty = true; // restore the live preview resolution
   hideBusy();
   exporting = false;
+  unlockMaskAfterExport();
 }
 
 function doExportTxt() {
@@ -1192,7 +2596,9 @@ function doExportTxt() {
       ? parseInt(state.ascii.bg.replace('#', ''), 16)
       : null;
     exportText(buildAnsi(engine.ascii.lastGrid, { defaultBg }), name, 'ans');
-    toast('ANSI text exported — try: cat file.ans');
+    toast(maskIsActive()
+      ? 'ANSI exported · Effect Mask applies only to raster/video output'
+      : 'ANSI text exported — try: cat file.ans');
   } else if (fmt === 'html' && engine.ascii.lastGrid) {
     const f = FONTS[state.ascii.fontId] || FONTS.menlo;
     exportText(buildHtml(engine.ascii.lastGrid, state.ascii.bg, {
@@ -1200,10 +2606,10 @@ function doExportTxt() {
       size: state.ascii.cellSize,
       bold: state.ascii.bold,
     }), name, 'html');
-    toast('HTML exported');
+    toast(maskIsActive() ? 'HTML exported · Effect Mask applies only to raster/video output' : 'HTML exported');
   } else {
     exportText(engine.ascii.lastText, name);
-    toast('ASCII text exported');
+    toast(maskIsActive() ? 'ASCII exported · Effect Mask applies only to raster/video output' : 'ASCII text exported');
   }
   dirty = true; // restore the live preview resolution
 }
@@ -1213,7 +2619,9 @@ exportSettings.onCopyText = () => {
   renderOnce(Infinity, true, false, true);
   dirty = true;
   navigator.clipboard.writeText(engine.ascii.lastText)
-    .then(() => toast('Copied to clipboard'))
+    .then(() => toast(maskIsActive()
+      ? 'Copied full-frame ASCII · Effect Mask applies only to raster/video output'
+      : 'Copied to clipboard'))
     .catch(() => toast('Clipboard unavailable'));
 };
 
@@ -1228,31 +2636,39 @@ function rebuildPanel() {
     isLive: source?.type === 'video' || source?.type === 'webcam',
     gen: source?.type === 'gen' ? source.gen : null,
     onGenChange: () => {
+      if (exporting || maskPriming) return;
       clearActivePreset($('preset-strip'));
       if (source?.type === 'gen') source.name = source.gen.sceneName().toLowerCase();
       updateStatus();
       pushHistory();
+      effectRevision++;
+      frameBundles.invalidate('generative change', { releaseCurrent: false });
       dirty = true;
     },
     onChange: () => {
-      if (exporting) return;
+      if (exporting || maskPriming) return;
       clearActivePreset($('preset-strip'));
       updateExportButtons();
       updateStatus();
       pushHistory();
+      effectRevision++;
+      frameBundles.invalidate('effect change', { releaseCurrent: false });
       dirty = true;
     },
   });
 }
 
 function applyPreset(preset) {
-  if (exporting) return;
+  if (exporting || maskPriming) return;
+  maskEditor.cancelDraft();
   commitHistory(); // land any pending debounced edit first
   resetState(state);
   applyParams(state, preset.params);
   rebuildPanel();
   updateExportButtons();
   updateStatus();
+  effectRevision++;
+  frameBundles.invalidate('preset change', { releaseCurrent: false });
   commitHistory();
   dirty = true;
   toast(preset.name);
@@ -1263,7 +2679,8 @@ thumbCanvases = buildPresetStrip({
   presets: PRESETS,
   onApply: applyPreset,
   onShuffle: () => {
-    if (exporting) return;
+    if (exporting || maskPriming) return;
+    maskEditor.cancelDraft();
     commitHistory();
     clearActivePreset($('preset-strip'));
     resetState(state);
@@ -1271,6 +2688,8 @@ thumbCanvases = buildPresetStrip({
     rebuildPanel();
     updateExportButtons();
     updateStatus();
+    effectRevision++;
+    frameBundles.invalidate('shuffle change', { releaseCurrent: false });
     commitHistory();
     dirty = true;
     toast('Shuffled');
@@ -1339,21 +2758,26 @@ $('btn-webcam').onclick = async () => {
 };
 
 $('btn-reset').onclick = () => {
-  if (exporting) return;
+  if (exporting || maskPriming) return;
+  maskEditor.cancelDraft();
   commitHistory();
   clearActivePreset($('preset-strip'));
   resetState(state);
+  commitMaskProposal(maskStore.proposeReset(maskRevisionId), { addHistory: false });
   Object.assign(exportSettings, EXPORT_DEFAULTS);
   rebuildPanel();
   updateExportButtons();
   updateStatus();
+  effectRevision++;
+  frameBundles.invalidate('reset');
   commitHistory();
   dirty = true;
-  toast('Reset');
+  toast('Reset · mask cleared');
 };
 
 $('btn-shuffle').onclick = () => {
-  if (exporting) return;
+  if (exporting || maskPriming) return;
+  maskEditor.cancelDraft();
   commitHistory();
   clearActivePreset($('preset-strip'));
   resetState(state);
@@ -1361,25 +2785,42 @@ $('btn-shuffle').onclick = () => {
   rebuildPanel();
   updateExportButtons();
   updateStatus();
+  effectRevision++;
+  frameBundles.invalidate('shuffle change', { releaseCurrent: false });
   commitHistory(); // discrete action: its own undo step, never merged with the next edit
   dirty = true;
   toast('Shuffled');
 };
 
 // hold-to-compare
-const startCompare = (e) => { if (exporting) return; e.preventDefault(); comparing = true; dirty = true; };
-const endCompare = () => { if (comparing) { comparing = false; dirty = true; } };
+const startCompare = (e) => {
+  if (exporting || maskPriming || maskEditor.hasDraft) return;
+  e.preventDefault();
+  comparing = true;
+  maskEditor.setComparing(true);
+  dirty = true;
+};
+const endCompare = () => {
+  if (comparing) {
+    comparing = false;
+    maskEditor.setComparing(false);
+    if (frameBundles.current && maskIsActive()) presentMaskedBundle();
+    else dirty = true;
+  }
+};
 $('btn-compare').addEventListener('mousedown', startCompare);
 $('btn-compare').addEventListener('touchstart', startCompare, { passive: false });
 window.addEventListener('mouseup', endCompare);
 window.addEventListener('touchend', endCompare);
 window.addEventListener('blur', endCompare); // keyup can be lost on window switch
+window.addEventListener('blur', () => maskEditor.handleBlur());
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') endCompare();
 });
 
 window.addEventListener('keydown', (e) => {
-  if (exporting) return;
+  if (maskEditor.handleKeyDown(e)) return;
+  if (exporting || maskPriming) return;
   const active = document.activeElement;
   const tag = active?.tagName;
   const textEditable = tag === 'TEXTAREA'
@@ -1405,10 +2846,13 @@ window.addEventListener('keydown', (e) => {
   if (e.key === '1') view.actualSize();
   if (e.key === 's') $('btn-split').click();
 });
-window.addEventListener('keyup', (e) => { if (e.key === 'c') endCompare(); });
+window.addEventListener('keyup', (e) => {
+  if (maskEditor.handleKeyUp(e)) return;
+  if (e.key === 'c') endCompare();
+});
 
 $('btn-export-png').onclick = doExportPNG;
-$('btn-export-video').onclick = doExportVideo;
+$('btn-export-video').onclick = () => { void doExportVideo().catch(abortVideoExport); };
 $('btn-export-gif').onclick = doExportGIF;
 $('btn-export-txt').onclick = doExportTxt;
 
@@ -1418,6 +2862,8 @@ function togglePlay() {
   const el = source.el;
   if (el.paused) { el.play(); $('btn-play').textContent = '❚❚'; }
   else { el.pause(); $('btn-play').textContent = '▶'; }
+  transportRevision++;
+  frameBundles.invalidate('transport change', { releaseCurrent: false });
   // Paused error-diffusion is allowed a higher-detail still render; resuming
   // returns to the pixel-size-aware live budget. Force either transition to
   // replace the previous-size worker result immediately.
@@ -1434,13 +2880,17 @@ $('seek').addEventListener('input', () => {
   const el = source.el;
   if (isFinite(el.duration) && el.duration) {
     el.currentTime = (parseInt($('seek').value, 10) / 1000) * el.duration;
+    transportRevision++;
     updateVideoTime(el);
     dirty = true;
   }
 });
 $('speed').addEventListener('change', () => {
   if (exporting) return;
-  if (source?.el instanceof HTMLVideoElement) source.el.playbackRate = parseFloat($('speed').value);
+  if (source?.el instanceof HTMLVideoElement) {
+    source.el.playbackRate = parseFloat($('speed').value);
+    transportRevision++;
+  }
 });
 
 // drag & drop + paste
@@ -1524,6 +2974,17 @@ window.__dl = {
   setGenPhase(ph) { genPhaseOverride = ph; dirty = true; },
   clearGenPhase() { genPhaseOverride = null; dirty = true; },
   get source() { return source; },
+  get mask() {
+    return {
+      revisionId: maskRevisionId,
+      uniformCoverage: maskUniformCoverage(),
+      draft: !!maskDraft,
+      editorDraft: maskEditor.hasDraft,
+      liveSession: !!liveMaskSession,
+      exporting,
+    };
+  },
+  get maskTimings() { return { effectRenderMs, bundleBuildMs, maskCompositeMs }; },
   engine,
   state,
 };

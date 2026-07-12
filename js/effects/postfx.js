@@ -69,6 +69,14 @@ let glowFilterDiv = -1;
 // Deterministic frame counter so video grain animates
 let frameCounter = 0;
 
+const fxEnabled = (fx) => !!fx && (
+    (+fx.vignette || 0) > 0 ||
+    (+fx.scanlines || 0) > 0 ||
+    (+fx.grain || 0) > 0 ||
+    (+fx.chromatic || 0) > 0 ||
+    (+fx.glow || 0) > 0
+);
+
 // ---------------------------------------------------------------------------
 // Stage helpers
 // ---------------------------------------------------------------------------
@@ -313,4 +321,51 @@ export function applyPostFX(srcCanvas, fx, opts = {}) {
     if (vignette > 0) drawVignette(w, h, vignette);
 
     return out;
+}
+
+/**
+ * Estimate the persistent Canvas2D backing-store bytes needed by the active
+ * Post-FX stages at a target size. The estimate intentionally excludes the
+ * caller-owned source canvas and includes only module-owned surfaces.
+ */
+export function estimatePostFXBytes(width, height, fx, { fast = false } = {}) {
+    if (!fxEnabled(fx) || width <= 0 || height <= 0) return 0;
+    const full = width * height * 4;
+    let bytes = full; // returned composite
+    if ((+fx.chromatic || 0) > 0) bytes += full; // isolated channel scratch
+    if ((+fx.glow || 0) > 0) {
+        const div = fast ? 4 : 1;
+        bytes += Math.max(1, Math.round(width / div))
+            * Math.max(1, Math.round(height / div)) * 4;
+    }
+    // Grain/scanline tiles are small but real and remain allocated.
+    if ((+fx.grain || 0) > 0) bytes += GRAIN_SIZE * GRAIN_SIZE * 4;
+    if ((+fx.scanlines || 0) > 0) {
+        const spacing = Math.max(2, Math.round(height / 270));
+        bytes += 4 * spacing * 6 * 4;
+    }
+    return bytes;
+}
+
+/** Release target-sized Post-FX backing stores after source/export teardown. */
+export function releasePostFXBuffers() {
+    out.width = 0;
+    out.height = 0;
+    chan.width = 0;
+    chan.height = 0;
+    soft.width = 0;
+    soft.height = 0;
+    grainPattern = null;
+    grainPatternK = -1;
+    scanTile = null;
+    scanPattern = null;
+    scanSpacing = 0;
+    vigGrad = null;
+    vigW = 0;
+    vigH = 0;
+    vigV = -1;
+    glowFilter = '';
+    glowFilterGlow = -1;
+    glowFilterK = -1;
+    glowFilterDiv = -1;
 }

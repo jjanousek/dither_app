@@ -8,11 +8,12 @@ const MAX_ZOOM = 32;
 const PADDING = 48;
 
 export class Viewport {
-  constructor({ viewport, stack, output, divider, onChange }) {
+  constructor({ viewport, stack, output, divider, comparison = null, onChange }) {
     this.el = viewport;
     this.stack = stack;
     this.output = output;
     this.divider = divider;
+    this.comparison = comparison || stack.querySelector?.('#compare-canvas') || null;
     this.onChange = onChange || (() => {});
 
     this.zoom = 1;
@@ -24,6 +25,14 @@ export class Viewport {
 
     this.splitOn = false;
     this.splitFrac = 0.5;
+    this.splitSuppressed = false;
+
+    // Optional editor/tool surface. Viewport remains the sole pointer
+    // dispatcher: a tool can claim a pointer, request the normal pan path, or
+    // consume an event, but it never installs a competing viewport drag loop.
+    this.toolRouter = null;
+    this._toolPointers = new Set();
+    this._transformListeners = new Set();
 
     this.#bind();
   }
@@ -34,6 +43,49 @@ export class Viewport {
     this.stack.style.transform = `translate(${this.tx}px, ${this.ty}px) scale(${this.zoom})`;
     this.#positionDivider();
     this.onChange(this.zoom);
+    for (const listener of this._transformListeners) listener(this);
+  }
+
+  onTransform(listener) {
+    this._transformListeners.add(listener);
+    return () => this._transformListeners.delete(listener);
+  }
+
+  setToolRouter(router) {
+    this.toolRouter = router || null;
+  }
+
+  clientToContent(clientX, clientY) {
+    const rect = this.el.getBoundingClientRect();
+    const viewportX = clientX - rect.left;
+    const viewportY = clientY - rect.top;
+    return {
+      viewportX,
+      viewportY,
+      x: (viewportX - this.tx) / this.zoom,
+      y: (viewportY - this.ty) / this.zoom,
+    };
+  }
+
+  clientToNormalized(clientX, clientY) {
+    const point = this.clientToContent(clientX, clientY);
+    const width = this.output.width;
+    const height = this.output.height;
+    const u = width ? point.x / width : 0;
+    const v = height ? point.y / height : 0;
+    return {
+      ...point,
+      u,
+      v,
+      inside: width > 0 && height > 0 && u >= 0 && u <= 1 && v >= 0 && v <= 1,
+    };
+  }
+
+  panBy(dx, dy) {
+    this.tx += dx;
+    this.ty += dy;
+    this.fitMode = false;
+    this.apply();
   }
 
   fit() {
@@ -94,13 +146,25 @@ export class Viewport {
   // ---- split ---------------------------------------------------------------
 
   setSplit(on) {
-    this.splitOn = on;
-    this.divider.hidden = !on;
+    this.splitOn = !!on;
+    this.#syncSplitVisibility();
     this.#positionDivider();
   }
 
+  setSplitSuppressed(on) {
+    this.splitSuppressed = !!on;
+    this.#syncSplitVisibility();
+    this.#positionDivider();
+  }
+
+  #syncSplitVisibility() {
+    const hidden = !this.splitOn || this.splitSuppressed;
+    this.divider.hidden = hidden;
+    if (this.comparison) this.comparison.hidden = hidden;
+  }
+
   #positionDivider() {
-    if (!this.splitOn) return;
+    if (!this.splitOn || this.splitSuppressed) return;
     const x = this.tx + this.splitFrac * this.output.width * this.zoom;
     this.divider.style.left = `${x}px`;
   }
@@ -109,8 +173,12 @@ export class Viewport {
 
   #bind() {
     const el = this.el;
+    const isViewportControl = (target) => !!target?.closest?.(
+      '[data-viewport-control], #zoom-controls, #split-divider, #busy',
+    );
 
     el.addEventListener('wheel', (e) => {
+      if (isViewportControl(e.target)) return;
       e.preventDefault();
       const rect = el.getBoundingClientRect();
       const cx = e.clientX - rect.left;
@@ -128,17 +196,43 @@ export class Viewport {
       }
     }, { passive: false });
 
-    // pan drag
+    // One routed drag surface for both tools and the legacy pan interaction.
     let panning = null;
-    el.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      if (e.target.closest('#zoom-controls, #split-divider, #busy')) return;
+    const beginPan = (e) => {
       e.preventDefault(); // stop WebKit from starting a text-selection drag
       panning = { id: e.pointerId, x: e.clientX, y: e.clientY, tx: this.tx, ty: this.ty };
       el.classList.add('panning');
-      el.setPointerCapture(e.pointerId);
+      try { el.setPointerCapture(e.pointerId); } catch { /* unavailable */ }
+    };
+    el.addEventListener('pointerdown', (e) => {
+      if (isViewportControl(e.target)) return;
+      const point = this.clientToNormalized(e.clientX, e.clientY);
+      const route = this.toolRouter?.pointerDown?.(e, point, this) || null;
+      if (route === 'tool') {
+        e.preventDefault();
+        this._toolPointers.add(e.pointerId);
+        try { el.setPointerCapture(e.pointerId); } catch { /* unavailable */ }
+        return;
+      }
+      if (route === 'consume') {
+        e.preventDefault();
+        return;
+      }
+      if (route === 'pan') {
+        beginPan(e);
+        return;
+      }
+      if (e.button !== 0) return;
+      beginPan(e);
     });
     el.addEventListener('pointermove', (e) => {
+      const point = this.clientToNormalized(e.clientX, e.clientY);
+      if (this._toolPointers.has(e.pointerId)) {
+        e.preventDefault();
+        this.toolRouter?.pointerMove?.(e, point, this);
+        return;
+      }
+      this.toolRouter?.pointerHover?.(e, point, this);
       if (!panning || e.pointerId !== panning.id) return;
       e.preventDefault();
       this.tx = panning.tx + (e.clientX - panning.x);
@@ -147,16 +241,40 @@ export class Viewport {
       this.apply();
     });
     const endPan = (e) => {
-      if (!panning) return;
+      if (!panning || (e?.pointerId !== undefined && e.pointerId !== panning.id)) return;
       panning = null;
       el.classList.remove('panning');
-      try { el.releasePointerCapture(e.pointerId); } catch { /* released */ }
+      try { el.releasePointerCapture(e?.pointerId); } catch { /* released */ }
     };
-    el.addEventListener('pointerup', endPan);
-    el.addEventListener('pointercancel', endPan);
+    el.addEventListener('pointerup', (e) => {
+      if (this._toolPointers.delete(e.pointerId)) {
+        this.toolRouter?.pointerUp?.(e, this.clientToNormalized(e.clientX, e.clientY), this);
+        try { el.releasePointerCapture(e.pointerId); } catch { /* released */ }
+        return;
+      }
+      endPan(e);
+    });
+    el.addEventListener('pointercancel', (e) => {
+      if (this._toolPointers.delete(e.pointerId)) {
+        this.toolRouter?.pointerCancel?.(e, this.clientToNormalized(e.clientX, e.clientY), this);
+        try { el.releasePointerCapture(e.pointerId); } catch { /* released */ }
+        return;
+      }
+      endPan(e);
+    });
+    el.addEventListener('pointerleave', (e) => {
+      if (!this._toolPointers.has(e.pointerId)) this.toolRouter?.pointerLeave?.(e, this);
+    });
+    el.addEventListener('contextmenu', (e) => {
+      if (this.toolRouter?.contextMenu?.(e, this)) e.preventDefault();
+    });
 
     el.addEventListener('dblclick', (e) => {
-      if (e.target.closest('#zoom-controls, #split-divider, #busy')) return;
+      if (isViewportControl(e.target)) return;
+      if (this.toolRouter?.doubleClick?.(e, this)) {
+        e.preventDefault();
+        return;
+      }
       if (this.fitMode) this.actualSize();
       else this.fit();
     });
@@ -197,6 +315,11 @@ export class Viewport {
 
     // lost focus mid-drag: never leave a drag armed
     const cancelDrags = () => {
+      this.toolRouter?.blur?.('window', this);
+      for (const pointerId of this._toolPointers) {
+        try { el.releasePointerCapture(pointerId); } catch { /* released */ }
+      }
+      this._toolPointers.clear();
       if (panning) { panning = null; el.classList.remove('panning'); }
       splitDrag = false;
     };

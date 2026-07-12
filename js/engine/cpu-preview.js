@@ -26,6 +26,10 @@ export class CpuPreview {
     this.cctx = this.committed.getContext('2d');
     this._timer = null;            // watchdog: reply never comes -> fall back to sync
     this.pending = false;          // new content arrived while the worker was busy
+    // Detailed render clients consume worker landings exactly once. The canvas
+    // is still borrowed/mutable; callers that retain it must copy immediately.
+    this._landed = null;
+    this._inFlight = null;
   }
 
   #ensure() {
@@ -47,6 +51,8 @@ export class CpuPreview {
     this.state = 'failed';
     this.busy = false;
     this.pending = false;
+    this._landed = null;
+    this._inFlight = null;
     clearTimeout(this._timer);
     // A failed/hung module worker otherwise stays retained for the lifetime of
     // the editor even though every subsequent frame uses the sync fallback.
@@ -62,6 +68,17 @@ export class CpuPreview {
   invalidate() {
     this.epoch++;      // in-flight replies carry the old epoch -> discarded
     this.pending = false;
+    this._landed = null;
+    this._inFlight = null;
+  }
+
+  // Consume the most recent worker landing once. Legacy callers never need
+  // this; Engine.renderDetailed() uses it to pair the borrowed processed canvas
+  // with the raw snapshot captured when that exact job was accepted.
+  takeCommittedResult() {
+    const landed = this._landed;
+    this._landed = null;
+    return landed;
   }
 
   #commit(imgData, w, h, epoch) {
@@ -78,9 +95,18 @@ export class CpuPreview {
   #onMessage(data) {
     this.busy = false;
     clearTimeout(this._timer);
-    const { buffer, w, h, epoch } = data;
+    const { buffer, w, h, epoch, token = null } = data;
+    const accepted = this._inFlight;
+    this._inFlight = null;
     if (epoch !== this.epoch) return; // settings changed since dispatch — discard
     this.#commit(new ImageData(new Uint8ClampedArray(buffer), w, h), w, h, epoch);
+    if (accepted || token !== null) {
+      this._landed = {
+        canvas: this.committed,
+        token: token ?? accepted?.token ?? null,
+        descriptor: accepted?.descriptor ?? { width: w, height: h, samplingKind: 'crisp', asciiGridInfo: null },
+      };
+    }
     if (this.onResult) this.onResult();
   }
 
@@ -88,10 +114,14 @@ export class CpuPreview {
   // `img` is a real, already-adjusted ImageData at the work size. `contentNew`
   // is true when this render was triggered by genuinely new content (a user
   // change / new video frame / animation tick) vs a worker-completion wake-up.
-  render(img, w, h, palette, kernelId, opts, sig, ctx, contentNew) {
+  render(img, w, h, palette, kernelId, opts, sig, ctx, contentNew, detail = null) {
     this.#ensure();
     if (this.state !== 'ready') return null;
     if (sig !== this.sig) { this.sig = sig; this.epoch++; }
+    const detailed = !!detail;
+    const descriptor = detailed
+      ? (detail.descriptor ?? { width: w, height: h, samplingKind: 'crisp', asciiGridInfo: null })
+      : null;
 
     // Cold start, or size/settings change: dither this frame synchronously so
     // the on-screen result is always current and correctly sized. Then async
@@ -101,7 +131,9 @@ export class CpuPreview {
       ctx.putImageData(img, 0, 0);
       this.#commit(img, w, h, this.epoch);
       this.pending = false;
-      return this.committed;
+      return detailed
+        ? { canvas: this.committed, rendered: true, acceptedJob: null }
+        : this.committed;
     }
 
     // Steady state: new content marks work pending; dispatch the CURRENT frame
@@ -110,18 +142,31 @@ export class CpuPreview {
     // the preview never settles on a stale frame. The transferred buffer means
     // `img` must not be used afterwards; we return the committed result.
     if (contentNew) this.pending = true;
+    let acceptedJob = null;
     if (this.pending && !this.busy) {
+      if (detailed) {
+        const planned = detail?.makeAcceptedJob?.(descriptor) ?? null;
+        acceptedJob = planned ? { ...planned, descriptor } : { token: null, targetPlan: null, descriptor };
+      }
       this.pending = false;
       this.busy = true;
-      this.worker.postMessage(
-        { buffer: img.data.buffer, w, h, palette, kernelId, opts, epoch: this.epoch },
-        [img.data.buffer],
-      );
+      if (detailed) {
+        this._inFlight = {
+          epoch: this.epoch,
+          token: acceptedJob.token,
+          descriptor,
+        };
+      }
+      const message = { buffer: img.data.buffer, w, h, palette, kernelId, opts, epoch: this.epoch };
+      if (detailed) message.token = acceptedJob.token;
+      this.worker.postMessage(message, [img.data.buffer]);
       // If a reply never lands (worker module failed to load / hung), give up
       // on the worker and fall back to the synchronous path — never freeze.
       clearTimeout(this._timer);
       this._timer = setTimeout(() => this.#fail(), 2000);
     }
-    return this.committed;
+    return detailed
+      ? { canvas: this.committed, rendered: false, acceptedJob }
+      : this.committed;
   }
 }

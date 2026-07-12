@@ -57,6 +57,10 @@
         <svg viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M8 1.5v13"/></svg>
         <span>Split</span>
       </button>
+      <button id="btn-mask" class="btn" title="Edit Effect Mask (B)" aria-label="Edit Effect Mask" aria-pressed="false" hidden>
+        <svg viewBox="0 0 16 16"><path d="m10.8 2.1 3.1 3.1-7.4 7.4-3.8.7.7-3.8Z"/><path d="m9.6 3.3 3.1 3.1M2.7 13.3l-1.1 1.1"/></svg>
+        <span>Mask</span>
+      </button>
     </div>
 
     <div class="tb-group tb-right">
@@ -73,6 +77,7 @@
         <div id="canvas-stack">
           <canvas id="output"></canvas>
           <canvas id="compare-canvas" hidden></canvas>
+          <canvas id="mask-overlay" hidden aria-hidden="true"></canvas>
         </div>
         <div id="split-divider" hidden>
           <div class="split-labels"><span>before</span><span>after</span></div>
@@ -90,6 +95,41 @@
           </button>
           <button id="zoom-100" class="zbtn" title="Actual pixels (1)">1:1</button>
         </div>
+        <div id="mask-cursor" hidden aria-hidden="true"><div id="mask-cursor-core"></div></div>
+        <div id="mask-brush-bar" role="toolbar" aria-label="Effect Mask brush controls" data-viewport-control hidden>
+          <div class="mask-segment" role="group" aria-label="Brush operation">
+            <button id="mask-tool-paint" class="mask-segment-btn active" type="button" aria-pressed="true">Paint</button>
+            <button id="mask-tool-erase" class="mask-segment-btn" type="button" aria-pressed="false">Erase</button>
+          </div>
+          <label class="mask-range" for="mask-size">
+            <span>Size</span>
+            <input id="mask-size" type="range" min="0.005" max="0.4" step="0.001" value="0.06">
+            <output id="mask-size-value" for="mask-size">6%</output>
+          </label>
+          <label class="mask-range" for="mask-feather">
+            <span>Feather</span>
+            <input id="mask-feather" type="range" min="0" max="1" step="0.01" value="0.3">
+            <output id="mask-feather-value" for="mask-feather">30%</output>
+          </label>
+          <div class="mask-placement">
+            <span class="mask-placement-label">Painted shows</span>
+            <div class="mask-segment" role="group" aria-label="What painted areas show">
+              <button id="mask-show-original" class="mask-segment-btn active" type="button" aria-pressed="true">Original</button>
+              <button id="mask-show-effect" class="mask-segment-btn" type="button" aria-pressed="false">Effect</button>
+            </div>
+          </div>
+          <details id="mask-actions" class="mask-actions">
+            <summary class="btn">Actions</summary>
+            <div class="mask-actions-menu" role="menu">
+              <button id="mask-clear-paint" type="button" role="menuitem">Clear paint</button>
+              <button id="mask-effect-everywhere" type="button" role="menuitem">Effect everywhere</button>
+              <button id="mask-original-everywhere" type="button" role="menuitem">Original everywhere</button>
+            </div>
+          </details>
+          <button id="mask-done" class="btn" type="button">Done</button>
+          <div id="mask-editor-hint" class="mask-editor-hint">Paint to reveal original · ⌥ drag to erase · Space drag to pan</div>
+        </div>
+        <div id="mask-priming" role="status" aria-live="polite" data-viewport-control hidden>Preparing mask…</div>
         <div id="drop-hint"><span class="kbd-hint">drop an image or video · paste from clipboard · drag to pan · scroll to zoom</span></div>
         <div id="busy" hidden><div class="busy-box"><div id="busy-label">Exporting…</div><div class="busy-bar"><div id="busy-fill"></div></div><button id="busy-cancel" class="btn">Cancel</button></div></div>
       </div>
@@ -111,6 +151,7 @@
 
       <div id="status-bar">
         <span id="st-left">—</span>
+        <button id="mask-status" class="status-chip" type="button" hidden></button>
         <span id="st-right"></span>
       </div>
     </section>
