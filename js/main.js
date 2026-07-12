@@ -26,6 +26,7 @@ import {
 } from './mask/rasterizer.js';
 import { MaskCompositor } from './mask/compositor.js';
 import { MaskEditor } from './mask/tools.js';
+import { syncRangeProgress } from './range-progress.js';
 import {
   FrameBundleManager,
   MAX_MASK_PREVIEW_AREA,
@@ -87,6 +88,7 @@ let maskDirty = false;
 let overlayDirty = true;
 let maskDraft = null;
 let liveMaskSession = null;
+let appliedMaskDraft = null;
 let fastMaskPreview = null;
 let liveDraftStrokeId = null;
 let draftEffectCanvas = null;
@@ -385,8 +387,9 @@ function presentFastMaskPreview() {
   const width = preview.targetWidth;
   const height = preview.targetHeight;
   const uniform = maskDraft ? null : maskUniformCoverage();
-  setOutputSize(width, height);
+  const resized = setOutputSize(width, height);
   ensureLiveMaskSessionSize(width, height);
+  if (maskDraft) flushLiveMaskDraft();
 
   let effectCoverage = null;
   if (uniform !== 0 && uniform !== 1) {
@@ -423,9 +426,11 @@ function presentFastMaskPreview() {
   out.classList.add('mask-fast-overlay');
   out.classList.remove('pixelated');
   maskDirty = false;
-  overlayDirty = true;
   maskCompositeMs = performance.now() - started;
-  syncMaskEditor();
+  if (resized) {
+    overlayDirty = true;
+    syncMaskEditor();
+  }
   if (view.splitOn && !view.splitSuppressed && !comparing && !exporting) drawSplitOverlay();
   return true;
 }
@@ -516,14 +521,42 @@ function ensureLiveMaskSessionSize(width, height) {
   if (selection.width === width && selection.height === height) return;
   liveMaskSession.rollback();
   liveMaskSession = null;
-  const session = startLiveMaskSession(maskDraft);
-  session?.applySegment({
-    id: liveDraftStrokeId,
-    operation: maskDraft.operation,
-    radiusShortNorm: maskDraft.radiusShortNorm,
-    feather: maskDraft.feather,
-    points: Float32Array.from(maskDraft.points),
-  });
+  appliedMaskDraft = null;
+  flushLiveMaskDraft();
+}
+
+function flushLiveMaskDraft() {
+  if (!maskDraft) return liveMaskSession;
+  const session = liveMaskSession || startLiveMaskSession(maskDraft);
+  if (!session) {
+    maskDraft = null;
+    liveDraftStrokeId = null;
+    overlayDirty = true;
+    queueMicrotask(() => maskEditor.cancelDraft());
+    return null;
+  }
+  if (appliedMaskDraft === maskDraft) return session;
+  try {
+    session.applySegment({
+      id: maskDraft.id,
+      operation: maskDraft.operation,
+      radiusShortNorm: maskDraft.radiusShortNorm,
+      feather: maskDraft.feather,
+      points: Float32Array.from(maskDraft.points),
+    });
+    appliedMaskDraft = maskDraft;
+    return session;
+  } catch (error) {
+    session.rollback();
+    liveMaskSession = null;
+    appliedMaskDraft = null;
+    maskDraft = null;
+    liveDraftStrokeId = null;
+    overlayDirty = true;
+    toast(`Mask unavailable: ${error.message}`);
+    queueMicrotask(() => maskEditor.cancelDraft());
+    return null;
+  }
 }
 
 function setOutputSize(width, height) {
@@ -533,8 +566,10 @@ function setOutputSize(width, height) {
     out.height = height;
     resized = true;
   }
-  maskEditor.onOutputResized(width, height);
-  if (resized) view.contentResized();
+  if (resized) {
+    maskEditor.onOutputResized(width, height);
+    view.contentResized();
+  }
   return resized;
 }
 
@@ -556,8 +591,9 @@ function presentMaskedBundle(bundle = frameBundles.current) {
       return false;
     }
   }
-  setOutputSize(bundle.targetWidth, bundle.targetHeight);
+  const resized = setOutputSize(bundle.targetWidth, bundle.targetHeight);
   ensureLiveMaskSessionSize(bundle.targetWidth, bundle.targetHeight);
+  if (maskDraft) flushLiveMaskDraft();
   if (uniform === 0) {
     maskCompositor.copyRaw({ raw: bundle.rawTarget, destination: out });
   } else if (uniform === 1) {
@@ -612,8 +648,10 @@ function presentMaskedBundle(bundle = frameBundles.current) {
   if (view.splitOn && !view.splitSuppressed && !comparing && !exporting) drawSplitOverlay();
   maskDirty = false;
   maskCompositeMs = performance.now() - started;
-  overlayDirty = true;
-  syncMaskEditor();
+  if (resized) {
+    overlayDirty = true;
+    syncMaskEditor();
+  }
   return true;
 }
 
@@ -624,6 +662,7 @@ function updateMaskOverlay() {
     return;
   }
   try {
+    if (maskDraft) flushLiveMaskDraft();
     if (liveMaskSession) {
       maskEditor.setOverlayRaster(liveMaskSession.selectionCanvas());
       return;
@@ -670,8 +709,10 @@ function startLiveMaskSession(draft) {
       height: out.height,
       normalizedCrop: { u0: 0, v0: 0, u1: 1, v1: 1 },
     });
+    appliedMaskDraft = null;
   } catch (error) {
     liveMaskSession = null;
+    appliedMaskDraft = null;
     toast(`Mask unavailable: ${error.message}`);
   }
   return liveMaskSession;
@@ -679,27 +720,11 @@ function startLiveMaskSession(draft) {
 
 function setMaskDraft(draft) {
   const needsFirstPrime = !!draft && maskBypassed() && !frameBundles.current;
+  if (!draft && maskDraft) flushLiveMaskDraft();
   maskDraft = draft;
   if (draft) {
     if (liveDraftStrokeId == null) liveDraftStrokeId = maskStore.nextStrokeId();
     draft.id = liveDraftStrokeId;
-    const session = liveMaskSession || startLiveMaskSession(draft);
-    if (!session) {
-      maskDraft = null;
-      liveDraftStrokeId = null;
-      overlayDirty = true;
-      queueMicrotask(() => maskEditor.cancelDraft());
-      return;
-    }
-    if (session) {
-      session.applySegment({
-        id: draft.id,
-        operation: draft.operation,
-        radiusShortNorm: draft.radiusShortNorm,
-        feather: draft.feather,
-        points: Float32Array.from(draft.points),
-      });
-    }
   }
   overlayDirty = true;
   if (frameBundles.current || fastMaskPreview) maskDirty = true;
@@ -714,6 +739,7 @@ function setMaskDraft(draft) {
 function rollbackMaskDraft() {
   liveMaskSession?.rollback();
   liveMaskSession = null;
+  appliedMaskDraft = null;
   releaseDraftEffectCanvas();
   liveDraftStrokeId = null;
   maskDraft = null;
@@ -770,6 +796,7 @@ function commitMaskProposal(proposal, { addHistory = true } = {}) {
   if (proposal.kind === 'stroke' && liveMaskSession) liveMaskSession.commit(revision);
   else liveMaskSession?.rollback();
   liveMaskSession = null;
+  appliedMaskDraft = null;
   releaseDraftEffectCanvas();
   liveDraftStrokeId = null;
   maskDraft = null;
@@ -1304,7 +1331,7 @@ function present(result, srcW, offline = false, noFx = false) {
     resized = true;
   }
   octx.drawImage(final, 0, 0);
-  maskEditor.onOutputResized(out.width, out.height);
+  if (resized) maskEditor.onOutputResized(out.width, out.height);
   // Crisp dither wants nearest-neighbour upscaling (sharp dots); a box-resolved
   // (tone) result should scale smoothly. Use the engine's ACTUAL last-frame
   // state so a CPU algorithm, WebGL loss, or governor ss->1 (all crisp) keep
@@ -1312,8 +1339,10 @@ function present(result, srcW, offline = false, noFx = false) {
   const pixelate = state.mode === 'dither' && !engine.lastBoxResolved;
   out.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
-  syncMaskEditor();
-  overlayDirty = true;
+  if (resized) {
+    syncMaskEditor();
+    overlayDirty = true;
+  }
   // not during exports: out is at export resolution and the overlay is hidden
   // behind the busy screen anyway
   if (view.splitOn && !view.splitSuppressed && !comparing && !exporting) drawSplitOverlay();
@@ -1503,6 +1532,7 @@ const fmtTime = (s) => {
 function updateVideoTime(video) {
   const text = `${fmtTime(video.currentTime)} / ${fmtTime(video.duration)}`;
   if ($('time').textContent !== text) $('time').textContent = text;
+  syncRangeProgress($('seek'));
 }
 
 function updateStatus() {
@@ -1767,6 +1797,7 @@ function setSource(next) {
   maskCompositor.release();
   releasePostFXBuffers();
   liveMaskSession = null;
+  appliedMaskDraft = null;
   liveDraftStrokeId = null;
   maskDraft = null;
   maskDirty = false;
@@ -2848,6 +2879,7 @@ function rebuildPanel() {
       clearActivePreset($('preset-strip'));
       updateExportButtons();
       updateStatus();
+      syncMaskEditor();
       pushHistory();
       effectRevision++;
       frameBundles.invalidate('effect change', { releaseCurrent: false });
@@ -2865,6 +2897,7 @@ function applyPreset(preset) {
   rebuildPanel();
   updateExportButtons();
   updateStatus();
+  syncMaskEditor();
   effectRevision++;
   frameBundles.invalidate('preset change', { releaseCurrent: false });
   commitHistory();
@@ -2886,6 +2919,7 @@ thumbCanvases = buildPresetStrip({
     rebuildPanel();
     updateExportButtons();
     updateStatus();
+    syncMaskEditor();
     effectRevision++;
     frameBundles.invalidate('shuffle change', { releaseCurrent: false });
     commitHistory();
@@ -2966,6 +3000,7 @@ $('btn-reset').onclick = () => {
   rebuildPanel();
   updateExportButtons();
   updateStatus();
+  syncMaskEditor();
   effectRevision++;
   frameBundles.invalidate('reset');
   commitHistory();
@@ -2983,6 +3018,7 @@ $('btn-shuffle').onclick = () => {
   rebuildPanel();
   updateExportButtons();
   updateStatus();
+  syncMaskEditor();
   effectRevision++;
   frameBundles.invalidate('shuffle change', { releaseCurrent: false });
   commitHistory(); // discrete action: its own undo step, never merged with the next edit
@@ -3111,6 +3147,7 @@ if (bootPreset) {
   rebuildPanel();
   updateExportButtons();
   updateStatus();
+  syncMaskEditor();
   document.querySelector(`.preset-card[data-id="${bootPreset.id}"]`)?.classList.add('active');
 }
 const genParam = qp.get('gen');

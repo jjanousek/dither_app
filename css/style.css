@@ -225,11 +225,12 @@ main { display: flex; height: calc(100% - 52px); }
   height: 24px;
   border: 1.5px solid #fff;
   border-radius: 50%;
-  transform: translate(-50%, -50%);
+  transform: translate3d(-100px, -100px, 0) translate(-50%, -50%);
   pointer-events: none;
-  mix-blend-mode: difference;
   z-index: 17;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85), 0 0 0 2px rgba(255, 255, 255, 0.5);
+  contain: layout paint;
+  will-change: transform;
 }
 #mask-cursor.eraser { border-style: dashed; }
 #mask-cursor-core {
@@ -258,8 +259,7 @@ main { display: flex; height: calc(100% - 52px); }
   padding: 7px;
   border: 1px solid var(--border-strong);
   border-radius: 12px;
-  background: rgba(14, 14, 20, 0.9);
-  backdrop-filter: blur(9px);
+  background: rgba(14, 14, 20, 0.97);
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.46);
 }
 #mask-brush-bar[hidden], #mask-cursor[hidden], #mask-priming[hidden],
@@ -683,7 +683,7 @@ main { display: flex; height: calc(100% - 52px); }
 }
 
 input[type='range'] {
-  --p: 50;
+  --p: 0;
   flex: 1;
   appearance: none;
   height: 3px;

@@ -2,6 +2,8 @@
 // state only; canonical mask revisions, history, rendering and exports stay in
 // the app orchestrator and are reached exclusively through callbacks.
 
+import { syncRangeProgress } from '../range-progress.js';
+
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const noop = () => {};
 
@@ -713,6 +715,8 @@ export class MaskEditor {
       e.sizeValue.textContent = px ? `${px}px` : `${Math.round(this.diameterShortNorm * 100)}%`;
     }
     if (e.featherValue) e.featherValue.textContent = `${Math.round(this.feather * 100)}%`;
+    syncRangeProgress(e.size);
+    syncRangeProgress(e.feather);
 
     if (e.status) {
       e.status.hidden = this.uniformCoverage === 1;
@@ -751,10 +755,11 @@ export class MaskEditor {
       outputHeight: this.outputHeight || this.view.output?.height,
       zoom: this.view.zoom,
     });
-    cursor.style.left = `${point.viewportX}px`;
-    cursor.style.top = `${point.viewportY}px`;
-    cursor.style.width = `${Math.max(2, size.width)}px`;
-    cursor.style.height = `${Math.max(2, size.height)}px`;
+    cursor.style.transform = `translate3d(${point.viewportX}px, ${point.viewportY}px, 0) translate(-50%, -50%)`;
+    const cursorWidth = `${Math.max(2, size.width)}px`;
+    const cursorHeight = `${Math.max(2, size.height)}px`;
+    if (cursor.style.width !== cursorWidth) cursor.style.width = cursorWidth;
+    if (cursor.style.height !== cursorHeight) cursor.style.height = cursorHeight;
     const cursorOperation = this.draft?.operation || resolveStrokeOperation(
       { altKey: point.altKey }, this.selectedTool, this.optionHeld,
     );
@@ -762,8 +767,9 @@ export class MaskEditor {
     const core = this.elements.cursorCore;
     if (core) {
       const fraction = Math.max(0, 1 - this.feather);
-      core.style.width = `${fraction * 100}%`;
-      core.style.height = `${fraction * 100}%`;
+      const coreSize = `${fraction * 100}%`;
+      if (core.style.width !== coreSize) core.style.width = coreSize;
+      if (core.style.height !== coreSize) core.style.height = coreSize;
     }
   }
 }

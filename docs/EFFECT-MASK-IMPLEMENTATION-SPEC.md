@@ -199,6 +199,7 @@ Recommended v1 values:
 
 - Size: diameter from 0.5% to 40% of the source's shorter side; default 6%.
 - Feather: 0% to 100%; default 30%. Higher values paint broad, blurry mask lines for a softer, more organic/interwoven transition.
+- Size, Feather, and video seek tracks derive their filled percentage from `(value - min) / (max - min)` after both pointer and programmatic updates; the visual fill, thumb, numeric label, and actual value must agree.
 - No pressure, tilt, or stroke-opacity control in v1.
 - Tool configuration is session UI state, not effect state and not an undo entry.
 
@@ -210,9 +211,11 @@ While editing:
 
 - `#mask-overlay` tints painted selection `s`, regardless of placement.
 - The tint explains “this is what you painted”; placement explains what it means.
-- Overlay opacity is approximately 35% accent color.
+- Overlay opacity is approximately 18% accent color so the underlying composition remains judgeable.
 - The overlay lives in `#canvas-stack`, inherits zoom/pan, and always has `pointer-events: none`.
 - A DOM ring cursor displays brush diameter and feather core; eraser is dashed.
+- Static video playback does not repaint the guide canvas. Invalidate it only for a mask/editor/target-size change.
+- Avoid moving-video backdrop filters and blend modes in the editor chrome. Move the cursor with a compositor transform rather than changing layout coordinates.
 - The cursor grows on screen when zooming because brush size is source-relative.
 - Radius and feather are captured at pointerdown and remain fixed for that stroke.
 
@@ -808,6 +811,8 @@ Uniform full-effect coverage adds only one branch check. It must not:
 ### 11.2 Mask-only editing
 
 - Incrementally stamp only the new stroke segment into the live mask raster.
+- Coalesce raw pointer samples and update the live coverage canvas at most once per animation frame; pointer frequency must not trigger full-raster conversions.
+- Reuse one live `ImageData` buffer for the stroke instead of allocating a target-sized RGBA array on every update.
 - Re-finalize the latest owned bundle without running Engine or Post FX.
 - Do not dispatch a CPU worker job.
 - Do not update renderer or cadence governor EMAs.

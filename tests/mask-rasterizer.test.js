@@ -17,9 +17,11 @@ class PixelContext {
   constructor(canvas) {
     this.canvas = canvas;
     this.image = null;
+    this.imageAllocations = 0;
   }
 
   createImageData(width, height) {
+    this.imageAllocations++;
     return { width, height, data: new Uint8ClampedArray(width * height * 4) };
   }
 
@@ -243,6 +245,7 @@ test('live incremental raster commits the same alpha as a full deterministic rep
 
   const expected = rasterizeSelectionData({ ...request, revision });
   assert.deepEqual(alphaBytes(committed), Array.from(expected, (value) => Math.round(value * 255)));
+  assert.equal(committed.context.imageAllocations, 1, 'live updates reuse one ImageData buffer');
 });
 
 test('live raster replays the committed revision when pointer-up simplification changes points', () => {

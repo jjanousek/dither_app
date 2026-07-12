@@ -7,6 +7,7 @@ import { ALGORITHMS, getAlgorithm } from './engine/engine.js';
 import { PALETTES, getPalette } from './palettes.js';
 import { RAMPS, FONTS } from './engine/ascii.js';
 import { GEN_SCENES } from './generate.js';
+import { syncRangeProgress } from './range-progress.js';
 
 // ---------- tiny component helpers ----------
 
@@ -72,8 +73,7 @@ function slider(body, label, { min, max, step = 1, value, fmt = (v) => v, oninpu
   input.max = max;
   input.step = step;
   input.value = value;
-  const fill = () => input.style.setProperty('--p', ((parseFloat(input.value) - min) / (max - min)) * 100);
-  fill();
+  syncRangeProgress(input);
   const val = document.createElement('span');
   val.className = 'value';
   // Range inputs clamp an out-of-range shared state value immediately (for
@@ -83,7 +83,7 @@ function slider(body, label, { min, max, step = 1, value, fmt = (v) => v, oninpu
   input.addEventListener('input', () => {
     const v = parseFloat(input.value);
     val.textContent = fmt(v);
-    fill();
+    syncRangeProgress(input);
     oninput(v);
   });
   associateRowLabel(r, input);

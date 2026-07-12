@@ -1,6 +1,6 @@
 // Deterministic source-space Effect Mask rasterization and byte-budgeted cache.
 
-import { brushAlpha, iterateRevisionStrokes, selectionAfterAdd, selectionAfterErase } from './model.js';
+import { iterateRevisionStrokes } from './model.js';
 import { getBlueNoise } from '../engine/bluenoise.js';
 
 export const FULL_CROP = Object.freeze({ u0: 0, v0: 0, u1: 1, v1: 1 });
@@ -224,20 +224,34 @@ function applyStampToSelection(selection, request, stroke, stampU, stampV) {
   const maxX = Math.min(width - 1, Math.ceil(centerX + radiusX) + 1);
   const minY = Math.max(0, Math.floor(centerY - radiusY) - 1);
   const maxY = Math.min(height - 1, Math.ceil(centerY + radiusY) + 1);
+  const cropWidth = crop.u1 - crop.u0;
+  const cropHeight = crop.v1 - crop.v0;
+  const feather = Math.min(1, Math.max(0, stroke.feather));
+  const hardness = 1 - feather;
+  const hardnessSquared = hardness * hardness;
+  const erase = stroke.operation === 'erase';
 
   for (let y = minY; y <= maxY; y++) {
-    const sampleV = crop.v0 + ((y + 0.5) / height) * (crop.v1 - crop.v0);
+    const sampleV = crop.v0 + ((y + 0.5) / height) * cropHeight;
     const dy = (sampleV - stampV) * sourceHeight;
+    const dyNorm = dy / radiusSrc;
+    const dySquared = dyNorm * dyNorm;
     for (let x = minX; x <= maxX; x++) {
-      const sampleU = crop.u0 + ((x + 0.5) / width) * (crop.u1 - crop.u0);
+      const sampleU = crop.u0 + ((x + 0.5) / width) * cropWidth;
       const dx = (sampleU - stampU) * sourceWidth;
-      const distance = Math.hypot(dx, dy) / radiusSrc;
-      if (distance > 1) continue;
-      const alpha = brushAlpha(distance, stroke.feather);
+      const dxNorm = dx / radiusSrc;
+      const distanceSquared = dxNorm * dxNorm + dySquared;
+      if (distanceSquared > 1) continue;
+      let alpha = 1;
+      if (feather > 0 && distanceSquared > hardnessSquared) {
+        const t = (Math.sqrt(distanceSquared) - hardness) / feather;
+        alpha = 1 - t * t * (3 - 2 * t);
+      }
       const offset = y * width + x;
-      selection[offset] = stroke.operation === 'erase'
-        ? selectionAfterErase(selection[offset], alpha)
-        : selectionAfterAdd(selection[offset], alpha);
+      const selected = selection[offset];
+      selection[offset] = erase
+        ? selected * (1 - alpha)
+        : alpha + selected * (1 - alpha);
     }
   }
 }
@@ -335,10 +349,12 @@ export function rasterizeCoverageData(rawRequest, blueNoise = getBlueNoise()) {
     : effectDataFromSelection(selection, request.revision.placement);
 }
 
-function writeCoverageCanvas(canvas, coverage, width, height) {
+function writeCoverageCanvas(canvas, coverage, width, height, reusableImage = null) {
   const context = canvas.getContext('2d');
   if (!context) throw new Error('Could not acquire a 2D mask context');
-  const image = typeof context.createImageData === 'function'
+  const image = reusableImage?.width === width && reusableImage?.height === height
+    ? reusableImage
+    : typeof context.createImageData === 'function'
     ? context.createImageData(width, height)
     : { width, height, data: new Uint8ClampedArray(width * height * 4) };
   for (let i = 0, pixel = 0; pixel < coverage.length; pixel++, i += 4) {
@@ -498,7 +514,11 @@ export class LiveRasterSession {
     this._stampPrefix = new Float32Array(0);
     this._draftStyle = null;
     this._closed = false;
-    writeCoverageCanvas(this.canvas, this.selection, request.width, request.height);
+    const context = this.canvas.getContext('2d');
+    this._image = typeof context?.createImageData === 'function'
+      ? context.createImageData(request.width, request.height)
+      : { width: request.width, height: request.height, data: new Uint8ClampedArray(request.width * request.height * 4) };
+    writeCoverageCanvas(this.canvas, this.selection, request.width, request.height, this._image);
   }
 
   applySegment(strokeDraft) {
@@ -542,7 +562,7 @@ export class LiveRasterSession {
     this._appliedStamps = stamps.length / 2;
     this._stampPrefix = stamps;
     this._lastDraft = strokeDraft;
-    writeCoverageCanvas(this.canvas, this.selection, this.request.width, this.request.height);
+    writeCoverageCanvas(this.canvas, this.selection, this.request.width, this.request.height, this._image);
     return this.canvas;
   }
 
@@ -585,7 +605,7 @@ export class LiveRasterSession {
     } else {
       this.selection = rasterizeSelectionData(request);
     }
-    writeCoverageCanvas(this.canvas, this.selection, request.width, request.height);
+    writeCoverageCanvas(this.canvas, this.selection, request.width, request.height, this._image);
     const key = makeRasterCacheKey(request);
     this.rasterizer._cachePut(key, this.canvas, request.width * request.height * 4);
     this._closed = true;
