@@ -1,0 +1,12 @@
+{
+  "score": 95,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [],
+  "suggestions": [],
+  "reasoning": "The regenerated current-policy sheet shows Dots and Mosaic cleanly at 3px and seam-free LEGO at 4px. Voxel, LED, and Lattice remain recognizable at their intentional 6px quality/performance floor, and no panel is blank, clipped, or corrupted.",
+  "threshold": 90,
+  "threshold_pass": true,
+  "generated_screenshot": "qa-artifacts/regression-cell-minima.png",
+  "next_actions": []
+}

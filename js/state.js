@@ -11,6 +11,19 @@ export const MODES = [
   { id: 'mosaic', name: 'Mosaic' },
 ];
 
+// Smallest size that still preserves each renderer's visual identity. These
+// are mode-specific: dots/mosaic survive finer grids, while lattice becomes a
+// line field below 6px. UI and engine both use this table so presets/history
+// cannot bypass the quality floor.
+export const CELL_SIZE_MIN = Object.freeze({
+  dots: 3,
+  lego: 4,
+  voxel: 6,
+  led: 6,
+  lattice: 6,
+  mosaic: 3,
+});
+
 export const DEFAULTS = {
   mode: 'dither',
 
@@ -60,7 +73,7 @@ export const DEFAULTS = {
 
   // --- cell effects (dots/lego/voxel/led/lattice/mosaic) ---
   cells: {
-    size: 14,              // px per cell, 6..40
+    size: 14,              // px per cell; minimum depends on mode (3..6)
     fill: 0.75,            // 0..1 coverage
     scatter: 0,            // 0..1 jitter
     colorMode: 'source',   // 'source' | 'duotone'

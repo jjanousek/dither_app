@@ -11,7 +11,8 @@
 //            dithering of the dot bitmap
 //
 // All renderers record lastText (plain) and lastGrid (per-cell char + colors)
-// for TXT / ANSI / HTML export.
+// for TXT / ANSI / HTML export by default. Live-preview callers can pass
+// captureMetadata:false to skip those export-only allocations for a frame.
 
 export const RAMPS = {
   classic: { name: 'Classic 10', chars: '@%#*+=-:. ' },
@@ -180,8 +181,13 @@ export class AsciiRenderer {
   }
 
   #finish(lines, grid) {
-    this.lastText = lines.join('\n');
-    this.lastGrid = grid;
+    // A metadata-free preview leaves the most recent captured snapshot intact.
+    // This lets callers opt out frame-by-frame without invalidating an export
+    // snapshot, and (more importantly) avoids the join and all row/cell arrays.
+    if (lines !== null) {
+      this.lastText = lines.join('\n');
+      this.lastGrid = grid;
+    }
     return this.canvas;
   }
 
@@ -355,7 +361,7 @@ export class AsciiRenderer {
   #renderRamp(imageData, opts) {
     const {
       chars, cellSize, font, colorMode, fg, bg, invertRamp,
-      dither, edgeStrength, autoContrast,
+      dither, edgeStrength, autoContrast, captureMetadata = true,
     } = opts;
     const { width: cols, height: rows, data } = imageData;
 
@@ -411,33 +417,35 @@ export class AsciiRenderer {
     const uniform = this.lastUniform;
     const ctx = this.#beginDraw(cols, rows, cellW, cellH, font, bg);
 
-    const lines = [];
-    const grid = [];
+    const lines = captureMetadata ? [] : null;
+    const grid = captureMetadata ? [] : null;
     if (colorMode === 'mono' && uniform) {
       ctx.fillStyle = fg;
       const fgInt = hexToInt(fg);
       for (let y = 0; y < rows; y++) {
         let line = '';
-        const grow = [];
+        const grow = captureMetadata ? [] : null;
         for (let x = 0; x < cols; x++) {
           const ch = picks[y * cols + x];
           line += ch;
-          grow.push([ch, fgInt, null]);
+          if (captureMetadata) grow.push([ch, fgInt, null]);
         }
-        lines.push(line);
-        grid.push(grow);
+        if (captureMetadata) {
+          lines.push(line);
+          grid.push(grow);
+        }
         ctx.fillText(line, 0, y * cellH);
       }
     } else {
       const fgInt = hexToInt(fg);
       for (let y = 0; y < rows; y++) {
-        let line = '';
-        const grow = [];
+        let line = captureMetadata ? '' : null;
+        const grow = captureMetadata ? [] : null;
         for (let x = 0; x < cols; x++) {
           const j = y * cols + x;
           const i = j * 4;
           const ch = picks[j];
-          line += ch;
+          if (captureMetadata) line += ch;
           if (colorMode === 'bg') {
             const rgb = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
             ctx.fillStyle = intToCss(rgb);
@@ -447,22 +455,24 @@ export class AsciiRenderer {
             const ink = LUMA(data[i], data[i + 1], data[i + 2]) / 255 > 0.5 ? 0x000000 : 0xffffff;
             ctx.fillStyle = intToCss(ink);
             ctx.fillText(ch, x * cellW, y * cellH);
-            grow.push([ch, ink, rgb]);
+            if (captureMetadata) grow.push([ch, ink, rgb]);
           } else if (colorMode === 'fg') {
             const rgb = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
             if (ch !== ' ') {
               ctx.fillStyle = intToCss(rgb);
               ctx.fillText(ch, x * cellW, y * cellH);
             }
-            grow.push([ch, rgb, null]);
+            if (captureMetadata) grow.push([ch, rgb, null]);
           } else {
             ctx.fillStyle = fg;
             if (ch !== ' ') ctx.fillText(ch, x * cellW, y * cellH);
-            grow.push([ch, fgInt, null]);
+            if (captureMetadata) grow.push([ch, fgInt, null]);
           }
         }
-        lines.push(line);
-        grid.push(grow);
+        if (captureMetadata) {
+          lines.push(line);
+          grid.push(grow);
+        }
       }
     }
     return this.#finish(lines, grid);
@@ -474,6 +484,7 @@ export class AsciiRenderer {
   #renderShape(imageData, opts) {
     const {
       cellSize, font, colorMode, fg, bg, invertRamp, autoContrast, shapeSet,
+      captureMetadata = true,
     } = opts;
     const W = imageData.width;   // cols * 8
     const H = imageData.height;  // rows * 8
@@ -495,21 +506,19 @@ export class AsciiRenderer {
     const ctx = this.#beginDraw(cols, rows, cellW, cellH, font, bg);
 
     const fgInt = hexToInt(fg);
-    const bgInt = hexToInt(bg);
     const K = 8; // candidates refined after Hamming prefilter
-    const lines = [];
-    const grid = [];
+    const lines = captureMetadata ? [] : null;
+    const grid = captureMetadata ? [] : null;
 
     // scratch
     const px = new Float32Array(64 * 3);
-    const plum = new Float32Array(64);
     const candIdx = new Int16Array(K);
     const candHam = new Uint8Array(K);
     const candInv = new Uint8Array(K);
 
     for (let cy = 0; cy < rows; cy++) {
-      let line = '';
-      const grow = [];
+      let line = captureMetadata ? '' : null;
+      const grow = captureMetadata ? [] : null;
       for (let cx = 0; cx < cols; cx++) {
         // gather 64 pixels
         let minL = 1, maxL = 0, minI = 0, maxI = 0, sumL = 0;
@@ -522,7 +531,6 @@ export class AsciiRenderer {
             px[k * 3 + 1] = data[di + 1];
             px[k * 3 + 2] = data[di + 2];
             const l = lumAll[si];
-            plum[k] = l;
             sumL += l;
             if (l < minL) { minL = l; minI = k; }
             if (l > maxL) { maxL = l; maxI = k; }
@@ -643,8 +651,10 @@ export class AsciiRenderer {
           }
         }
 
-        line += ch;
-        grow.push([ch, cellFg, cellBg]);
+        if (captureMetadata) {
+          line += ch;
+          grow.push([ch, cellFg, cellBg]);
+        }
         if (cellBg !== null && cellBg !== undefined) {
           ctx.fillStyle = intToCss(cellBg);
           ctx.fillRect(cx * cellW, cy * cellH, Math.ceil(cellW), cellH);
@@ -654,8 +664,10 @@ export class AsciiRenderer {
           ctx.fillText(ch, cx * cellW, cy * cellH);
         }
       }
-      lines.push(line);
-      grid.push(grow);
+      if (captureMetadata) {
+        lines.push(line);
+        grid.push(grow);
+      }
     }
     return this.#finish(lines, grid);
   }
@@ -666,7 +678,7 @@ export class AsciiRenderer {
   #renderQuadrant(imageData, opts) {
     const {
       cellSize, font, colorMode, fg, bg, invertRamp,
-      dither, dotThreshold, autoContrast,
+      dither, dotThreshold, autoContrast, captureMetadata = true,
     } = opts;
     const W = imageData.width;  // cols * 2
     const H = imageData.height; // rows * 2
@@ -686,12 +698,12 @@ export class AsciiRenderer {
     // mono / fg modes: dot bitmap from dithered luminance
     const bits = colorMode === 'bg' ? null : this.#ditherBits(lum, W, H, dotThreshold, dither);
 
-    const lines = [];
-    const grid = [];
+    const lines = captureMetadata ? [] : null;
+    const grid = captureMetadata ? [] : null;
     const SUB = [[0, 0, 1], [1, 0, 2], [0, 1, 4], [1, 1, 8]]; // dx, dy, bit
     for (let cy = 0; cy < rows; cy++) {
-      let line = '';
-      const grow = [];
+      let line = captureMetadata ? '' : null;
+      const grow = captureMetadata ? [] : null;
       for (let cx = 0; cx < cols; cx++) {
         let ch, cellFg = fgInt, cellBg = null;
         if (colorMode === 'bg') {
@@ -740,8 +752,10 @@ export class AsciiRenderer {
           if (colorMode === 'fg' && n) cellFg = rgbInt(rs / n, gs / n, bs / n);
         }
 
-        line += ch;
-        grow.push([ch, cellFg, cellBg]);
+        if (captureMetadata) {
+          line += ch;
+          grow.push([ch, cellFg, cellBg]);
+        }
         if (cellBg !== null) {
           ctx.fillStyle = intToCss(cellBg);
           ctx.fillRect(cx * cellW, cy * cellH, Math.ceil(cellW), cellH);
@@ -754,8 +768,10 @@ export class AsciiRenderer {
           ctx.fillRect(cx * cellW, cy * cellH, Math.ceil(cellW), cellH);
         }
       }
-      lines.push(line);
-      grid.push(grow);
+      if (captureMetadata) {
+        lines.push(line);
+        grid.push(grow);
+      }
     }
     return this.#finish(lines, grid);
   }
@@ -766,7 +782,7 @@ export class AsciiRenderer {
   #renderBraille(imageData, opts) {
     const {
       cellSize, font, colorMode, fg, bg, invertRamp,
-      dither, dotThreshold, autoContrast,
+      dither, dotThreshold, autoContrast, captureMetadata = true,
     } = opts;
     const W = imageData.width;  // cols * 2
     const H = imageData.height; // rows * 4
@@ -785,11 +801,12 @@ export class AsciiRenderer {
     const ctx = this.#beginDraw(cols, rows, cellW, cellH, font, bg);
     const fgInt = hexToInt(fg);
 
-    const lines = [];
-    const grid = [];
+    const lines = captureMetadata ? [] : null;
+    const grid = captureMetadata ? [] : null;
+    const needLine = captureMetadata || colorMode === 'mono';
     for (let cy = 0; cy < rows; cy++) {
-      let line = '';
-      const grow = [];
+      let line = needLine ? '' : null;
+      const grow = captureMetadata ? [] : null;
       for (let cx = 0; cx < cols; cx++) {
         let mask = 0;
         let rs = 0, gs = 0, bs = 0, n = 0;
@@ -805,7 +822,7 @@ export class AsciiRenderer {
           }
         }
         const ch = String.fromCharCode(0x2800 | mask);
-        line += ch;
+        if (needLine) line += ch;
         let cellFg = fgInt, cellBg = null;
         if (colorMode === 'bg') {
           let tr = 0, tg = 0, tb = 0;
@@ -831,10 +848,12 @@ export class AsciiRenderer {
             ctx.fillText(ch, cx * cellW, cy * cellH);
           }
         }
-        grow.push([ch, cellFg, cellBg]);
+        if (captureMetadata) grow.push([ch, cellFg, cellBg]);
       }
-      lines.push(line);
-      grid.push(grow);
+      if (captureMetadata) {
+        lines.push(line);
+        grid.push(grow);
+      }
       if (colorMode === 'mono') {
         ctx.fillStyle = fg;
         if (this.lastUniform) {

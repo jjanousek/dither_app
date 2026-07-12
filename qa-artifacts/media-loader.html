@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Ditherlab media QA harness</title>
+<style>
+  html, body, iframe { width: 100%; height: 100%; margin: 0; border: 0; }
+</style>
+<iframe id="app" title="Ditherlab QA"></iframe>
+<script>
+  const params = new URLSearchParams(location.search);
+  const asset = new URL(params.get('asset') || '/assets/demo.jpg', location.origin);
+  const asset2 = params.get('asset2') ? new URL(params.get('asset2'), location.origin) : null;
+  if (asset.origin !== location.origin) throw new Error('QA assets must be same-origin');
+  if (asset2 && asset2.origin !== location.origin) throw new Error('QA assets must be same-origin');
+
+  const frame = document.getElementById('app');
+  frame.src = '/';
+  frame.addEventListener('load', async () => {
+    try {
+      const deadline = performance.now() + 10_000;
+      while (typeof frame.contentWindow.__dlNativePaste !== 'function') {
+        if (performance.now() > deadline) throw new Error('Ditherlab test hook did not load');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      await frame.contentWindow.__dlNativePaste(asset.href);
+      if (asset2) {
+        await new Promise((resolve) => setTimeout(resolve, Number(params.get('delay')) || 10));
+        await frame.contentWindow.__dlNativePaste(asset2.href);
+      }
+      document.body.dataset.ready = 'true';
+    } catch (error) {
+      document.body.dataset.error = error.message;
+    }
+  });
+</script>

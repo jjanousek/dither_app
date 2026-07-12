@@ -8,14 +8,16 @@ import { RAMPS, FONTS } from './engine/ascii.js';
 import { applyPostFX } from './effects/postfx.js';
 import { PRESETS, shuffleParams } from './presets.js';
 import { loadFile, openWebcam, demoImage, demoPhoto, bindDropAndPaste } from './sources.js';
-import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob, canFrameExport, exportVideoFrameAccurate } from './export/exporters.js';
+import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob, canFrameExport, exportVideoFrameAccurate, exportLoopFrameAccurate } from './export/exporters.js';
 import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js';
 import { Viewport } from './view.js';
 import { GenerativeSource } from './generate.js';
+import { LIVE_CPU_DITHER_BUDGETS, liveCpuDitherBudget } from './preview-policy.js';
 
-const MAX_LIVE_PIXELS = 420_000;   // default live budget (cells / non-shape ASCII)
-const MAX_LIVE_CPU_PIXELS = 200_000; // tighter cap for the slow CPU live paths
+const MAX_LIVE_PIXELS = LIVE_CPU_DITHER_BUDGETS.balanced; // cells / non-shape ASCII
+const MAX_LIVE_CPU_PIXELS = LIVE_CPU_DITHER_BUDGETS.coarse; // shape ASCII / coarse CPU dither
 const MAX_LIVE_GPU_PIXELS = 2_250_000; // GPU dithers are cheap at any size — enough for true native 1080p (2.07MP)
+const MAX_STILL_PREVIEW_PIXELS = 1_250_000; // high-detail stills; bounded below runaway source sizes
 const LIVE_FX_PIXELS = 2_250_000;  // cap on the live post-FX compositing area (Canvas2D raster)
 const EXPORT_PIXELS = 1_600_000;   // GIF/text exports render finer than the live preview
 const MAX_EXPORT_SIDE = 16384;     // canvas hard limits (Chromium/WebKit)
@@ -33,9 +35,11 @@ const cctx = cmp.getContext('2d');
 const engine = new Engine();
 const thumbEngine = new Engine();
 const state = createState();
-const exportSettings = { pngSize: 'source', gifSize: '480', recordSeconds: '5', txtFormat: 'plain' };
+const EXPORT_DEFAULTS = Object.freeze({ pngSize: 'source', gifSize: '480', recordSeconds: '5', txtFormat: 'plain' });
+const exportSettings = { ...EXPORT_DEFAULTS };
 
 let source = null;
+let sourceLoadToken = 0;
 let dirty = true;
 let comparing = false;
 let exporting = false;
@@ -43,6 +47,7 @@ let scrubbing = false;
 let fpsEma = 0;
 let lastFrameT = 0;
 let fpsText = '';
+let lastStatusT = 0;
 // Sustained-load governor: if a smoothed video render can't keep up, pull the
 // supersample factor down BEFORE touching base resolution — dropping
 // resolution is the opposite of what someone complaining about grain wants.
@@ -155,16 +160,20 @@ function deriveParams(s) {
     : (RAMPS[s.ascii.rampId] || RAMPS.classic).chars;
   return { ...s, colors, ascii: { ...s.ascii, chars: ramp } };
 }
-const derived = () => ({
-  ...deriveParams(state),
-  animPhase: phaseOverride ?? animPhase,
-  // still images can cache their downsampled base across animation frames
-  staticSource: source?.type === 'image',
-  // temporal/denoise pre-pass runs only for genuinely live sources
-  liveSource: source?.type === 'video' || source?.type === 'webcam',
-  // exports always render at full supersampling; only the live loop degrades
-  ssCap: exporting ? 3 : governorSsCap,
-});
+const derived = (captureMetadata = false) => {
+  const p = deriveParams(state);
+  return {
+    ...p,
+    ascii: { ...p.ascii, captureMetadata },
+    animPhase: phaseOverride ?? animPhase,
+    // still images can cache their downsampled base across animation frames
+    staticSource: source?.type === 'image',
+    // temporal/denoise pre-pass runs only for genuinely live sources
+    liveSource: source?.type === 'video' || source?.type === 'webcam',
+    // exports always render at full supersampling; only the live loop degrades
+    ssCap: exporting ? 3 : governorSsCap,
+  };
+};
 
 function srcDims() {
   if (!source) return [0, 0];
@@ -176,14 +185,16 @@ function srcDims() {
 // ---------------------------------------------------------------------------
 // render + present
 // ---------------------------------------------------------------------------
-function renderOnce(budgetOverride = null, contentNew = true) {
+function renderOnce(budgetOverride = null, contentNew = true, noFx = false, captureMetadata = false) {
   const [w, h] = srcDims();
   if (!w || !h) return out;
   if (source.type === 'gen') source.gen.tick(genPhaseOverride ?? source.gen.phase);
-  const p = derived();
-  // live sources AND animated stills render every frame -> cap the CPU budget
-  const capped = source.type !== 'image' || isAnimating();
-  let budget = capped ? MAX_LIVE_PIXELS : Infinity;
+  const p = derived(captureMetadata);
+  // Preview work is bounded for every source, including large still images.
+  // Exports pass an explicit budget and remain full quality. At fit-to-window
+  // sizes 0.42MP already exceeds the editor viewport; GPU dithers get 2.25MP
+  // so pixel-size 1 and fine smooth grain stay crisp on Retina displays.
+  let budget = MAX_LIVE_PIXELS;
   // CPU error-diffusion and ASCII shape-matching are the slow live paths
   // (heavy per-pixel/per-cell JS, several times slower in WebKit). Cap them
   // harder on live video/webcam so scrubbing stays smooth — exports use
@@ -191,10 +202,18 @@ function renderOnce(budgetOverride = null, contentNew = true) {
   // cost ~the same at 0.4MP or 2MP (the shader is the bottleneck, not the
   // pixel count), so give them a much finer live budget — the dither pattern
   // on video is then crisp instead of chunky at pixel-size 1.
-  if (budgetOverride === null && capped && source.type !== 'image') {
+  if (budgetOverride === null) {
     const cpuDither = state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'cpu';
     const heavyAscii = state.mode === 'ascii' && state.ascii.renderer === 'shape';
-    if (cpuDither || heavyAscii) budget = MAX_LIVE_CPU_PIXELS;
+    const videoMoving = source.el instanceof HTMLVideoElement
+      && (!source.el.paused && !source.el.ended);
+    const inherentlyMoving = source.type === 'webcam'
+      || source.type === 'gen'
+      || source.type === 'animated-image';
+    const moving = videoMoving || inherentlyMoving || isAnimating();
+    if (moving && cpuDither) budget = liveCpuDitherBudget(state.pixelSize);
+    else if (moving && heavyAscii) budget = MAX_LIVE_CPU_PIXELS;
+    else if (!moving && state.mode !== 'dither') budget = MAX_STILL_PREVIEW_PIXELS;
     else if (state.mode === 'dither') budget = MAX_LIVE_GPU_PIXELS;
   }
   // Only the live preview (no budget override, not exporting) may run the CPU
@@ -206,7 +225,7 @@ function renderOnce(budgetOverride = null, contentNew = true) {
   // uncapped, deterministic rendition.
   p.liveRender = budgetOverride === null;
   const result = engine.render(source.el, w, h, p, budgetOverride ?? budget, allowAsync, contentNew);
-  if (result) present(result, w, h, budgetOverride !== null);
+  if (result) present(result, w, budgetOverride !== null, noFx);
   return out;
 }
 
@@ -215,8 +234,10 @@ function renderOnce(budgetOverride = null, contentNew = true) {
 // run through the live loop with exporting=true, and the presented canvas must
 // keep its exact live size/appearance — a mid-stream resize glitches the
 // recording.
-function present(result, srcW, offline = false) {
-  const fxOn = Object.values(state.fx).some((v) => v > 0);
+// noFx = present the raw render without the post-FX stack (the GIF exporter
+// applies fx itself, AFTER decimation, at the GIF's own resolution).
+function present(result, srcW, offline = false, noFx = false) {
+  const fxOn = !noFx && Object.values(state.fx).some((v) => v > 0);
   let final = result;
   if (fxOn) {
     // applied/ideal upscale ratio — compensates refH when the budget forces a
@@ -275,27 +296,25 @@ function present(result, srcW, offline = false) {
 }
 
 function presentOriginal() {
-  const [w, h] = srcDims();
-  if (!w || !h) return;
-  let resized = false;
-  if (out.width !== w || out.height !== h) {
-    out.width = w;
-    out.height = h;
-    resized = true;
-  }
-  octx.drawImage(source.el, 0, 0, w, h);
+  const [srcW, srcH] = srcDims();
+  if (!srcW || !srcH || !out.width || !out.height) return;
+  // Compare at the processed preview's bitmap size. Drawing a 48MP original
+  // into a native-size canvas only to CSS-shrink it wastes memory and causes a
+  // visible zoom jump; this is screen-identical at the current view scale.
+  octx.drawImage(source.el, 0, 0, out.width, out.height);
   out.classList.remove('pixelated');
-  if (resized) view.contentResized();
   if (view.splitOn) cctx.clearRect(0, 0, cmp.width, cmp.height);
 }
 
 // Draw the untouched source over the left part of the frame (split view).
 function drawSplitOverlay() {
   if (!source) return;
-  const [w, h] = srcDims();
-  if (!w || !h) return;
-  // full source resolution, CSS-scaled onto the output's layout box so the
-  // "before" pane stays sharp at any zoom
+  const [srcW, srcH] = srcDims();
+  const w = out.width;
+  const h = out.height;
+  if (!srcW || !srcH || !w || !h) return;
+  // Match the processed bitmap. A native 48MP comparison overlay consumed
+  // hundreds of MB even though it occupied the same screen pixels as `out`.
   if (cmp.width !== w || cmp.height !== h) {
     cmp.width = w;
     cmp.height = h;
@@ -305,7 +324,7 @@ function drawSplitOverlay() {
   cctx.clearRect(0, 0, w, h);
   const frac = view.splitFrac;
   if (frac <= 0) return;
-  cctx.drawImage(source.el, 0, 0, w * frac, h, 0, 0, w * frac, h);
+  cctx.drawImage(source.el, 0, 0, srcW * frac, srcH, 0, 0, w * frac, h);
 }
 
 // Adjust the supersample cap from the two load signals. Live ss is capped at
@@ -416,14 +435,18 @@ function loop(t) {
     if (lastFrameT) {
       const fdt = t - lastFrameT;
       fpsEma = fpsEma ? fpsEma * 0.9 + fdt * 0.1 : fdt;
-      fpsText = `${Math.round(1000 / fpsEma)} fps`;
-      updateStatus();
+      if (t - lastStatusT >= 250) {
+        fpsText = `${Math.round(1000 / fpsEma)} fps`;
+        updateStatus();
+        lastStatusT = t;
+      }
     }
     lastFrameT = t;
-    if (playing && !scrubbing && source.type === 'video') {
+    if (playing && !scrubbing && source.type === 'video' && t - lastStatusT < 20) {
       const el = source.el;
-      $('seek').value = isFinite(el.duration) && el.duration ? Math.round((el.currentTime / el.duration) * 1000) : 0;
-      $('time').textContent = `${fmtTime(el.currentTime)} / ${fmtTime(el.duration)}`;
+      const seekValue = isFinite(el.duration) && el.duration ? Math.round((el.currentTime / el.duration) * 1000) : 0;
+      if ($('seek').value !== String(seekValue)) $('seek').value = seekValue;
+      updateVideoTime(el);
     }
   } else {
     lastFrameT = 0;
@@ -437,14 +460,21 @@ const fmtTime = (s) => {
   return `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 };
 
+function updateVideoTime(video) {
+  const text = `${fmtTime(video.currentTime)} / ${fmtTime(video.duration)}`;
+  if ($('time').textContent !== text) $('time').textContent = text;
+}
+
 function updateStatus() {
   if (source) {
     const [w, h] = srcDims();
     const modeName = state.mode[0].toUpperCase() + state.mode.slice(1);
-    $('st-left').textContent = `${source.name || source.type} · ${w}×${h} · ${modeName}`;
+    const left = `${source.name || source.type} · ${w}×${h} · ${modeName}`;
+    if ($('st-left').textContent !== left) $('st-left').textContent = left;
   }
   const z = `${Math.round(view.zoom * 100)}%`;
-  $('st-right').textContent = fpsText ? `${fpsText} · ${z}` : z;
+  const right = fpsText ? `${fpsText} · ${z}` : z;
+  if ($('st-right').textContent !== right) $('st-right').textContent = right;
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +557,19 @@ let thumbToken = 0;
 
 async function renderPresetThumbs() {
   const [w, h] = srcDims();
-  if (!source || !w || !h) return;
+  if (!source) return;
+  if (!w || !h) {
+    // Cameras can report 0×0 for a moment after permission is granted. Retry
+    // a bounded number of times, tied to this source so a later source cannot
+    // receive stale thumbnails.
+    if (source.type === 'webcam' && (source._thumbRetries || 0) < 10) {
+      const pending = source;
+      source._thumbRetries = (source._thumbRetries || 0) + 1;
+      setTimeout(() => { if (source === pending) renderPresetThumbs(); }, 400);
+    }
+    return;
+  }
+  source._thumbRetries = 0;
   const el = source.el;
   if (el instanceof HTMLVideoElement && el.readyState < 2) {
     setTimeout(renderPresetThumbs, 400);
@@ -553,7 +595,9 @@ async function renderPresetThumbs() {
     try {
       const base = structuredClone(DEFAULTS);
       applyParams(base, p.params);
-      const result = thumbEngine.render(snap, TW, TH, deriveParams(base), Infinity);
+      const thumbParams = deriveParams(base);
+      thumbParams.ascii.captureMetadata = false;
+      const result = thumbEngine.render(snap, TW, TH, thumbParams, Infinity);
       const final = applyPostFX(result, base.fx, { grainPhase: 0, refH: TH });
       const tctx = target.getContext('2d');
       tctx.imageSmoothingEnabled = false;
@@ -573,7 +617,7 @@ async function renderPresetThumbs() {
 // ---------------------------------------------------------------------------
 // sources
 // ---------------------------------------------------------------------------
-// GPT-5.5 Pro: for moving video, a temporally-stable blue-noise dither looks
+// For moving video, a temporally-stable blue-noise dither looks
 // far smoother than Bayer (whose regular grid crawls/moirés on pans) or
 // per-frame error diffusion (which flickers). Apply a video-friendly profile
 // when entering a live source from a still (or cold start) — not on every
@@ -583,7 +627,7 @@ function applyVideoProfile() {
   if (getAlgorithm(state.algorithm).type === 'cpu' || state.algorithm.startsWith('bayer')) {
     state.algorithm = 'bluenoise';
   }
-  // GPT-5.5 Pro "Video / Smooth" starting point: smoother + finer grain out of
+  // Video / Smooth starting point: smoother + finer grain out of
   // the box (the user's request). All reversible — drag Smoothness to 0 for a
   // crisp full-resolution 1-bit look.
   state.smoothness = 0.5;
@@ -591,28 +635,32 @@ function applyVideoProfile() {
   state.videoDenoise = 0.2;
 }
 
+function disposeSource(s) {
+  if (!s) return;
+  if (s.stream) s.stream.getTracks().forEach((tr) => tr.stop());
+  if (s.el instanceof HTMLVideoElement && !s.stream) s.el.pause();
+  if (s._seekHandler) s.el.removeEventListener('seeked', s._seekHandler);
+  if (s._rvfc != null && s.el.cancelVideoFrameCallback) s.el.cancelVideoFrameCallback(s._rvfc);
+  if (s.url) URL.revokeObjectURL(s.url);
+}
+
 function setSource(next) {
   const prevType = source?.type;
   if (exporting) {
     // don't yank the source out from under a running export
-    if (next.stream) next.stream.getTracks().forEach((tr) => tr.stop());
-    if (next.url) URL.revokeObjectURL(next.url);
+    disposeSource(next);
     toast('Export in progress — cancel it first');
     return;
   }
-  if (source) {
-    if (source.stream) source.stream.getTracks().forEach((tr) => tr.stop());
-    if (source.el instanceof HTMLVideoElement && !source.stream) source.el.pause();
-    if (source._seekHandler) source.el.removeEventListener('seeked', source._seekHandler);
-    if (source._rvfc != null && source.el.cancelVideoFrameCallback) source.el.cancelVideoFrameCallback(source._rvfc);
-    if (source.url) URL.revokeObjectURL(source.url);
-  }
+  disposeSource(source);
   source = next;
   const nowLive = next.type === 'video' || next.type === 'webcam';
   const wasLive = prevType === 'video' || prevType === 'webcam';
   const profileApplied = nowLive && !wasLive;
   if (profileApplied) applyVideoProfile();
   fpsEma = 0;
+  fpsText = '';
+  lastStatusT = 0;
   videoFrameReady = false;
   // new pixels, possibly same dither settings/size — force a fresh sync frame
   // instead of briefly showing the old source's async result.
@@ -637,8 +685,17 @@ function setSource(next) {
       if (lastPumpT && meta && now - lastPumpT < 500) {
         const frames = Math.max(1, meta.presentedFrames - (s._lastPresented || 0));
         pumpFramesEma = pumpFramesEma ? pumpFramesEma * 0.85 + frames * 0.15 : frames;
+        // Passive source-frame-rate estimate for the frame-accurate exporter:
+        // mediaTime deltas are exact frame durations (no wall-clock jitter).
+        // Only at 1x — other rates can drop decoded frames, inflating deltas.
+        if (s.el.playbackRate === 1 && s._lastMediaTime !== undefined) {
+          const fd = (meta.mediaTime - s._lastMediaTime) / frames;
+          if (fd > 1 / 121 && fd < 1 / 9) {
+            s._frameDurEma = s._frameDurEma ? s._frameDurEma * 0.8 + fd * 0.2 : fd;
+          }
+        }
       }
-      if (meta) s._lastPresented = meta.presentedFrames;
+      if (meta) { s._lastPresented = meta.presentedFrames; s._lastMediaTime = meta.mediaTime; }
       lastPumpT = now;
       s._rvfc = s.el.requestVideoFrameCallback(pump);
     };
@@ -650,7 +707,13 @@ function setSource(next) {
     // re-render when the user seeks a paused video (exporters render themselves)
     // a seek is a temporal discontinuity — drop history so the landed frame
     // doesn't ghost-blend with wherever we jumped from
-    source._seekHandler = () => { if (!exporting) { dirty = true; engine.invalidateTemporal(); } };
+    source._seekHandler = () => {
+      if (!exporting) {
+        dirty = true;
+        engine.invalidateTemporal();
+        updateVideoTime(source.el);
+      }
+    };
     source.el.addEventListener('seeked', source._seekHandler);
     source.el.play().catch(() => {});
   }
@@ -673,10 +736,16 @@ function setSource(next) {
 }
 
 async function openFile(file) {
+  const token = ++sourceLoadToken;
   try {
-    setSource(await loadFile(file));
+    const next = await loadFile(file);
+    if (token !== sourceLoadToken) {
+      disposeSource(next);
+      return;
+    }
+    setSource(next);
   } catch (err) {
-    toast(err.message);
+    if (token === sourceLoadToken) toast(err.message);
   }
 }
 
@@ -684,10 +753,13 @@ function updateExportButtons() {
   const isVideo = source?.type === 'video';
   const isWebcam = source?.type === 'webcam';
   const isGen = source?.type === 'gen';
+  const isAnimatedImage = source?.type === 'animated-image';
   const animatedStill = source?.type === 'image' && isAnimating();
-  $('btn-export-video').hidden = !canRecord || !(isVideo || isWebcam || animatedStill || isGen);
+  const frameAccurate = canFrameExport() && !isWebcam && !isAnimatedImage;
+  $('btn-export-video').hidden = !(frameAccurate || canRecord)
+    || !(isVideo || isWebcam || isAnimatedImage || animatedStill || isGen);
   // a static image would make a pointless single-frame "animated" GIF
-  $('btn-export-gif').hidden = !(isVideo || isGen || animatedStill);
+  $('btn-export-gif').hidden = !(isVideo || isWebcam || isAnimatedImage || isGen || animatedStill);
   $('btn-export-txt').hidden = state.mode !== 'ascii';
 }
 
@@ -716,9 +788,7 @@ $('busy-cancel').onclick = () => busyCancel && busyCancel();
 async function doExportPNG() {
   if (!source || exporting) return;
   exporting = true; // block source swaps / concurrent exports mid-encode
-  let outC;
-  let W = 0;
-  let H = 0; // hoisted: the toBlob callback below outlives the try block
+  const exportName = `${source.name || 'ditherlab'}-${state.mode}.png`;
   // deterministic bake: an animated still exports its reference frame, not
   // whatever instant the clock happened to be at when the button was clicked
   const pinPhase = source.type === 'image' && isAnimating() && phaseOverride === null;
@@ -728,11 +798,15 @@ async function doExportPNG() {
     toast('Rendering…');
     await new Promise((r) => setTimeout(r, 30)); // let toast paint before a heavy CPU pass
     const p = derived();
-    const result = engine.render(source.el, w, h, p, Infinity);
+    // Apply the browser's area bound before rendering, not after allocating a
+    // potentially enormous work canvas/error buffer. Cell effects may produce
+    // up to 2x their sampling budget in output pixels.
+    const renderBudget = state.mode === 'dither' ? MAX_EXPORT_AREA : MAX_EXPORT_AREA / 2;
+    const result = engine.render(source.el, w, h, p, renderBudget);
     if (!result) return;
 
-    W = result.width;
-    H = result.height;
+    let W = result.width;
+    let H = result.height;
     if (state.mode === 'dither') {
       if (exportSettings.pngSize === 'source') { W = w; H = h; }
       if (exportSettings.pngSize === 'source2x') { W = w * 2; H = h * 2; }
@@ -756,34 +830,36 @@ async function doExportPNG() {
       return;
     }
     const cx = c.getContext('2d');
-    cx.imageSmoothingEnabled = false;
+    // crisp 1-bit wants hard nearest-neighbour pixels; a box-resolved (tone)
+    // render is continuous and must upscale smoothly — same rule as present()
+    // and the MP4 strict flag, read from the engine's ACTUAL last-frame state
+    cx.imageSmoothingEnabled = engine.lastBoxResolved;
+    cx.imageSmoothingQuality = 'high';
     cx.drawImage(result, 0, 0, W, H);
     const final = applyPostFX(c, state.fx, { grainPhase: currentGrainPhase() ?? 0, refH: h });
 
-    // applyPostFX may return a shared canvas — copy before async toBlob
-    outC = final === c ? c : (() => {
+    // applyPostFX may return a shared canvas — copy before async encoding.
+    const outC = final === c ? c : (() => {
       const cc = document.createElement('canvas');
       cc.width = final.width;
       cc.height = final.height;
       cc.getContext('2d').drawImage(final, 0, 0);
       return cc;
     })();
+    const blob = await new Promise((resolve) => outC.toBlob(resolve, 'image/png'));
+    if (!blob) {
+      toast('PNG export failed — image too large for this browser');
+      return;
+    }
+    downloadBlob(blob, exportName);
+    toast(`PNG exported · ${W}×${H}`);
+  } catch (err) {
+    toast(`PNG export failed: ${err.message}`);
   } finally {
     if (pinPhase) phaseOverride = null;
     exporting = false;
-  }
-  if (!outC) return;
-
-  outC.toBlob((blob) => {
-    if (!blob) {
-      toast('PNG export failed — image too large for this browser');
-      dirty = true;
-      return;
-    }
-    downloadBlob(blob, `${source.name || 'ditherlab'}-${state.mode}.png`);
-    toast(`PNG exported · ${W}×${H}`);
     dirty = true;
-  }, 'image/png');
+  }
 }
 
 // Record the live preview canvas for a fixed number of seconds (webcam feeds
@@ -832,30 +908,97 @@ function recordCanvasSeconds(secs, filename) {
   }
 }
 
+// Render budget for the frame-accurate MP4 exporters. GPU dithers can afford
+// a grid as fine as the H.264 pipeline can take: the encoder integer-upscales
+// by >=2x with a 3840px long-side / level 5.1 (~8.9M luma) ceiling, so the
+// GRID must keep its long side <=1920 and its area <=2.2MP. CPU algorithms
+// keep the classic EXPORT_PIXELS (a 2.2MP synchronous error-diffusion per
+// frame would stretch exports into many minutes for little visible gain).
+function mp4RenderBudget() {
+  const gpuAlgo = state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'gpu';
+  const [w, h] = srcDims();
+  const long = Math.max(w, h, 1);
+  const longSideArea = Math.max(1, Math.round(w * h * Math.min(1, (1920 / long) ** 2)));
+  return Math.min(gpuAlgo ? 2_200_000 : EXPORT_PIXELS, longSideArea);
+}
+
 async function doExportVideo() {
   if (!source || exporting) return;
+  const isAnimatedImage = source.type === 'animated-image';
   const animatedStill = source.type === 'image' && isAnimating();
   const isGen = source.type === 'gen';
-  if (!(source.el instanceof HTMLVideoElement) && !animatedStill && !isGen) return;
+  if (!(source.el instanceof HTMLVideoElement) && !isAnimatedImage && !animatedStill && !isGen) return;
   exporting = true;
   engine.invalidateTemporal(); // frame 0 of the export must not blend with the preview
 
   let secs = parseInt(exportSettings.recordSeconds, 10) || 5;
-  if (source.type === 'webcam') {
-    recordCanvasSeconds(secs, 'ditherlab-webcam');
+  if (source.type === 'webcam' || isAnimatedImage) {
+    recordCanvasSeconds(secs, source.type === 'webcam'
+      ? 'ditherlab-webcam'
+      : `${source.name || 'animated-image'}-${state.mode}`);
     return;
   }
-  // stretch to a whole number of animation cycles so the saved clip loops
-  const cps = isGen
-    ? source.gen.params.speed * GEN_CYCLES_PER_SEC
-    : (isAnimating() ? state.anim.speed * 0.15 : 0);
-  if (cps > 0) secs = Math.max(1, Math.round(secs * cps)) / cps;
-  if (isGen) {
-    recordCanvasSeconds(secs, `${source.name || 'scene'}-${state.mode}`);
-    return;
-  }
-  if (animatedStill) {
-    recordCanvasSeconds(secs, `${source.name || 'ditherlab'}-${state.mode}-${state.anim.style}`);
+  // strict resolved AFTER the exporter's sizing render: raw state.smoothness
+  // lies for CPU algorithms and lost WebGL (engine.lastBoxResolved is the
+  // actual crisp-vs-tone state of the frame being exported)
+  const strictFn = () => !engine.lastBoxResolved;
+
+  if (isGen || animatedStill) {
+    const name = isGen
+      ? `${source.name || 'scene'}-${state.mode}`
+      : `${source.name || 'ditherlab'}-${state.mode}-${state.anim.style}`;
+    // Deterministic sources deserve the frame-accurate path too: the realtime
+    // recorder just captures the live preview, inheriting its budget, judder
+    // and wall-clock pacing. Bake exactly the whole-cycle span instead.
+    if (canFrameExport()) {
+      const fps = 30;
+      const count = Math.max(2, Math.round(secs * fps));
+      // Preserve the selected duration and the tuned speeds. MP4 playback does
+      // not need to be loop-perfect (GIF baking still is); rounding cycles made
+      // a requested 3s slow scene silently turn into a 32s/960-frame export.
+      const genCycles = isGen ? secs * source.gen.params.speed * GEN_CYCLES_PER_SEC : 0;
+      const effCycles = isAnimating() ? secs * state.anim.speed * 0.15 : 0;
+      let cancelled = false;
+      let fallbackToRecorder = false;
+      showBusy('Rendering video (frame-accurate)…', () => { cancelled = true; });
+      try {
+        await exportLoopFrameAccurate({
+          renderFrame: () => { renderOnce(mp4RenderBudget()); return out; },
+          setPhase: (f) => {
+            if (isGen) genPhaseOverride = (f * genCycles) % 1;
+            if (effCycles) phaseOverride = (f * effCycles) % 1;
+          },
+          count,
+          fps,
+          name,
+          strict: strictFn,
+          onProgress: busyProgress,
+          onInfo: (msg) => toast(msg, 4000),
+          shouldAbort: () => cancelled,
+        });
+        toast('Video exported');
+      } catch (err) {
+        fallbackToRecorder = err.name === 'NotSupportedError' && canRecord;
+        if (!fallbackToRecorder) {
+          toast(err.message === 'cancelled' ? 'Export cancelled' : `Video export failed: ${err.message}`);
+        }
+      }
+      phaseOverride = null;
+      genPhaseOverride = null;
+      engine.invalidateTemporal(); // do not blend restored source time with the export tail
+      dirty = true; // restore the live preview resolution
+      hideBusy();
+      if (!fallbackToRecorder) {
+        exporting = false;
+        return;
+      }
+      toast('H.264 unavailable — using real-time recorder', 4000);
+      // The failed frame-accurate attempt resized `out` for export. Restore the
+      // stable live bitmap before captureStream() starts; resizing a captured
+      // canvas mid-recording can glitch or truncate the first frames.
+      renderOnce();
+    }
+    recordCanvasSeconds(secs, name);
     return;
   }
 
@@ -866,32 +1009,50 @@ async function doExportVideo() {
   // dither is on this device (silent — no audio).
   if (canFrameExport()) {
     let cancelled = false;
+    let fallbackToRecorder = false;
+    const pinAnim = isAnimating();
     showBusy('Rendering video (frame-accurate)…', () => { cancelled = true; });
     try {
       await exportVideoFrameAccurate({
         video: source.el,
-        renderFrame: () => { renderOnce(EXPORT_PIXELS); return out; },
-        maxWidth: 1280,
+        renderFrame: () => { renderOnce(mp4RenderBudget()); return out; },
         name,
-        strict: !(state.mode === 'dither' && state.smoothness >= 0.15),
+        strict: strictFn,
+        // true source rate from playback (rVFC mediaTime deltas) — sampling
+        // 24fps footage on a 30fps grid bakes 2:3 pulldown judder into the file
+        sourceFps: source._frameDurEma ? 1 / source._frameDurEma : 0,
+        // pattern animation pinned to the VIDEO timeline, not wall clock (the
+        // live loop would otherwise advance it while the exporter awaits) —
+        // also stops the loop's concurrent renders during the export
+        onFrameTime: pinAnim ? (t) => { phaseOverride = (t * state.anim.speed * 0.15) % 1; } : null,
         onProgress: busyProgress,
         onInfo: (msg) => toast(msg, 4000),
         shouldAbort: () => cancelled,
       });
       toast('Video exported');
     } catch (err) {
-      toast(err.message === 'cancelled' ? 'Export cancelled' : `Video export failed: ${err.message}`);
+      fallbackToRecorder = err.name === 'NotSupportedError' && canRecord;
+      if (!fallbackToRecorder) {
+        toast(err.message === 'cancelled' ? 'Export cancelled' : `Video export failed: ${err.message}`);
+      }
     }
+    if (pinAnim) phaseOverride = null;
+    engine.invalidateTemporal();
     dirty = true; // restore the live preview resolution
     hideBusy();
-    exporting = false;
-    return;
+    if (!fallbackToRecorder) {
+      exporting = false;
+      return;
+    }
+    toast('H.264 unavailable — using real-time recorder', 4000);
+    renderOnce();
   }
 
   // Fallback (no WebCodecs): real-time capture, keeps audio.
   const exporter = new VideoExporter(out, source.el, {
     fps: 30,
     onProgress: busyProgress,
+    renderFrame: () => renderOnce(),
   });
   // cancel() aborts start(), which throws 'cancelled' and restores the video
   showBusy('Exporting video (plays through once)…', () => exporter.cancel());
@@ -901,6 +1062,11 @@ async function doExportVideo() {
   } catch (err) {
     toast(err.message === 'cancelled' ? 'Export cancelled' : `Video export failed: ${err.message}`);
   }
+  // VideoExporter restores the original playback time in finally while the
+  // normal seek handler is suppressed by exporting=true. Force the editor to
+  // redraw that restored frame instead of leaving the export tail on screen.
+  engine.invalidateTemporal();
+  dirty = true;
   hideBusy();
   exporting = false;
 }
@@ -915,8 +1081,13 @@ async function doExportGIF() {
   showBusy('Encoding GIF…', () => { cancelled = true; });
 
   // Animated stills bake exactly one animation cycle -> seamless loop.
-  let fps = 12;
+  // Video default 50/3 fps: an exact 6-centisecond GIF frame delay (no
+  // rounding drift) and visibly smoother motion than the old 12.
+  let fps = 50 / 3;
   let animate = null;
+  const liveDuration = source.type === 'webcam' || source.type === 'animated-image'
+    ? (parseInt(exportSettings.recordSeconds, 10) || 5)
+    : 0;
   if (source.type === 'gen') {
     const cycleSec = 1 / (source.gen.params.speed * GEN_CYCLES_PER_SEC);
     const count = Math.min(180, Math.max(24, Math.round(cycleSec * 15)));
@@ -947,15 +1118,50 @@ async function doExportGIF() {
     animate = { setTime: (t) => { phaseOverride = (t * state.anim.speed * 0.15) % 1; } };
   }
 
+  // Post-FX for GIFs is applied AFTER decimation, at the GIF's own
+  // resolution: baked-then-decimated scanlines/grain are sub-Nyquist at the
+  // usual 480px sizes and either average away (smooth) or alias (strict).
+  // The frames render raw (noFx) and this hook re-applies the stack per
+  // frame with refH compensated so intensity/geometry match the preview.
+  const fxOn = Object.values(state.fx).some((v) => v > 0);
+  let fxCanvas = null;
+  let fxCtx = null;
+  const postProcess = fxOn ? (pixels, gw, gh) => {
+    if (!fxCanvas) {
+      fxCanvas = document.createElement('canvas');
+      fxCtx = fxCanvas.getContext('2d', { willReadFrequently: true });
+    }
+    if (fxCanvas.width !== gw || fxCanvas.height !== gh) {
+      fxCanvas.width = gw;
+      fxCanvas.height = gh;
+    }
+    fxCtx.putImageData(new ImageData(pixels, gw, gh), 0, 0);
+    // present() would show this render at out.height * scale with refH=srcH;
+    // scale refH by our (smaller) canvas so the fx read proportionally alike
+    const scale = state.mode === 'dither'
+      ? Math.min(2, Math.max(1, srcDims()[0] / out.width))
+      : 1;
+    const refH = (srcDims()[1] || gh) * (gh / (out.height * scale));
+    const final = applyPostFX(fxCanvas, state.fx, { grainPhase: currentGrainPhase(), refH });
+    return final.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, gw, gh).data;
+  } : null;
+
   try {
     await exportGIF({
       video: source.type === 'video' ? source.el : null,
       animate,
-      renderFrame: () => { renderOnce(EXPORT_PIXELS); return out; },
+      liveDuration,
+      // GIF has no H.264 1920px long-side restriction. Keep the established
+      // 1.6MP export budget so wide/native GIFs are not needlessly softened.
+      renderFrame: () => { renderOnce(EXPORT_PIXELS, true, fxOn); return out; },
       fps,
       maxWidth,
-      // dither wants exact pixels; ASCII/cells strokes need area-averaging
-      smooth: state.mode !== 'dither',
+      // dither wants exact pixels UNLESS the render is box-resolved tone
+      // (smoothness), which point-decimation would re-speckle; evaluated
+      // after the sizing render so it reflects the actual export frame
+      smooth: () => state.mode !== 'dither' || engine.lastBoxResolved,
+      postProcess,
+      onSized: () => engine.invalidateTemporal(),
       name: `${source.name || 'ditherlab'}-${state.mode}`,
       onInfo: (msg) => toast(msg, 4000),
       shouldAbort: () => cancelled,
@@ -970,6 +1176,7 @@ async function doExportGIF() {
   }
   phaseOverride = null;
   genPhaseOverride = null;
+  engine.invalidateTemporal();
   dirty = true; // restore the live preview resolution
   hideBusy();
   exporting = false;
@@ -977,7 +1184,7 @@ async function doExportGIF() {
 
 function doExportTxt() {
   if (state.mode !== 'ascii') return;
-  renderOnce(Infinity); // text exports always use the full-resolution grid
+  renderOnce(Infinity, true, false, true); // text exports capture the full-resolution grid once
   const name = `${source?.name || 'ditherlab'}-ascii`;
   const fmt = exportSettings.txtFormat;
   if (fmt === 'ansi' && engine.ascii.lastGrid) {
@@ -1003,7 +1210,7 @@ function doExportTxt() {
 
 exportSettings.onCopyText = () => {
   if (state.mode !== 'ascii') return;
-  renderOnce(Infinity);
+  renderOnce(Infinity, true, false, true);
   dirty = true;
   navigator.clipboard.writeText(engine.ascii.lastText)
     .then(() => toast('Copied to clipboard'))
@@ -1021,6 +1228,7 @@ function rebuildPanel() {
     isLive: source?.type === 'video' || source?.type === 'webcam',
     gen: source?.type === 'gen' ? source.gen : null,
     onGenChange: () => {
+      clearActivePreset($('preset-strip'));
       if (source?.type === 'gen') source.name = source.gen.sceneName().toLowerCase();
       updateStatus();
       pushHistory();
@@ -1028,6 +1236,7 @@ function rebuildPanel() {
     },
     onChange: () => {
       if (exporting) return;
+      clearActivePreset($('preset-strip'));
       updateExportButtons();
       updateStatus();
       pushHistory();
@@ -1077,10 +1286,17 @@ $('file-input').addEventListener('change', (e) => {
   e.target.value = '';
 });
 
-$('btn-demo').onclick = async () => setSource(await demoPhoto().catch(() => demoImage()));
+$('btn-demo').onclick = async () => {
+  if (exporting) return;
+  const token = ++sourceLoadToken;
+  const next = await demoPhoto().catch(() => demoImage());
+  if (token === sourceLoadToken) setSource(next);
+  else disposeSource(next);
+};
 
 $('btn-generate').onclick = () => {
   if (exporting) return;
+  sourceLoadToken++; // supersede an in-flight file/camera request
   if (!gen) {
     try {
       gen = new GenerativeSource(1920, 1200);
@@ -1112,10 +1328,13 @@ $('btn-generate').onclick = () => {
 };
 $('btn-webcam').onclick = async () => {
   if (exporting) return;
+  const token = ++sourceLoadToken;
   try {
-    setSource(await openWebcam());
+    const next = await openWebcam();
+    if (token === sourceLoadToken) setSource(next);
+    else disposeSource(next);
   } catch (err) {
-    toast(`Webcam unavailable: ${err.message}`);
+    if (token === sourceLoadToken) toast(`Webcam unavailable: ${err.message}`);
   }
 };
 
@@ -1124,6 +1343,7 @@ $('btn-reset').onclick = () => {
   commitHistory();
   clearActivePreset($('preset-strip'));
   resetState(state);
+  Object.assign(exportSettings, EXPORT_DEFAULTS);
   rebuildPanel();
   updateExportButtons();
   updateStatus();
@@ -1198,15 +1418,23 @@ function togglePlay() {
   const el = source.el;
   if (el.paused) { el.play(); $('btn-play').textContent = '❚❚'; }
   else { el.pause(); $('btn-play').textContent = '▶'; }
+  // Paused error-diffusion is allowed a higher-detail still render; resuming
+  // returns to the pixel-size-aware live budget. Force either transition to
+  // replace the previous-size worker result immediately.
+  if (engine.cpu) engine.cpu.invalidate();
+  dirty = true;
 }
 $('btn-play').onclick = () => source?.type === 'video' && togglePlay();
 $('seek').addEventListener('pointerdown', () => { scrubbing = true; });
 $('seek').addEventListener('pointerup', () => { scrubbing = false; });
+$('seek').addEventListener('pointercancel', () => { scrubbing = false; });
+window.addEventListener('blur', () => { scrubbing = false; });
 $('seek').addEventListener('input', () => {
   if (source?.type !== 'video' || exporting) return;
   const el = source.el;
   if (isFinite(el.duration) && el.duration) {
     el.currentTime = (parseInt($('seek').value, 10) / 1000) * el.duration;
+    updateVideoTime(el);
     dirty = true;
   }
 });
@@ -1218,8 +1446,12 @@ $('speed').addEventListener('change', () => {
 // drag & drop + paste
 bindDropAndPaste($('viewport'), openFile);
 
-// boot with the demo scene
-setSource(await demoPhoto().catch(() => demoImage()));
+// boot with the demo scene, unless a user-selected source wins the race while
+// the bundled image is still decoding.
+const bootSourceToken = ++sourceLoadToken;
+const bootSource = await demoPhoto().catch(() => demoImage());
+if (bootSourceToken === sourceLoadToken) setSource(bootSource);
+else disposeSource(bootSource);
 
 // shareable boot params: ?preset=<id>&split=1
 const qp = new URLSearchParams(location.search);

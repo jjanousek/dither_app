@@ -4,6 +4,7 @@
   "description": "Dither + ASCII studio for images and video — local, no build step",
   "type": "module",
   "scripts": {
-    "start": "python3 scripts/serve.py 8173"
+    "start": "python3 scripts/serve.py 8173",
+    "test": "node --test tests/*.test.js"
   }
 }

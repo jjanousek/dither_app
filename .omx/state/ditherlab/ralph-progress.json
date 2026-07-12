@@ -1,0 +1,15 @@
+{
+  "score": 100,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [],
+  "suggestions": [],
+  "reasoning": "The final default editor screenshot is pixel-identical to the pre-change reference at 1280x720, while targeted mode and media screenshots remain visually correct.",
+  "threshold": 90,
+  "threshold_pass": true,
+  "reference_images": [
+    "qa-artifacts/baseline-demo.png"
+  ],
+  "generated_screenshot": "qa-artifacts/final-demo-current.jpg",
+  "next_actions": []
+}

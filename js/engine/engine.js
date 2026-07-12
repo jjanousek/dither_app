@@ -9,6 +9,7 @@ import { AsciiRenderer, fontSpec } from './ascii.js';
 import { CELL_EFFECTS } from '../effects/cells.js';
 import { paletteToFloat, paletteToUniform } from '../palettes.js';
 import { CpuPreview } from './cpu-preview.js';
+import { CELL_SIZE_MIN } from '../state.js';
 
 export const ALGORITHMS = [
   { id: 'floyd', name: 'Floyd–Steinberg', type: 'cpu', group: 'Error Diffusion' },
@@ -90,7 +91,7 @@ export class Engine {
       'u_src', 'u_threshold', 'u_outSize', 'u_ss', 'u_smoothness',
       'u_thresholdSize', 'u_mode',
       'u_brightness', 'u_contrast', 'u_gamma', 'u_saturation', 'u_strength',
-      'u_bias', 'u_invert', 'u_palette', 'u_paletteSize',
+      'u_bias', 'u_invert', 'u_palette', 'u_paletteSize', 'u_darkest', 'u_brightest',
       'u_halftoneScale', 'u_halftoneAngle', 'u_matOffset', 'u_seed',
       'u_motionDamp', 'u_hasMotion',
     ]) {
@@ -153,8 +154,27 @@ export class Engine {
       this._palKey = key;
       this._palFloat = paletteToFloat(colors);
       this._palUniform = paletteToUniform(colors.slice(0, MAX_PALETTE), MAX_PALETTE);
+      let dark = 0;
+      let bright = 0;
+      let minL = Infinity;
+      let maxL = -Infinity;
+      const size = Math.min(colors.length, MAX_PALETTE);
+      for (let i = 0; i < size; i++) {
+        const j = i * 3;
+        const l = 0.2126 * this._palFloat[j] + 0.7152 * this._palFloat[j + 1] + 0.0722 * this._palFloat[j + 2];
+        if (l < minL) { minL = l; dark = j; }
+        if (l > maxL) { maxL = l; bright = j; }
+      }
+      this._palDark = this._palFloat.slice(dark, dark + 3).map((v) => v / 255);
+      this._palBright = this._palFloat.slice(bright, bright + 3).map((v) => v / 255);
     }
-    return { float: this._palFloat, uniform: this._palUniform, size: Math.min(colors.length, MAX_PALETTE) };
+    return {
+      float: this._palFloat,
+      uniform: this._palUniform,
+      size: Math.min(colors.length, MAX_PALETTE),
+      darkest: this._palDark,
+      brightest: this._palBright,
+    };
   }
 
   // Settings signature for the async CPU preview — a change forces one
@@ -227,7 +247,13 @@ export class Engine {
       ss = Math.min(p.smoothness > 0.6 ? 3 : 2, p.ssCap ?? 3, liveMax);
     }
     if (ss > 1) {
-      const outCap = Math.min(maxPixels, Math.floor(SS_SOURCE_BUDGET / (ss * ss)));
+      // Exports at ss=3 get a proportionally larger source budget: under the
+      // shared 5MP cap, ss=3 would shrink the output grid to 5M/9 ≈ 0.55MP —
+      // LESS than half the ss=2 preview's 1.25MP, on the one path (offline)
+      // that can afford more compute. 11.25M keeps the export grid at the
+      // ss=2 preview size, so raising Smoothness never costs resolution.
+      const ssBudget = (!this._allowAsync && ss === 3) ? 11_250_000 : SS_SOURCE_BUDGET;
+      const outCap = Math.min(maxPixels, Math.floor(ssBudget / (ss * ss)));
       if (w * h > outCap) {
         const k = Math.sqrt(outCap / (w * h));
         w = Math.max(1, Math.floor(w * k));
@@ -602,6 +628,8 @@ export class Engine {
     gl.uniform1i(this.u.u_invert, p.invert ? 1 : 0);
     gl.uniform3fv(this.u.u_palette, pal.uniform);
     gl.uniform1i(this.u.u_paletteSize, pal.size);
+    gl.uniform3fv(this.u.u_darkest, pal.darkest);
+    gl.uniform3fv(this.u.u_brightest, pal.brightest);
     gl.uniform1f(this.u.u_halftoneScale, p.halftoneScale);
     gl.uniform1f(this.u.u_halftoneAngle, (p.halftoneAngle * Math.PI) / 180);
 
@@ -714,6 +742,18 @@ export class Engine {
     const w = cols * dx;
     const h = rows * dy;
 
+    // Sampling work is already bounded above, but a small sampling grid could
+    // still paint a source-sized text canvas (for example 38K cells -> a 10MP
+    // canvas at 16px glyphs). Bound the preview bitmap separately while keeping
+    // the SAME cell grid/detail: rasterize each glyph smaller, then let the
+    // viewport scale the finished canvas. One-shot/export renders retain the
+    // selected/native glyph size even when they carry a finite memory budget.
+    let renderCellH = cellH;
+    const outputArea = cols * cellW * rows * cellH;
+    if (p.liveRender && isFinite(maxPixels) && outputArea > maxPixels * 2) {
+      renderCellH = Math.max(4, Math.floor(cellH * Math.sqrt((maxPixels * 2) / outputArea)));
+    }
+
     this.#drawWork(source, w, h, p);
     const img = this.workCtx.getImageData(0, 0, w, h);
     applyAdjustments(img, {
@@ -726,7 +766,7 @@ export class Engine {
     return this.ascii.render(img, {
       renderer,
       chars: a.chars,
-      cellSize: a.cellSize,
+      cellSize: renderCellH,
       font,
       colorMode: a.colorMode,
       fg: a.fg,
@@ -737,12 +777,13 @@ export class Engine {
       edgeStrength: a.edgeStrength || (a.edges ? 0.5 : 0),
       autoContrast: a.autoContrast !== false,
       shapeSet: a.shapeSet || 'ascii',
+      captureMetadata: a.captureMetadata !== false,
     });
   }
 
   #renderCells(source, srcW, srcH, p, maxPixels = Infinity) {
     const c = p.cells;
-    const cell = Math.max(4, c.size);
+    const cell = Math.max(CELL_SIZE_MIN[p.mode] ?? 4, c.size);
     let cols = Math.max(1, Math.round(srcW / cell));
     let rows = Math.max(1, Math.round(srcH / cell));
     if (cols * rows * cell * cell > maxPixels * 2) {
@@ -767,8 +808,8 @@ export class Engine {
       this.cellCanvas = document.createElement('canvas');
       this.cellCtx = this.cellCanvas.getContext('2d');
     }
-    const W = cols * cell;
-    const H = rows * cell;
+    const W = Math.max(1, Math.round(cols * cell));
+    const H = Math.max(1, Math.round(rows * cell));
     if (this.cellCanvas.width !== W || this.cellCanvas.height !== H) {
       this.cellCanvas.width = W;
       this.cellCanvas.height = H;
@@ -776,6 +817,10 @@ export class Engine {
     const eff = CELL_EFFECTS[p.mode] || CELL_EFFECTS.dots;
     eff.render(this.cellCtx, { cols, rows, data: img.data }, {
       cell,
+      // Preserve the selected geometry while allowing expensive sub-pixel
+      // decoration to be omitted in fine live video previews. Exports retain
+      // the complete renderer treatment.
+      compact: !!p.liveRender && cell <= 6,
       fill: c.fill,
       scatter: c.scatter,
       colorMode: c.colorMode,

@@ -1,0 +1,15 @@
+{
+  "score": 93,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [],
+  "suggestions": [],
+  "reasoning": "The 1px live Floyd and False Floyd renders now retain visibly finer edge and texture detail at 1066x600 instead of collapsing to the former 596x335 ceiling. The paused Floyd fixture renders at the full 1920x1080 source grid without palette corruption.",
+  "threshold": 90,
+  "threshold_pass": true,
+  "reference_images": [
+    "qa-artifacts/regression-floyd-live-detail.png"
+  ],
+  "generated_screenshot": "qa-artifacts/regression-floyd-paused-full.png",
+  "next_actions": []
+}

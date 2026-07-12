@@ -101,6 +101,8 @@ uniform bool  u_invert;
 
 uniform vec3 u_palette[${MAX_PALETTE}];
 uniform int u_paletteSize;
+uniform vec3 u_darkest;
+uniform vec3 u_brightest;
 
 uniform float u_halftoneScale; // cell size in pixels
 uniform float u_halftoneAngle; // radians
@@ -114,12 +116,18 @@ uniform int u_hasMotion;       // 1 = alpha carries per-pixel motion (pre-pass r
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
 vec3 adjust(vec3 c) {
-  float l = luma(c);
-  // clamp after saturation to mirror the CPU LUT-index clamp in cpu.js
-  c = clamp(l + (c - l) * u_saturation, 0.0, 1.0);
-  c = (c - 0.5) * (1.0 + u_contrast) + 0.5 + u_brightness;
-  c = clamp(c, 0.0, 1.0);
-  c = pow(c, vec3(1.0 / max(u_gamma, 0.01)));
+  // Uniform-coherent identity branches skip exact no-ops on the overwhelmingly
+  // common default path. Supersampling calls this up to ten times per pixel.
+  if (u_saturation != 1.0) {
+    float l = luma(c);
+    // clamp after saturation to mirror the CPU LUT-index clamp in cpu.js
+    c = clamp(l + (c - l) * u_saturation, 0.0, 1.0);
+  }
+  if (u_contrast != 0.0 || u_brightness != 0.0) {
+    c = (c - 0.5) * (1.0 + u_contrast) + 0.5 + u_brightness;
+    c = clamp(c, 0.0, 1.0);
+  }
+  if (u_gamma != 1.0) c = pow(c, vec3(1.0 / max(u_gamma, 0.01)));
   if (u_invert) c = 1.0 - c;
   return c;
 }
@@ -135,18 +143,6 @@ vec3 nearestPalette(vec3 c) {
     if (dist < bestD) { bestD = dist; best = u_palette[i]; }
   }
   return best;
-}
-
-// Darkest / brightest palette entries, for halftone fg/bg.
-void paletteExtremes(out vec3 darkest, out vec3 brightest) {
-  darkest = u_palette[0]; brightest = u_palette[0];
-  float dMin = 1e9, dMax = -1e9;
-  for (int i = 0; i < ${MAX_PALETTE}; i++) {
-    if (i >= u_paletteSize) break;
-    float l = luma(u_palette[i]);
-    if (l < dMin) { dMin = l; darkest = u_palette[i]; }
-    if (l > dMax) { dMax = l; brightest = u_palette[i]; }
-  }
 }
 
 float hash12(vec2 p) {
@@ -181,18 +177,16 @@ vec4 ditherSample(vec2 uv, vec2 pix, float gridScale) {
     // Ordered dithering from tiling threshold texture (u_matOffset drifts it)
     vec2 mpix = mod(pix + u_matOffset, vec2(u_thresholdSize));
     float t = texelFetch(u_threshold, ivec2(mpix), 0).r;
-    c += (t - 0.5 + u_bias) * spread * 255.0 / 255.0 * vec3(1.0);
+    c += (t - 0.5) * spread + u_bias;
     return vec4(nearestPalette(clamp(c, 0.0, 1.0)), outA);
   } else if (u_mode == 2) {
     // White noise (u_seed reseeds per animation tick). floor(): sub-pixel
     // offsets would decorrelate the hash into boiling instead of drift.
     float t = hash12(pix + floor(u_matOffset) + vec2(u_seed * 91.7, u_seed * 37.3));
-    c += (t - 0.5 + u_bias) * spread;
+    c += (t - 0.5) * spread + u_bias;
     return vec4(nearestPalette(clamp(c, 0.0, 1.0)), outA);
   } else if (u_mode == 3 || u_mode == 4) {
     // Procedural halftone: dots (3) or lines (4)
-    vec3 darkest, brightest;
-    paletteExtremes(darkest, brightest);
     // drift applied AFTER rotation so a whole-tile offset stays a lattice
     // vector of the rotated pattern (seamless flow loops at any angle).
     // pix/gridScale puts the lattice in output-pixel space so the dot size is
@@ -212,7 +206,7 @@ vec4 ditherSample(vec2 uv, vec2 pix, float gridScale) {
       float width = (1.0 - l);
       v = step(abs(s - 0.5) * 2.0, width);
     }
-    return vec4(mix(brightest, darkest, v), outA);
+    return vec4(mix(u_brightest, u_darkest, v), outA);
   }
   // Quantize only (mode 0)
   c += u_bias;
@@ -229,7 +223,10 @@ void main() {
   // CORNER of the finer source; the LINEAR sampler reads that as the exact 2x2
   // box mean — deterministic, unlike the old NEAREST corner pick which was
   // FP/driver-dependent (and closer to the box-downsampled classic source).
-  vec4 crisp = ditherSample((vec2(op) + 0.5) / u_outSize, vec2(op), 1.0);
+  vec4 crisp;
+  if (u_ss <= 1 || u_smoothness < 1.0) {
+    crisp = ditherSample((vec2(op) + 0.5) / u_outSize, vec2(op), 1.0);
+  }
 
   if (u_ss <= 1 || u_smoothness <= 0.0) {
     outColor = crisp;
@@ -250,5 +247,5 @@ void main() {
   }
   acc /= float(u_ss * u_ss);
 
-  outColor = mix(crisp, acc, u_smoothness);
+  outColor = u_smoothness >= 1.0 ? acc : mix(crisp, acc, u_smoothness);
 }`;

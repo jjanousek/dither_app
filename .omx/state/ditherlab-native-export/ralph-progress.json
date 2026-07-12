@@ -1,0 +1,16 @@
+{
+  "score": 98,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [],
+  "suggestions": [],
+  "reasoning": "The final rebuilt native app exported a valid full-source 3841x2561 RGBA PNG, a decodable 480x320 GIF, and a 3.02s H.264 MP4 with 89 frames. Extracted GIF/video frames retain clean contours, fine stipple detail, and correct palette coverage without blank, clipped, or corrupted regions.",
+  "threshold": 90,
+  "threshold_pass": true,
+  "reference_images": [
+    "qa-artifacts/final-native-gif-current.png",
+    "qa-artifacts/final-native-video-current.png"
+  ],
+  "generated_screenshot": "/Users/aischool/Downloads/demo-dither-4.png",
+  "next_actions": []
+}

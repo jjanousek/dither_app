@@ -3,8 +3,69 @@
 import { GifEncoder } from './gif.js';
 import { Mp4Muxer } from './mp4.js';
 
+const MAX_MP4_SAMPLE_BYTES = 256 * 1024 * 1024;
+const SEEK_TIMEOUT_MS = 4000;
+export const GIF_RETAINED_PIXEL_BUDGET = 60_000_000;
+
+export function gifFrameBudget(width, height) {
+  const pixels = Math.max(1, width * height);
+  return Math.max(1, Math.floor(GIF_RETAINED_PIXEL_BUDGET / pixels));
+}
+
+function unsupportedH264(message = 'H.264 encoding is not supported on this device') {
+  const error = new Error(message);
+  error.name = 'NotSupportedError';
+  return error;
+}
+
+function seekMedia(video, time, { timeoutMs = SEEK_TIMEOUT_MS, tolerance = 0.05 } = {}) {
+  const target = Math.max(0, time);
+  if (!video.seeking && Math.abs(video.currentTime - target) < 1e-4 && video.readyState >= 2) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    let poll = null;
+    let armed = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      clearInterval(poll);
+      video.removeEventListener('seeked', check);
+      video.removeEventListener('loadeddata', check);
+      video.removeEventListener('timeupdate', check);
+      video.removeEventListener('error', failed);
+    };
+    const check = () => {
+      if (armed && video.readyState >= 2 && !video.seeking
+          && Math.abs(video.currentTime - target) <= tolerance) {
+        cleanup();
+        resolve();
+      }
+    };
+    const failed = () => { cleanup(); reject(new Error('Video decoder failed while seeking')); };
+    video.addEventListener('seeked', check);
+    video.addEventListener('loadeddata', check);
+    video.addEventListener('timeupdate', check);
+    video.addEventListener('error', failed);
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Video seek timed out at ${target.toFixed(3)}s`));
+    }, timeoutMs);
+    try {
+      video.currentTime = target;
+    } catch (error) {
+      cleanup();
+      reject(error);
+      return;
+    }
+    // Browsers may coalesce a sub-frame seek onto the already-decoded frame and
+    // omit `seeked`. Poll the same correctness conditions after one task turn;
+    // do not treat setting currentTime alone as proof that decoding landed.
+    setTimeout(() => { armed = true; check(); }, 0);
+    poll = setInterval(check, 25);
+  });
+}
+
 // Frame-accurate H.264/MP4 export via WebCodecs. Unlike the real-time
-// MediaRecorder path, this seeks the source frame by frame and renders each
+// MediaRecorder path, this steps the source frame by frame and renders each
 // one with no time pressure, so a slow dither can't judder the output — the
 // clip is limited by quality, not by how fast the device renders. Video only
 // (no audio). Returns false if WebCodecs is unavailable so the caller can
@@ -13,41 +74,22 @@ export function canFrameExport() {
   return typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined';
 }
 
-export async function exportVideoFrameAccurate({
-  video, renderFrame, maxWidth = 1280, name = 'dithered', strict = true,
-  onProgress = () => {}, onInfo = null, shouldAbort = null,
-}) {
-  // resolve the source frame rate (fall back to 30) and duration
-  if (!isFinite(video.duration)) {
-    video.currentTime = 1e9;
-    await new Promise((res) => {
-      const done = () => { video.removeEventListener('durationchange', done); res(); };
-      video.addEventListener('durationchange', done);
-      setTimeout(done, 4000);
-    });
-  }
-  const duration = video.duration;
-  if (!isFinite(duration) || duration <= 0) throw new Error('video duration unknown');
-  const fps = 30;
-  // hold all compressed samples until finalize -> bound memory (and export
-  // time) by capping the frame count; realistic clips are far under this
-  const MAX_FRAMES = 6000; // ~3.3 min at 30fps
-  let frameCount = Math.max(1, Math.round(duration * fps));
-  if (frameCount > MAX_FRAMES) {
-    frameCount = MAX_FRAMES;
-    onInfo?.(`Long clip: exporting the first ${Math.round(MAX_FRAMES / fps)}s`);
-  }
-
-  // Encode size: NEVER fractionally resample (that shreds the pattern), and
-  // integer-UPSCALE so each 1px dither cell becomes a >=2x2 block. A 1px
-  // dither is pure highest-frequency energy — the worst case for H.264's DCT,
-  // which discards exactly that. Turning cells into 2x2 blocks shifts the
-  // energy into lower frequencies that survive quantization, so the pattern
-  // stays crisp instead of blocking/ringing (nearest-neighbor upscale).
-  const first = renderFrame();
+// Shared H.264 pipeline for the frame-accurate exporters (seek-driven video
+// and phase-driven loop bakes).
+//
+// Encode size: NEVER fractionally resample (that shreds the pattern), and
+// integer-UPSCALE so each 1px dither cell becomes a >=2x2 block. A 1px
+// dither is pure highest-frequency energy — the worst case for H.264's DCT,
+// which discards exactly that. Turning cells into 2x2 blocks shifts the
+// energy into lower frequencies that survive quantization, so the pattern
+// stays crisp instead of blocking/ringing (nearest-neighbor upscale).
+async function makeH264Encoder(first, fps, strict) {
   const long = Math.max(first.width, first.height);
-  let scale = Math.max(2, Math.round(1440 / long));
-  while (long * scale > 3840 && scale > 2) scale--; // cap ~4K long side (level 5.1)
+  // Use the quality-preserving >=2x enlargement whenever the source grid fits.
+  // Very wide ASCII/cell renders use 1x rather than exceeding H.264 level 5.1.
+  let scale = long > 1920 ? 1 : Math.max(2, Math.round(1440 / long));
+  while (long * scale > 3840 && scale > 1) scale--;
+  if (long * scale > 3840) throw unsupportedH264('Video frame is wider than the 3840px H.264 limit');
   const w = Math.max(2, (first.width * scale) & ~1);
   const h = Math.max(2, (first.height * scale) & ~1);
 
@@ -59,73 +101,219 @@ export async function exportVideoFrameAccurate({
   fctx.imageSmoothingEnabled = !strict;
   fctx.imageSmoothingQuality = 'high';
 
-  const muxer = new Mp4Muxer(w, h, fps);
-  let encErr = null;
-  const encoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addChunk(chunk, meta),
-    error: (e) => { encErr = e; },
-  });
   // Prefer constant-QUALITY (quantizer/QP) encoding — for a hard-edged dither
   // that tracks the canvas far better than a target bitrate — with High
   // profile (CABAC). Fall back to a generous VBR bitrate where QP is
   // unsupported. avc1.640033 = High @ Level 5.1 (covers up to ~4K).
-  const base = {
-    codec: 'avc1.640033', width: w, height: h, framerate: fps,
-    latencyMode: 'quality', contentHint: 'text', avc: { format: 'avc' },
-  };
+  const codecs = ['avc1.640033', 'avc1.4d0033', 'avc1.420033']; // High, Main, Baseline @ L5.1
   // Hard 1-bit is adversarial for H.264 (high-freq edges -> ringing/mosquito),
   // so strict output needs a lower QP / fatter bitrate than smoothed (tone)
-  // output, which compresses cleanly. (GPT-5.5 Pro: ~10-12 strict, ~14-16 smooth.)
+  // output, which compresses cleanly. Tuned ranges: ~10-12 strict, ~14-16 smooth.
+  const bpp = strict ? 0.5 : 0.25;
+  const cap = strict ? 80e6 : 48e6;
+  let config = null;
   let quantizer = null;
-  try {
-    if ((await VideoEncoder.isConfigSupported({ ...base, bitrateMode: 'quantizer' })).supported) {
-      encoder.configure({ ...base, bitrateMode: 'quantizer' });
-      quantizer = strict ? 12 : 16; // lower = higher quality
+  for (const codec of codecs) {
+    const base = {
+      codec, width: w, height: h, framerate: fps,
+      latencyMode: 'quality', contentHint: 'text', avc: { format: 'avc' },
+    };
+    if (typeof VideoEncoder.isConfigSupported !== 'function') {
+      config = { ...base, bitrateMode: 'variable', bitrate: Math.min(cap, Math.max(8e6, Math.round(w * h * fps * bpp))) };
+      break;
     }
-  } catch { /* fall through to VBR */ }
-  if (quantizer === null) {
-    const bpp = strict ? 0.5 : 0.25;
-    const cap = strict ? 80e6 : 48e6;
-    encoder.configure({ ...base, bitrateMode: 'variable', bitrate: Math.min(cap, Math.max(8e6, Math.round(w * h * fps * bpp))) });
+    try {
+      const qp = { ...base, bitrateMode: 'quantizer' };
+      if ((await VideoEncoder.isConfigSupported(qp)).supported) {
+        config = qp;
+        quantizer = strict ? 12 : 16; // lower = higher quality
+        break;
+      }
+      const vbr = { ...base, bitrateMode: 'variable', bitrate: Math.min(cap, Math.max(8e6, Math.round(w * h * fps * bpp))) };
+      if ((await VideoEncoder.isConfigSupported(vbr)).supported) {
+        config = vbr;
+        break;
+      }
+    } catch { /* try the next profile */ }
+  }
+  if (!config) throw unsupportedH264();
+
+  const muxer = new Mp4Muxer(w, h, fps, { maxBytes: MAX_MP4_SAMPLE_BYTES });
+  let encErr = null;
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => { try { muxer.addChunk(chunk, meta); } catch (error) { encErr = error; } },
+    error: (e) => { encErr = e; },
+  });
+  try {
+    encoder.configure(config);
+  } catch (error) {
+    try { encoder.close(); } catch { /* configure may already close it */ }
+    throw unsupportedH264(error.message);
   }
 
-  const wasLooping = video.loop;
-  const wasPaused = video.paused;
-  video.loop = false;
-  video.pause();
-
-  const seekTo = (t) => new Promise((res) => {
-    let timer = null;
-    const done = () => { video.removeEventListener('seeked', done); clearTimeout(timer); res(); };
-    video.addEventListener('seeked', done);
-    timer = setTimeout(done, 4000);
-    video.currentTime = t;
-  });
-
-  try {
-    for (let i = 0; i < frameCount; i++) {
-      if (shouldAbort && shouldAbort()) throw new Error('cancelled');
-      if (encErr) throw encErr;
-      await seekTo(Math.min(duration - 1e-3, i / fps));
-      const processed = renderFrame();
+  const keyEvery = Math.max(1, Math.round(fps * 2)); // ~2s GOP at any rate
+  return {
+    w,
+    h,
+    err: () => encErr,
+    limitReached: () => muxer.limitReached,
+    // Draw + encode one frame; awaits encoder backpressure (keeps UI alive).
+    async add(processed, i) {
       fctx.drawImage(processed, 0, 0, processed.width, processed.height, 0, 0, w, h);
       const vf = new VideoFrame(frame, { timestamp: Math.round((i * 1e6) / fps), duration: Math.round(1e6 / fps) });
-      const opts = { keyFrame: i % 60 === 0 };
+      const opts = { keyFrame: i % keyEvery === 0 };
       if (quantizer !== null) opts.avc = { quantizer };
       encoder.encode(vf, opts);
       vf.close();
-      // backpressure: don't let the encode queue run away, and keep UI alive
       while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 4));
+      return !muxer.limitReached;
+    },
+    async finish() {
+      await encoder.flush();
+      if (encErr) throw encErr;
+      encoder.close();
+      const blob = muxer.finalize();
+      muxer.release();
+      return blob;
+    },
+    close() {
+      if (encoder.state !== 'closed') { try { encoder.close(); } catch { /* already closing */ } }
+    },
+  };
+}
+
+// Snap a measured frame rate to the standard it almost certainly is; keeps
+// the seek grid aligned with real frames (23.976 sampled at 24 would double
+// one frame every ~41s) and gives the muxer exact NTSC deltas (90000/29.97
+// -> 3003). Unrecognized rates are used as measured, clamped to sanity.
+const COMMON_FPS = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60];
+function snapFps(measured) {
+  if (!(measured > 0)) return 30;
+  const fps = Math.min(60, Math.max(10, measured));
+  // nearest within 2% — NOT first match: the NTSC/integer pairs (23.976/24,
+  // 29.97/30, 59.94/60) are only 0.1% apart, both inside any sane tolerance
+  let best = fps;
+  let bd = 0.02;
+  for (const c of COMMON_FPS) {
+    const d = Math.abs(fps - c) / c;
+    if (d < bd) { bd = d; best = c; }
+  }
+  return best;
+}
+
+export async function exportVideoFrameAccurate({
+  video, renderFrame, name = 'dithered', strict = true, sourceFps = 0,
+  onFrameTime = null, onProgress = () => {}, onInfo = null, shouldAbort = null,
+}) {
+  const originalTime = video.currentTime;
+  const wasLooping = video.loop;
+  const wasPaused = video.paused;
+  // resolve the duration (MediaRecorder-made clips report Infinity until
+  // forced to demux to the end)
+  if (!isFinite(video.duration)) {
+    video.currentTime = 1e9;
+    await new Promise((res) => {
+      const done = () => { video.removeEventListener('durationchange', done); res(); };
+      video.addEventListener('durationchange', done);
+      setTimeout(done, 4000);
+    });
+  }
+  const duration = video.duration;
+  if (!isFinite(duration) || duration <= 0) {
+    await seekMedia(video, originalTime, { timeoutMs: 2000 }).catch(() => {});
+    if (!wasPaused) video.play().catch(() => {});
+    else video.pause();
+    throw new Error('video duration unknown');
+  }
+  // sourceFps = the app's passive estimate from rVFC mediaTime deltas during
+  // normal playback; sampling a 24fps clip on a 30fps grid would bake 2:3
+  // pulldown judder into every export of film-rate footage.
+  const fps = snapFps(sourceFps);
+  if (Math.round(fps) !== 30) onInfo?.(`Exporting at ${Math.round(fps * 100) / 100} fps (source rate)`);
+  // hold all compressed samples until finalize -> bound memory (and export
+  // time) by capping the frame count; realistic clips are far under this
+  const MAX_FRAMES = Math.round(fps * 200); // ~3.3 min at any rate
+  let frameCount = Math.max(1, Math.round(duration * fps));
+  if (frameCount > MAX_FRAMES) {
+    frameCount = MAX_FRAMES;
+    onInfo?.(`Long clip: exporting the first ${Math.round(MAX_FRAMES / fps)}s`);
+  }
+
+  video.loop = false;
+  video.pause();
+
+  let enc = null;
+  try {
+    // Seek to frame 0 BEFORE the sizing render: it must reflect the exported
+    // clip's own first frame (strict/lastBoxResolved read after it), and it
+    // must not re-prime the freshly invalidated temporal history with the
+    // arbitrary pre-export playback position.
+    await seekMedia(video, 0);
+    onFrameTime?.(0);
+    const first = renderFrame();
+    // strict may be a thunk evaluated after the sizing render, so the caller
+    // can read the engine's ACTUAL crisp-vs-tone state for this export
+    // (raw state.smoothness lies for CPU algorithms and lost WebGL).
+    const strictVal = typeof strict === 'function' ? !!strict() : strict;
+    enc = await makeH264Encoder(first, fps, strictVal);
+
+    await enc.add(first, 0); // frame 0 is already rendered — encode it as-is
+    onProgress(1 / frameCount);
+    for (let i = 1; i < frameCount; i++) {
+      if (shouldAbort && shouldAbort()) throw new Error('cancelled');
+      if (enc.err()) throw enc.err();
+      await seekMedia(video, Math.min(duration - 1e-3, i / fps));
+      onFrameTime?.(i / fps);
+      if (!(await enc.add(renderFrame(), i))) {
+        onInfo?.('Video capped when compressed frames reached 256 MB (memory safety)');
+        break;
+      }
       onProgress((i + 1) / frameCount);
     }
-    await encoder.flush();
-    if (encErr) throw encErr;
-    encoder.close();
-    downloadBlob(muxer.finalize(), `${name}.mp4`);
+    downloadBlob(await enc.finish(), `${name}.mp4`);
   } finally {
-    if (encoder.state !== 'closed') { try { encoder.close(); } catch { /* already closing */ } }
+    enc?.close();
     video.loop = wasLooping;
+    const restoreTime = isFinite(video.duration)
+      ? Math.min(Math.max(0, originalTime), Math.max(0, video.duration - 1e-3))
+      : originalTime;
+    await seekMedia(video, restoreTime, { timeoutMs: 2000 }).catch(() => {});
     if (!wasPaused) video.play().catch(() => {});
+    else video.pause();
+  }
+}
+
+// Frame-accurate MP4 for deterministic sources (generative scenes, animated
+// stills): steps a phase clock over exactly the requested cycle span instead
+// of seeking a video, so the bake is perfectly paced and loops seamlessly no
+// matter how slowly the device renders — same encoder/quality as the video
+// path, unlike the realtime MediaRecorder capture it replaces.
+export async function exportLoopFrameAccurate({
+  renderFrame, setPhase, count, fps, name = 'dithered', strict = true,
+  onProgress = () => {}, onInfo = null, shouldAbort = null,
+}) {
+  setPhase(0);
+  const first = renderFrame();
+  const strictVal = typeof strict === 'function' ? !!strict() : strict;
+  const enc = await makeH264Encoder(first, fps, strictVal);
+  try {
+    await enc.add(first, 0);
+    onProgress(1 / count);
+    for (let i = 1; i < count; i++) {
+      if (shouldAbort && shouldAbort()) throw new Error('cancelled');
+      if (enc.err()) throw enc.err();
+      setPhase(i / count);
+      if (!(await enc.add(renderFrame(), i))) {
+        onInfo?.('Video capped when compressed frames reached 256 MB (memory safety)');
+        break;
+      }
+      onProgress((i + 1) / count);
+      // let the busy overlay paint / cancel clicks land between heavy renders
+      if (i % 4 === 0) await new Promise((r) => setTimeout(r, 0));
+    }
+    downloadBlob(await enc.finish(), `${name}.mp4`);
+  } finally {
+    enc.close();
   }
 }
 
@@ -134,7 +322,8 @@ export function downloadBlob(blob, filename) {
   a.href = URL.createObjectURL(blob);
   a.download = filename;
   a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  const revokeTimer = setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  revokeTimer?.unref?.(); // keep Node-side regression tests from waiting 10s
 }
 
 export function exportText(text, name = 'ascii', ext = 'txt') {
@@ -233,12 +422,13 @@ export function buildHtml(grid, pageBg = '#0a0a0c', font = null) {
 const audioTaps = new WeakMap();
 
 export class VideoExporter {
-  constructor(canvas, sourceVideo, { fps = 30, onProgress, onDone } = {}) {
+  constructor(canvas, sourceVideo, { fps = 30, onProgress, onDone, renderFrame = null } = {}) {
     this.canvas = canvas;
     this.video = sourceVideo;
     this.fps = fps;
     this.onProgress = onProgress || (() => {});
     this.onDone = onDone || (() => {});
+    this.renderFrame = renderFrame;
     this.recorder = null;
     this._tick = null;
     this._abort = null;
@@ -279,6 +469,10 @@ export class VideoExporter {
 
     const video = this.video;
     const wasLooping = video.loop;
+    const wasPaused = video.paused;
+    const originalTime = video.currentTime;
+    const originalMuted = video.muted;
+    const originalRate = video.playbackRate;
     const stream = this.canvas.captureStream(this.fps);
     this._cancelled = false;
 
@@ -318,6 +512,11 @@ export class VideoExporter {
       }
       if (this._cancelled) throw new Error('cancelled');
 
+      // The seek updates the media element before the app's preview loop gets
+      // another animation frame. Render the landed frame explicitly so the
+      // recorded canvas cannot begin with a stale pre-seek image.
+      this.renderFrame?.();
+
       this.recorder.start(250);
       await video.play();
       let doneTicks = 0;
@@ -352,8 +551,14 @@ export class VideoExporter {
       try { this._audioTap?.cached.src.disconnect(this._audioTap.dest); } catch { /* fine */ }
       this._audioTap = null;
       video.loop = wasLooping;
-      video.muted = true;
-      video.play().catch(() => {});
+      video.muted = originalMuted;
+      video.playbackRate = originalRate;
+      const restoreTime = isFinite(video.duration)
+        ? Math.min(Math.max(0, originalTime), Math.max(0, video.duration - 1e-3))
+        : originalTime;
+      await seekMedia(video, restoreTime, { timeoutMs: 2000 }).catch(() => {});
+      if (!wasPaused) video.play().catch(() => {});
+      else video.pause();
     }
   }
 
@@ -368,9 +573,18 @@ export class VideoExporter {
 // ---------------------------------------------------------------------------
 // GIF export: samples processed frames while the video plays once.
 // renderFrame() must return the current processed canvas.
+// smooth may be a thunk evaluated after the sizing render (reads the engine's
+// actual crisp-vs-tone state). postProcess (optional) runs on each frame's
+// pixels AFTER decimation — the app uses it to apply post-FX at the GIF's own
+// resolution, so scanlines/grain survive instead of being averaged away.
 // ---------------------------------------------------------------------------
-export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, name = 'dithered', onProgress = () => {}, onInfo = null, animate = null, shouldAbort = null, smooth = false }) {
+export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, name = 'dithered', onProgress = () => {}, onInfo = null, animate = null, liveDuration = 0, shouldAbort = null, smooth = false, postProcess = null, onSized = null }) {
+  const originalTime = video?.currentTime ?? 0;
   const first = renderFrame();
+  if (typeof smooth === 'function') smooth = !!smooth();
+  // the sizing render ran at the arbitrary pre-export playback position; let
+  // the caller drop temporal history again so frame 0 doesn't blend with it
+  onSized?.();
   // Dither patterns don't survive fractional resampling — nearest-neighbor at
   // a ratio like 0.876 drops irregular rows/columns and shreds the pattern.
   // Snap to a whole-number divisor of the frame instead, picking the divisor
@@ -389,7 +603,7 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
   // sizes, retaining every frame would exhaust the tab. Sampling the same
   // cycle at a lower fps keeps the loop seamless and the memory flat.
   if (animate?.count) {
-    const maxFrames = Math.max(24, Math.floor(60e6 / (w * h)));
+    const maxFrames = gifFrameBudget(w, h);
     if (animate.count > maxFrames) {
       const k = Math.ceil(animate.count / maxFrames);
       animate = { ...animate, count: Math.ceil(animate.count / k) };
@@ -436,42 +650,64 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
     }
     return dst;
   };
+  // one captured frame: render -> decimate -> optional post-FX at GIF size
+  const capture = () => {
+    const px = grab(renderFrame());
+    return postProcess ? postProcess(px, w, h) : px;
+  };
 
   const enc = new GifEncoder(w, h, { fps });
 
   if (!video) {
+    if (liveDuration > 0) {
+      // Webcam and browser-decoded animated images cannot be seeked to exact
+      // timestamps. Sample them in real time for the requested record length,
+      // while keeping the same retained-pixel memory bound as baked loops.
+      const wanted = Math.max(1, Math.round(liveDuration * fps));
+      const maxFrames = gifFrameBudget(w, h);
+      const count = Math.min(wanted, maxFrames);
+      if (count < wanted) onInfo?.(`Large GIF: capped to ${(count / fps).toFixed(1)}s to bound memory`);
+      const started = performance.now();
+      for (let i = 0; i < count; i++) {
+        if (shouldAbort?.()) throw new Error('cancelled');
+        const due = started + (i * 1000) / fps;
+        const delay = due - performance.now();
+        if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+        enc.addFrame(capture());
+        onProgress((i + 1) / count);
+      }
+      await new Promise((r) => setTimeout(r, 0));
+      const blob = await enc.finish(shouldAbort);
+      downloadBlob(blob, `${name}.gif`);
+      return blob;
+    }
     if (animate) {
       // Animated still: step the animation phase over exactly one cycle so
       // the exported GIF loops seamlessly. Yield each frame so the busy
       // overlay paints and Cancel clicks are processed.
       for (let i = 0; i < animate.count; i++) {
+        if (shouldAbort?.()) throw new Error('cancelled');
         animate.setPhase(i / animate.count);
-        enc.addFrame(grab(renderFrame()));
+        enc.addFrame(capture());
         onProgress((i + 1) / animate.count);
         await new Promise((r) => setTimeout(r, 0));
       }
       await new Promise((r) => setTimeout(r, 0)); // paint 100% before LZW
-      downloadBlob(await enc.finish(shouldAbort), `${name}.gif`);
-      return;
+      const blob = await enc.finish(shouldAbort);
+      downloadBlob(blob, `${name}.gif`);
+      return blob;
     }
     // Single image -> single-frame GIF
-    enc.addFrame(grab(first));
-    downloadBlob(await enc.finish(shouldAbort), `${name}.gif`);
-    return;
+    enc.addFrame(postProcess ? postProcess(grab(first), w, h) : grab(first));
+    const blob = await enc.finish(shouldAbort);
+    downloadBlob(blob, `${name}.gif`);
+    return blob;
   }
 
   const wasLooping = video.loop;
   const wasPaused = video.paused;
   video.loop = false;
   video.pause();
-
-  const seekTo = (t) => new Promise((r) => {
-    let timer = null;
-    const hnd = () => { video.removeEventListener('seeked', hnd); clearTimeout(timer); r(); };
-    video.addEventListener('seeked', hnd);
-    timer = setTimeout(hnd, 4000); // safety: some streams drop seeked events
-    video.currentTime = t;
-  });
 
   try {
     // MediaRecorder-produced webm (including this app's own exports) reports
@@ -491,7 +727,7 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
 
     const step = 1 / fps;
     // memory bound: keep total retained frame indices under ~60M px (~120MB)
-    const memFrames = Math.max(24, Math.floor(60e6 / (w * h)));
+    const memFrames = gifFrameBudget(w, h);
     const frameCount = Math.max(1, Math.min(480, memFrames, Math.floor(duration * fps)));
     if (frameCount < Math.floor(duration * fps)) {
       onInfo?.(`GIF covers the first ${(frameCount / fps).toFixed(0)}s of ${duration.toFixed(0)}s`);
@@ -500,14 +736,21 @@ export async function exportGIF({ video, renderFrame, fps = 12, maxWidth = 480, 
     for (let i = 0; i < frameCount; i++) {
       // animated video: lock the phase to the video timeline, not wall clock
       animate?.setTime?.(i * step);
-      await seekTo(Math.min(duration - 0.001, i * step));
-      enc.addFrame(grab(renderFrame()));
+      await seekMedia(video, Math.min(duration - 0.001, i * step));
+      enc.addFrame(capture());
       onProgress((i + 1) / frameCount);
     }
 
-    downloadBlob(await enc.finish(shouldAbort), `${name}.gif`);
+    const blob = await enc.finish(shouldAbort);
+    downloadBlob(blob, `${name}.gif`);
+    return blob;
   } finally {
     video.loop = wasLooping;
+    const restoreTime = isFinite(video.duration)
+      ? Math.min(Math.max(0, originalTime), Math.max(0, video.duration - 1e-3))
+      : originalTime;
+    await seekMedia(video, restoreTime, { timeoutMs: 2000 }).catch(() => {});
     if (!wasPaused) video.play().catch(() => {});
+    else video.pause();
   }
 }

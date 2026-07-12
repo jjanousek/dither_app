@@ -1,11 +1,59 @@
 // Media source loading: images, videos, webcam, drag & drop, paste, demo scene.
 
-export function loadImageFile(file) {
+// Count GIF image blocks without decoding compressed pixels. This distinguishes
+// a genuinely animated GIF from a one-frame GIF, avoiding a permanent 60fps
+// render loop for static files. Stop at `limit` so animated files are cheap.
+export function countGifFrames(bytes, limit = 2) {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (b.length < 13 || String.fromCharCode(...b.subarray(0, 3)) !== 'GIF') return 0;
+  let p = 13;
+  if (b[10] & 0x80) p += 3 * (1 << ((b[10] & 0x07) + 1));
+  let frames = 0;
+  const skipSubBlocks = () => {
+    while (p < b.length) {
+      const n = b[p++];
+      if (!n) return true;
+      p += n;
+      if (p > b.length) return false;
+    }
+    return false;
+  };
+  while (p < b.length) {
+    const marker = b[p++];
+    if (marker === 0x3b) break; // trailer
+    if (marker === 0x21) { // extension: label + data sub-blocks
+      if (p >= b.length) break;
+      p++;
+      if (!skipSubBlocks()) break;
+      continue;
+    }
+    if (marker !== 0x2c || p + 9 > b.length) break; // image descriptor
+    frames++;
+    if (frames >= limit) return frames;
+    const packed = b[p + 8];
+    p += 9;
+    if (packed & 0x80) p += 3 * (1 << ((packed & 0x07) + 1));
+    if (p >= b.length) break;
+    p++; // LZW minimum code size
+    if (!skipSubBlocks()) break;
+  }
+  return frames;
+}
+
+export async function loadImageFile(file) {
+  const isGif = (file.type || '').toLowerCase() === 'image/gif' || /\.gif$/i.test(file.name || '');
+  let animatedGif = false;
+  if (isGif) {
+    try { animatedGif = countGifFrames(await file.arrayBuffer()) > 1; }
+    catch { animatedGif = true; } // malformed metadata: preserve visible motion if the browser can decode it
+  }
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => resolve({
-      type: 'image',
+      // Animated GIFs advance inside an Image element, but they must stay on
+      // the live render loop instead of being cached as a static still.
+      type: animatedGif ? 'animated-image' : 'image',
       el: img,
       width: img.naturalWidth,
       height: img.naturalHeight,
@@ -25,7 +73,16 @@ export function loadVideoFile(file) {
     video.loop = true;
     video.playsInline = true;
     video.preload = 'auto';
-    video.onloadedmetadata = () => {
+    let settled = false;
+    let fallback = null;
+    const cleanup = () => {
+      clearTimeout(fallback);
+      video.removeEventListener('loadeddata', loaded);
+    };
+    const loaded = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve({
         type: 'video',
         el: video,
@@ -36,7 +93,21 @@ export function loadVideoFile(file) {
         url,
       });
     };
-    video.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Could not load video')); };
+    // Wait for a decoded frame where possible. Metadata alone can leave the
+    // first preview/export black on slower decoders; the fallback retains
+    // compatibility with formats that expose dimensions but delay decoding.
+    video.onloadedmetadata = () => {
+      if (video.readyState >= 2) loaded();
+      else fallback = setTimeout(loaded, 4000);
+    };
+    video.addEventListener('loadeddata', loaded);
+    video.onerror = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      URL.revokeObjectURL(url);
+      reject(new Error('Could not load video'));
+    };
     video.src = url;
   });
 }
@@ -74,8 +145,10 @@ export async function openWebcam() {
 }
 
 export function loadFile(file) {
-  if (file.type.startsWith('video/')) return loadVideoFile(file);
-  if (file.type.startsWith('image/')) return loadImageFile(file);
+  const type = (file.type || '').toLowerCase();
+  const name = (file.name || '').toLowerCase();
+  if (type.startsWith('video/') || /\.(mp4|m4v|mov|webm|ogv)$/i.test(name)) return loadVideoFile(file);
+  if (type.startsWith('image/') || /\.(avif|bmp|gif|jpe?g|png|webp)$/i.test(name)) return loadImageFile(file);
   return Promise.reject(new Error(`Unsupported file type: ${file.type || 'unknown'}`));
 }
 

@@ -13,6 +13,31 @@ import WebKit
 
 var appURL = URL(string: "http://127.0.0.1/")! // real port filled in at launch
 let testMode = ProcessInfo.processInfo.environment["DL_TEST_DOWNLOAD"] == "1"
+let testExportTarget = ProcessInfo.processInfo.environment["DL_TEST_EXPORT"] ?? "png"
+
+private func matchesAppOrigin(scheme: String?, host: String?, port: Int?) -> Bool {
+    guard let scheme, let host,
+          let appScheme = appURL.scheme, let appHost = appURL.host else { return false }
+    return scheme.caseInsensitiveCompare(appScheme) == .orderedSame
+        && host.caseInsensitiveCompare(appHost) == .orderedSame
+        && port == appURL.port
+}
+
+private func isAppOrigin(_ url: URL) -> Bool {
+    matchesAppOrigin(scheme: url.scheme, host: url.host, port: url.port)
+}
+
+private func isAppOrigin(_ origin: WKSecurityOrigin) -> Bool {
+    matchesAppOrigin(scheme: origin.protocol, host: origin.host, port: origin.port)
+}
+
+private func isAppBlobURL(_ url: URL) -> Bool {
+    guard url.scheme?.lowercased() == "blob" else { return false }
+    let value = url.absoluteString
+    guard value.lowercased().hasPrefix("blob:"),
+          let embeddedURL = URL(string: String(value.dropFirst(5))) else { return false }
+    return isAppOrigin(embeddedURL)
+}
 
 /// Minimal HTTP/1.1 static file server over Network.framework. GET/HEAD only,
 /// loopback only, Cache-Control: no-store (never serve stale modules after an
@@ -263,7 +288,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func scheduleTestHook() {
         guard testMode else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            self.webView.evaluateJavaScript("document.getElementById('btn-export-png').click()")
+            if testExportTarget == "video" {
+                let script = """
+                (() => {
+                  const row = [...document.querySelectorAll('.row')]
+                    .find((el) => el.querySelector('label')?.textContent === 'Style');
+                  const style = row?.querySelector('select');
+                  if (!style) throw new Error('animation style control missing');
+                  style.value = 'breathe';
+                  style.dispatchEvent(new Event('change', { bubbles: true }));
+                  setTimeout(() => {
+                    const lengthRow = [...document.querySelectorAll('.row')]
+                      .find((el) => el.querySelector('label')?.textContent === 'Record length');
+                    const length = lengthRow?.querySelector('select');
+                    if (length) {
+                      length.value = '3';
+                      length.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    document.getElementById('btn-export-video').click();
+                  }, 250);
+                })()
+                """
+                self.webView.evaluateJavaScript(script)
+            } else {
+                let id = testExportTarget == "gif" ? "btn-export-gif" : "btn-export-png"
+                self.webView.evaluateJavaScript("document.getElementById('\(id)').click()")
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
             print("TEST_DOWNLOAD_FAIL: timed out")
@@ -281,15 +331,43 @@ extension AppDelegate: WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
             decisionHandler(.download)
             return
         }
-        // external links open in the default browser, the app stays on Ditherlab
-        if let url = navigationAction.request.url,
-           let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
-           url.host != "127.0.0.1" {
+
+        guard let url = navigationAction.request.url,
+              let scheme = url.scheme?.lowercased() else {
+            decisionHandler(.cancel)
+            return
+        }
+
+        if isAppOrigin(url) {
+            decisionHandler(.allow)
+            return
+        }
+
+        // External web links leave the wrapper. In particular, a different
+        // loopback port is not part of Ditherlab's ephemeral server origin.
+        if scheme == "http" || scheme == "https" {
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
             return
         }
-        decisionHandler(.allow)
+
+        // The app creates blob/data URLs for exports and pasted images. Keep
+        // those flows local, but only when their provenance is Ditherlab's
+        // exact origin. about:blank is WebKit's only required opaque page.
+        if scheme == "blob", isAppBlobURL(url) {
+            decisionHandler(.allow)
+            return
+        }
+        if scheme == "data", isAppOrigin(navigationAction.sourceFrame.securityOrigin) {
+            decisionHandler(.allow)
+            return
+        }
+        if scheme == "about", url.absoluteString.lowercased() == "about:blank" {
+            decisionHandler(.allow)
+            return
+        }
+
+        decisionHandler(.cancel)
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
@@ -308,7 +386,10 @@ extension AppDelegate: WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
     func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
                  initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
-        decisionHandler(.grant) // macOS still shows its own camera consent dialog
+        // The web app requests video-only capture. Never grant capture to a
+        // subframe, another loopback port, or a microphone request.
+        let trustedCameraRequest = frame.isMainFrame && isAppOrigin(origin) && type == .camera
+        decisionHandler(trustedCameraRequest ? .grant : .deny)
     }
 
     // <input type=file> needs the app to supply the picker in WKWebView

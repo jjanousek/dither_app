@@ -48,6 +48,10 @@ export class CpuPreview {
     this.busy = false;
     this.pending = false;
     clearTimeout(this._timer);
+    // A failed/hung module worker otherwise stays retained for the lifetime of
+    // the editor even though every subsequent frame uses the sync fallback.
+    this.worker?.terminate();
+    this.worker = null;
     if (this.onResult) this.onResult();
   }
 

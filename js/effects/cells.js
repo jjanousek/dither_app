@@ -33,6 +33,25 @@ function hexRgb(hex) {
   return c;
 }
 
+// Exact byte-RGB CSS strings, kept in a small direct-mapped cache. Cell
+// renderers otherwise allocate several short strings per visible cell, every
+// frame. A direct map stays bounded and makes a miss no worse than formatting
+// the original string (unlike a Map with per-miss eviction on colorful video).
+const RGB_CACHE_SLOTS = 1 << 12;
+const rgbTags = new Int32Array(RGB_CACHE_SLOTS);
+const rgbStrings = new Array(RGB_CACHE_SLOTS);
+rgbTags.fill(-1);
+
+function rgbCss(r, g, b) {
+  const key = (r << 16) | (g << 8) | b;
+  const slot = Math.imul(key ^ (key >>> 11), 0x9e3779b1) & (RGB_CACHE_SLOTS - 1);
+  if (rgbTags[slot] === key) return rgbStrings[slot];
+  const css = `rgb(${r},${g},${b})`;
+  rgbTags[slot] = key;
+  rgbStrings[slot] = css;
+  return css;
+}
+
 // Deterministic per-cell hash in [0,1). Stable across frames.
 function hash01(col, row, seed) {
   let h = (Math.imul(col + 1, 374761393) +
@@ -76,6 +95,87 @@ function paintBg(ctx, o) {
 
 function lighten(v, t) { return Math.round(v + (255 - v) * t); }
 
+// Fine cell previews can contain 50K-100K primitives per frame. Issuing one
+// Canvas path/fill call per primitive is far slower than writing the bounded
+// preview bitmap once, and was the reason sub-6px cells stuttered. Reuse one
+// ImageData per context/size so the fast path has no per-frame multi-megabyte
+// allocation. Scatter and the more elaborate large-cell treatments continue
+// through Canvas paths below.
+const compactRasterCache = new WeakMap();
+
+function compactRaster(ctx, o) {
+  if (typeof ctx.createImageData !== 'function' || typeof ctx.putImageData !== 'function') return null;
+  ctx.setTransform?.(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  const width = Math.max(1, Math.round(o.width));
+  const height = Math.max(1, Math.round(o.height));
+  let cached = compactRasterCache.get(ctx);
+  if (!cached || cached.width !== width || cached.height !== height) {
+    cached = { width, height, image: ctx.createImageData(width, height) };
+    compactRasterCache.set(ctx, cached);
+  }
+  const bg = hexRgb(o.ink);
+  const d = cached.image.data;
+  for (let i = 0; i < d.length; i += 4) {
+    d[i] = bg[0];
+    d[i + 1] = bg[1];
+    d[i + 2] = bg[2];
+    d[i + 3] = 255;
+  }
+  cached.data = d;
+  cached.bg = bg;
+  return cached;
+}
+
+function blendChannel(bg, fg, alpha) {
+  return Math.round(bg + (fg - bg) * alpha);
+}
+
+function putBlended(d, i, bg, r, g, b, alpha) {
+  d[i] = blendChannel(bg[0], r, alpha);
+  d[i + 1] = blendChannel(bg[1], g, alpha);
+  d[i + 2] = blendChannel(bg[2], b, alpha);
+  d[i + 3] = 255;
+}
+
+function renderCompactDots(ctx, grid, o, gate, duo, paper) {
+  if (!o.compact || o.scatter !== 0) return false;
+  const raster = compactRaster(ctx, o);
+  if (!raster) return false;
+  const { cols, rows, data } = grid;
+  const { width, height, image, data: out, bg } = raster;
+  const cell = o.cell;
+  for (let row = 0; row < rows; row++) {
+    const cy = row * cell + cell * 0.5;
+    for (let col = 0; col < cols; col++) {
+      const i = (row * cols + col) * 4;
+      const L = lumOf(data, i);
+      if (L < gate) continue;
+      const rad = cell * 0.425 * Math.sqrt(L);
+      if (rad < 0.4) continue;
+      const cx = col * cell + cell * 0.5;
+      const r = duo ? paper[0] : data[i];
+      const g = duo ? paper[1] : data[i + 1];
+      const b = duo ? paper[2] : data[i + 2];
+      const x0 = Math.max(0, Math.floor(cx - rad - 0.5));
+      const x1 = Math.min(width, Math.ceil(cx + rad + 0.5));
+      const y0 = Math.max(0, Math.floor(cy - rad - 0.5));
+      const y1 = Math.min(height, Math.ceil(cy + rad + 0.5));
+      for (let y = y0; y < y1; y++) {
+        const dy = y + 0.5 - cy;
+        for (let x = x0; x < x1; x++) {
+          const dx = x + 0.5 - cx;
+          const alpha = Math.min(1, Math.max(0, rad + 0.5 - Math.sqrt(dx * dx + dy * dy)));
+          if (alpha > 0) putBlended(out, (y * width + x) * 4, bg, r, g, b, alpha);
+        }
+      }
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Dots — circles, brighter = bigger, small specular highlight
 // ---------------------------------------------------------------------------
@@ -89,12 +189,13 @@ function renderDots(ctx, grid, o) {
   const paper = duo ? hexRgb(o.paper) : null;
   const drawHi = cell >= 8;
 
+  if (renderCompactDots(ctx, grid, o, gate, duo, paper)) return;
   paintBg(ctx, o);
 
   // Duotone colors are constant — build the strings once.
-  const duoFill = duo ? `rgb(${paper[0]},${paper[1]},${paper[2]})` : null;
+  const duoFill = duo ? rgbCss(paper[0], paper[1], paper[2]) : null;
   const duoHi = duo
-    ? `rgb(${Math.min(255, paper[0] + 80)},${Math.min(255, paper[1] + 80)},${Math.min(255, paper[2] + 80)})`
+    ? rgbCss(Math.min(255, paper[0] + 80), Math.min(255, paper[1] + 80), Math.min(255, paper[2] + 80))
     : null;
 
   for (let row = 0; row < rows; row++) {
@@ -103,7 +204,10 @@ function renderDots(ctx, grid, o) {
       const L = lumOf(data, i);
       if (L < gate) continue;
 
-      const rad = cell * 0.5 * 0.85 * (0.5 + L * 0.7);
+      // Radius follows sqrt(luminance), so the circle's AREA (coverage) is
+      // linear in luminance. The old linear-radius curve squared the tone,
+      // made midtones too large, and let highlights overlap neighbouring cells.
+      const rad = cell * 0.5 * 0.85 * Math.sqrt(L);
       if (rad < 0.4) continue;
 
       let cx = col * cell + cell * 0.5;
@@ -115,7 +219,7 @@ function renderDots(ctx, grid, o) {
 
       ctx.fillStyle = duo
         ? duoFill
-        : `rgb(${data[i]},${data[i + 1]},${data[i + 2]})`;
+        : rgbCss(data[i], data[i + 1], data[i + 2]);
       ctx.beginPath();
       ctx.arc(cx, cy, rad, 0, TAU);
       ctx.fill();
@@ -123,7 +227,7 @@ function renderDots(ctx, grid, o) {
       if (drawHi) {
         ctx.fillStyle = duo
           ? duoHi
-          : `rgb(${Math.min(255, data[i] + 80)},${Math.min(255, data[i + 1] + 80)},${Math.min(255, data[i + 2] + 80)})`;
+          : rgbCss(Math.min(255, data[i] + 80), Math.min(255, data[i + 1] + 80), Math.min(255, data[i + 2] + 80));
         ctx.beginPath();
         ctx.arc(cx - rad * 0.4, cy - rad * 0.4, rad * 0.35, 0, TAU);
         ctx.fill();
@@ -145,6 +249,73 @@ function renderDots(ctx, grid, o) {
 // oldest entry evicted once it reaches 4096 (15-bit key caps it at ~32k anyway).
 const legoBodyCache = new Map();
 
+function renderCompactLego(ctx, grid, o, gate, duo, paper) {
+  // Small LEGO cells use the seam-free treatment in previews AND exports.
+  // Reintroducing the 8% grout at export time would recreate the user's
+  // graph-paper defect and make the saved image disagree with the editor.
+  if (!(o.compact || o.cell <= 6) || o.scatter !== 0) return false;
+  const raster = compactRaster(ctx, o);
+  if (!raster) return false;
+  const { cols, rows, data } = grid;
+  const { width, height, image, data: out, bg } = raster;
+  const cell = o.cell;
+  for (let row = 0; row < rows; row++) {
+    const y0 = Math.max(0, Math.round(row * cell));
+    const y1 = Math.min(height, Math.round((row + 1) * cell));
+    if (y1 <= y0) continue;
+    for (let col = 0; col < cols; col++) {
+      const i = (row * cols + col) * 4;
+      const L = lumOf(data, i);
+      if (L < gate) continue;
+      const x0 = Math.max(0, Math.round(col * cell));
+      const x1 = Math.min(width, Math.round((col + 1) * cell));
+      if (x1 <= x0) continue;
+      const alpha = duo ? 0.3 + 0.7 * L : 1;
+      const r = duo ? paper[0] : data[i];
+      const g = duo ? paper[1] : data[i + 1];
+      const b = duo ? paper[2] : data[i + 2];
+      const bodyR = alpha === 1 ? r : blendChannel(bg[0], r, alpha);
+      const bodyG = alpha === 1 ? g : blendChannel(bg[1], g, alpha);
+      const bodyB = alpha === 1 ? b : blendChannel(bg[2], b, alpha);
+      for (let y = y0; y < y1; y++) {
+        let p = (y * width + x0) * 4;
+        for (let x = x0; x < x1; x++, p += 4) {
+          out[p] = bodyR;
+          out[p + 1] = bodyG;
+          out[p + 2] = bodyB;
+          out[p + 3] = 255;
+        }
+      }
+
+      // The compact Canvas path maps a unit circle through the snapped cell
+      // transform. Recreate that coverage in the bitmap so 4px cells retain a
+      // recognizable lighter stud instead of degrading into plain squares.
+      const lr = lighten(r, 0.15);
+      const lg = lighten(g, 0.15);
+      const lb = lighten(b, 0.15);
+      const tw = x1 - x0;
+      const th = y1 - y0;
+      const aa = 0.5 / Math.max(1, Math.min(tw, th));
+      for (let y = y0; y < y1; y++) {
+        const ny = (y + 0.5 - y0) / th - 0.5;
+        for (let x = x0; x < x1; x++) {
+          const nx = (x + 0.5 - x0) / tw - 0.5;
+          const coverage = Math.min(1, Math.max(0, (0.22 + aa - Math.sqrt(nx * nx + ny * ny)) / (aa * 2)));
+          if (coverage <= 0) continue;
+          const p = (y * width + x) * 4;
+          const studAlpha = alpha * coverage;
+          out[p] = blendChannel(out[p], lr, studAlpha);
+          out[p + 1] = blendChannel(out[p + 1], lg, studAlpha);
+          out[p + 2] = blendChannel(out[p + 2], lb, studAlpha);
+        }
+      }
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  ctx.globalAlpha = 1;
+  return true;
+}
+
 function renderLego(ctx, grid, o) {
   const { cols, rows, data } = grid;
   const cell = o.cell;
@@ -153,9 +324,15 @@ function renderLego(ctx, grid, o) {
   const duo = o.colorMode === 'duotone';
   const paper = duo ? hexRgb(o.paper) : null;
 
+  if (renderCompactLego(ctx, grid, o, gate, duo, paper)) return;
   paintBg(ctx, o);
 
-  const tile = cell * 0.92;
+  // Below six raster pixels an 8% grout gap is sub-pixel at fit-to-view but
+  // becomes a heavy black graph-paper grid when the user zooms in. Let the
+  // compact preview bodies meet edge-to-edge; the center stud still carries
+  // the LEGO texture. Full-size/native renders keep the separated bricks.
+  const compactPreview = !!o.compact || cell <= 6;
+  const tile = cell * (compactPreview ? 1 : 0.92);
   const half = tile * 0.5;
   const rx = Math.min(tile * 0.1, 3);
   const studR = cell * 0.22;
@@ -192,39 +369,56 @@ function renderLego(ctx, grid, o) {
       // Duotone: paper hue fixed, luminance drives opacity.
       ctx.globalAlpha = duo ? 0.3 + 0.7 * L : 1;
 
-      // Map the unit square onto this brick; everything below draws in unit
-      // space, so the cached unit gradient lands exactly where the old
-      // per-cell createLinearGradient(dx, dy, dx, dy + tile) did.
-      ctx.setTransform(tile, 0, 0, tile, dx, dy);
-
-      // Brick body: vertical gradient from base color to 20% darker.
-      const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
-      let body = legoBodyCache.get(key);
-      if (!body) {
-        // At capacity: evict the oldest entry (Maps iterate in insertion
-        // order) instead of wiping the cache mid-frame.
-        if (legoBodyCache.size >= 4096) legoBodyCache.delete(legoBodyCache.keys().next().value);
-        body = ctx.createLinearGradient(0, 0, 0, 1);
-        body.addColorStop(0, `rgb(${r},${g},${b})`);
-        body.addColorStop(1, `rgb(${Math.round(r * 0.8)},${Math.round(g * 0.8)},${Math.round(b * 0.8)})`);
-        legoBodyCache.set(key, body);
+      // Map the unit square onto this brick. Compact, unscattered cells snap
+      // both edges to integer raster coordinates; adjacent fractional cells
+      // otherwise expose antialias seams even when their geometry touches.
+      if (compactPreview && amp === 0) {
+        const x0 = Math.round(col * cell);
+        const y0 = Math.round(row * cell);
+        const x1 = Math.round((col + 1) * cell);
+        const y1 = Math.round((row + 1) * cell);
+        ctx.setTransform(x1 - x0, 0, 0, y1 - y0, x0, y0);
+      } else {
+        ctx.setTransform(tile, 0, 0, tile, dx, dy);
       }
-      rrect(ctx, 0, 0, 1, 1, rxU);
-      ctx.fillStyle = body;
-      ctx.fill();
+
+      if (compactPreview) {
+        // At this size the repeated gradient reads as horizontal ruling rather
+        // than plastic shading. A flat body plus the lighter center stud keeps
+        // the LEGO identity without turning the image into graph paper.
+        ctx.fillStyle = rgbCss(r, g, b);
+        ctx.fillRect(0, 0, 1, 1);
+      } else {
+        // Full treatment: vertical gradient from base color to 20% darker.
+        const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+        let body = legoBodyCache.get(key);
+        if (!body) {
+          if (legoBodyCache.size >= 4096) legoBodyCache.delete(legoBodyCache.keys().next().value);
+          body = ctx.createLinearGradient(0, 0, 0, 1);
+          body.addColorStop(0, `rgb(${r},${g},${b})`);
+          body.addColorStop(1, `rgb(${Math.round(r * 0.8)},${Math.round(g * 0.8)},${Math.round(b * 0.8)})`);
+          legoBodyCache.set(key, body);
+        }
+        ctx.fillStyle = body;
+        rrect(ctx, 0, 0, 1, 1, rxU);
+        ctx.fill();
+      }
 
       // Stud: 15% brighter than the brick.
       ctx.beginPath();
       ctx.arc(0.5, 0.5, studRU, 0, TAU);
-      ctx.fillStyle = `rgb(${lighten(r, 0.15)},${lighten(g, 0.15)},${lighten(b, 0.15)})`;
+      ctx.fillStyle = rgbCss(lighten(r, 0.15), lighten(g, 0.15), lighten(b, 0.15));
       ctx.fill();
 
-      // Subtle darker rim around the stud.
-      ctx.beginPath();
-      ctx.arc(0.5, 0.5, studRU * 0.9, 0, TAU);
-      ctx.strokeStyle = 'rgba(0,0,0,0.22)';
-      ctx.lineWidth = rimWU;
-      ctx.stroke();
+      // Subtle darker rim around the stud. It is sub-pixel in the compact
+      // fitted preview; native/export rasters keep the full treatment.
+      if (!compactPreview) {
+        ctx.beginPath();
+        ctx.arc(0.5, 0.5, studRU * 0.9, 0, TAU);
+        ctx.strokeStyle = 'rgba(0,0,0,0.22)';
+        ctx.lineWidth = rimWU;
+        ctx.stroke();
+      }
 
       // Tiny specular glint on larger cells.
       if (drawSpec) {
@@ -258,6 +452,8 @@ function renderVoxel(ctx, grid, o) {
   const hw = tw * 0.5;
   const hh = th * 0.5;
   const maxH = cell * (0.15 + 1.1);
+  const compactPreview = !!o.compact;
+  const drawRidge = !compactPreview; // sub-pixel after preview scaling below this size
 
   // Scatter jitter moves cubes past the ideal grid extents: ±amp in x and
   // ±amp*0.3 in y (see the render loop — the y amplitude is capped there so
@@ -306,12 +502,9 @@ function renderVoxel(ctx, grid, o) {
         const topY = y - blockH; // bottom vertex of the top diamond
 
         // Face colors: top lightened 35%, left base, right darkened 45%.
-        const topC = `rgb(${lighten(r, 0.35)},${lighten(g, 0.35)},${lighten(b, 0.35)})`;
-        const leftC = `rgb(${r},${g},${b})`;
-        const rightC = `rgb(${Math.round(r * 0.55)},${Math.round(g * 0.55)},${Math.round(b * 0.55)})`;
-
-        // Stroke each face with its own fill color to seal antialias seams.
-        ctx.lineWidth = 0.75;
+        const topC = rgbCss(lighten(r, 0.35), lighten(g, 0.35), lighten(b, 0.35));
+        const leftC = rgbCss(r, g, b);
+        const rightC = rgbCss(Math.round(r * 0.55), Math.round(g * 0.55), Math.round(b * 0.55));
 
         // Top face (diamond).
         ctx.beginPath();
@@ -321,9 +514,12 @@ function renderVoxel(ctx, grid, o) {
         ctx.lineTo(x - hw, topY - hh);
         ctx.closePath();
         ctx.fillStyle = topC;
-        ctx.strokeStyle = topC;
         ctx.fill();
-        ctx.stroke();
+        if (!compactPreview) {
+          ctx.strokeStyle = topC;
+          ctx.lineWidth = 0.75;
+          ctx.stroke();
+        }
 
         // Left face.
         ctx.beginPath();
@@ -333,9 +529,12 @@ function renderVoxel(ctx, grid, o) {
         ctx.lineTo(x - hw, topY - hh + blockH);
         ctx.closePath();
         ctx.fillStyle = leftC;
-        ctx.strokeStyle = leftC;
         ctx.fill();
-        ctx.stroke();
+        if (!compactPreview) {
+          ctx.strokeStyle = leftC;
+          ctx.lineWidth = 0.75;
+          ctx.stroke();
+        }
 
         // Right face.
         ctx.beginPath();
@@ -345,17 +544,24 @@ function renderVoxel(ctx, grid, o) {
         ctx.lineTo(x, topY + blockH);
         ctx.closePath();
         ctx.fillStyle = rightC;
-        ctx.strokeStyle = rightC;
         ctx.fill();
-        ctx.stroke();
+        if (!compactPreview) {
+          ctx.strokeStyle = rightC;
+          ctx.lineWidth = 0.75;
+          ctx.stroke();
+        }
 
-        // Crisp ridge accent along the top-left edge.
-        ctx.beginPath();
-        ctx.moveTo(x - hw, topY - hh);
-        ctx.lineTo(x, topY - th);
-        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-        ctx.lineWidth = 0.6;
-        ctx.stroke();
+        // Crisp ridge accent along the top-left edge. Below six raster pixels
+        // it is sub-pixel in the fitted preview and costs one stroke per cube;
+        // exports retain it because they use the exact selected cell size.
+        if (drawRidge) {
+          ctx.beginPath();
+          ctx.moveTo(x - hw, topY - hh);
+          ctx.lineTo(x, topY - th);
+          ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+          ctx.lineWidth = 0.6;
+          ctx.stroke();
+        }
       }
     }
   }
@@ -428,9 +634,9 @@ function renderLED(ctx, grid, o) {
       ctx.setTransform(bloomR, 0, 0, bloomR, cx, cy);
       ctx.globalAlpha = L * 0.28;
       ctx.fillStyle = glow;
-      ctx.beginPath();
-      ctx.arc(0, 0, 1, 0, TAU);
-      ctx.fill();
+      // The radial gradient is fully transparent at radius 1, so a bounding
+      // box produces the same visible disc without constructing an arc path.
+      ctx.fillRect(-1, -1, 2, 2);
     }
   }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -457,14 +663,16 @@ function renderLED(ctx, grid, o) {
         cy += jit(col, row, 2, amp);
       }
 
-      // Pixel intensity scales with luminance (hue preserved).
-      const fr = Math.round(r * L);
-      const fg = Math.round(g * L);
-      const fb = Math.round(b * L);
+      // Source RGB already contains its luminance. Multiplying it by L again
+      // darkened neutral tones as L². Duotone still needs L to shade the fixed
+      // paper hue, so preserve that intent only on the duotone path.
+      const fr = duo ? Math.round(r * L) : r;
+      const fg = duo ? Math.round(g * L) : g;
+      const fb = duo ? Math.round(b * L) : b;
 
-      rrect(ctx, cx - s * 0.5, cy - s * 0.5, s, s, corner);
-      ctx.fillStyle = `rgb(${fr},${fg},${fb})`;
-      ctx.fill();
+      ctx.fillStyle = rgbCss(fr, fg, fb);
+      if (o.compact) ctx.fillRect(cx - s * 0.5, cy - s * 0.5, s, s);
+      else { rrect(ctx, cx - s * 0.5, cy - s * 0.5, s, s, corner); ctx.fill(); }
     }
   }
 
@@ -513,6 +721,7 @@ function renderLattice(ctx, grid, o) {
   const scatterAmp = o.scatter * cell * 0.4;
   const duo = o.colorMode === 'duotone';
   const paper = duo ? hexRgb(o.paper) : null;
+  const paperCss = duo ? rgbCss(paper[0], paper[1], paper[2]) : null;
   const shape = o.nodeShape || 'circle';
 
   paintBg(ctx, o);
@@ -541,6 +750,7 @@ function renderLattice(ctx, grid, o) {
   // ── Pass 2: edges ──
   const maxDist = cell * 2;
   ctx.lineWidth = 1;
+  if (duo) ctx.strokeStyle = paperCss;
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
       const idx = row * cols + col;
@@ -562,17 +772,18 @@ function renderLattice(ctx, grid, o) {
         const alpha = (1 - dist / maxDist) * midL * 0.65;
         if (alpha < 0.01) continue;
 
-        let er, eg, eb;
-        if (duo) {
-          er = paper[0]; eg = paper[1]; eb = paper[2];
-        } else {
+        if (!duo) {
           const ia = idx * 4;
           const ib = nIdx * 4;
-          er = (data[ia] + data[ib]) >> 1;
-          eg = (data[ia + 1] + data[ib + 1]) >> 1;
-          eb = (data[ia + 2] + data[ib + 2]) >> 1;
+          const er = (data[ia] + data[ib]) >> 1;
+          const eg = (data[ia + 1] + data[ib + 1]) >> 1;
+          const eb = (data[ia + 2] + data[ib + 2]) >> 1;
+          ctx.strokeStyle = rgbCss(er, eg, eb);
         }
-        ctx.strokeStyle = `rgba(${er},${eg},${eb},${alpha})`;
+        // Keep opacity in canvas state instead of allocating a unique rgba()
+        // string for almost every edge. CSS rgba() stores alpha as an 8-bit
+        // channel, so apply the same rounding to keep rendered pixels exact.
+        ctx.globalAlpha = Math.round(alpha * 255) / 255;
         ctx.beginPath();
         ctx.moveTo(latX[idx], latY[idx]);
         ctx.lineTo(latX[nIdx], latY[nIdx]);
@@ -580,8 +791,10 @@ function renderLattice(ctx, grid, o) {
       }
     }
   }
+  ctx.globalAlpha = 1;
 
   // ── Pass 3: nodes ──
+  if (duo) ctx.fillStyle = paperCss;
   for (let idx = 0; idx < n; idx++) {
     if (!latOn[idx]) continue;
     const L = latL[idx];
@@ -590,11 +803,9 @@ function renderLattice(ctx, grid, o) {
     const x = latX[idx];
     const y = latY[idx];
 
-    if (duo) {
-      ctx.fillStyle = `rgb(${paper[0]},${paper[1]},${paper[2]})`;
-    } else {
+    if (!duo) {
       const i = idx * 4;
-      ctx.fillStyle = `rgb(${data[i]},${data[i + 1]},${data[i + 2]})`;
+      ctx.fillStyle = rgbCss(data[i], data[i + 1], data[i + 2]);
     }
     ctx.globalAlpha = Math.min(1, 0.35 + L * 0.9);
 
@@ -623,16 +834,59 @@ function renderLattice(ctx, grid, o) {
 // Mosaic — flat tiles with 1px ink gap, posterized colors
 // ---------------------------------------------------------------------------
 
+function renderCompactMosaic(ctx, grid, o, gate, duo, paper) {
+  if (!o.compact || o.scatter !== 0) return false;
+  const raster = compactRaster(ctx, o);
+  if (!raster) return false;
+  const { cols, rows, data } = grid;
+  const { width, height, image, data: out, bg } = raster;
+  const cell = o.cell;
+  for (let row = 0; row < rows; row++) {
+    const top = row * cell + 0.5;
+    const bottom = top + cell - 1;
+    const y0 = Math.max(0, Math.floor(top));
+    const y1 = Math.min(height, Math.ceil(bottom));
+    for (let col = 0; col < cols; col++) {
+      const i = (row * cols + col) * 4;
+      const L = lumOf(data, i);
+      if (L < gate) continue;
+      const left = col * cell + 0.5;
+      const right = left + cell - 1;
+      const x0 = Math.max(0, Math.floor(left));
+      const x1 = Math.min(width, Math.ceil(right));
+      let r, g, b, alpha = 1;
+      if (duo) {
+        r = paper[0]; g = paper[1]; b = paper[2]; alpha = L;
+      } else {
+        r = Math.round(data[i] / 51) * 51;
+        g = Math.round(data[i + 1] / 51) * 51;
+        b = Math.round(data[i + 2] / 51) * 51;
+      }
+      for (let y = y0; y < y1; y++) {
+        const coverY = Math.max(0, Math.min(y + 1, bottom) - Math.max(y, top));
+        for (let x = x0; x < x1; x++) {
+          const coverX = Math.max(0, Math.min(x + 1, right) - Math.max(x, left));
+          const coverage = alpha * coverX * coverY;
+          if (coverage > 0) putBlended(out, (y * width + x) * 4, bg, r, g, b, coverage);
+        }
+      }
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  ctx.globalAlpha = 1;
+  return true;
+}
+
 function renderMosaic(ctx, grid, o) {
   const { cols, rows, data } = grid;
   const cell = o.cell;
   const gate = 1 - o.fill;
   const amp = o.scatter * cell * 0.4;
   const duo = o.colorMode === 'duotone';
-  const paperStr = duo
-    ? `rgb(${hexRgb(o.paper)[0]},${hexRgb(o.paper)[1]},${hexRgb(o.paper)[2]})`
-    : null;
+  const paper = duo ? hexRgb(o.paper) : null;
+  const paperStr = duo ? rgbCss(paper[0], paper[1], paper[2]) : null;
 
+  if (renderCompactMosaic(ctx, grid, o, gate, duo, paper)) return;
   paintBg(ctx, o);
 
   const size = cell - 1; // 1px ink gap between tiles
@@ -658,7 +912,7 @@ function renderMosaic(ctx, grid, o) {
         const pr = Math.round(data[i] / 51) * 51;
         const pg = Math.round(data[i + 1] / 51) * 51;
         const pb = Math.round(data[i + 2] / 51) * 51;
-        ctx.fillStyle = `rgb(${pr},${pg},${pb})`;
+        ctx.fillStyle = rgbCss(pr, pg, pb);
       }
       ctx.fillRect(x, y, size, size);
     }

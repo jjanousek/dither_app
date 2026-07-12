@@ -74,6 +74,9 @@ export const DIFFUSION_KERNELS = {
 export function applyAdjustments(imageData, p) {
   const d = imageData.data;
   const { brightness = 0, contrast = 0, gamma = 1, saturation = 1, invert = false } = p;
+  // The common/default path is already in the exact byte space the renderer
+  // needs. Avoid a full-frame LUT walk for every decoded video frame.
+  if (brightness === 0 && contrast === 0 && gamma === 1 && saturation === 1 && !invert) return;
   const cf = 1 + contrast;
   const ig = 1 / Math.max(gamma, 0.01);
 
@@ -158,10 +161,10 @@ function nearestIndex(pal, n, r, g, b) {
 // strength: 0..1 scales how much error is propagated.
 // serpentine: alternate scan direction per row (reduces worm artifacts).
 // ---------------------------------------------------------------------------
-// Reusable error-accumulation buffer — a full-res export frame needs ~19 MB,
-// and re-allocating (and zero-init'ing) it every frame dominates GC on the
-// live path. The buffer is fully overwritten by the source copy below each
-// call, so reuse is byte-identical; a larger leftover buffer is harmless.
+// Reusable row ring for error diffusion. The widest kernel reaches only two
+// rows ahead, so retaining a full Float32 RGB copy of a phone photo wastes
+// hundreds of MB. Rows are preloaded with their original pixels before any
+// errors land, preserving the old Float32 rounding/order byte-for-byte.
 let _edBuf = null;
 // Flattened kernel plans cached by (kernelId, width): pure precompute, no
 // change to arithmetic. Cleared if it grows unbounded (many preview sizes).
@@ -202,17 +205,26 @@ export function errorDiffusion(imageData, palette, kernelId, { strength = 1, ser
   const n = palette.length / 3;
   const b = bias * 255; // threshold bias, mirrors u_bias in the shader
 
-  // Work buffer in float to carry sub-integer error (reused across calls).
-  const need = w * h * 3;
-  if (!_edBuf || _edBuf.length < need) _edBuf = new Float32Array(need);
+  const { taps, kdxF, kdxR, kdy, kw, maxDx, maxDy } = edPlan(kernelId, kernel, w);
+  const rowStride = w * 3;
+  const ringRows = maxDy + 1;
+  const need = rowStride * ringRows;
+  if (!_edBuf || _edBuf.length !== need) _edBuf = new Float32Array(need);
   const buf = _edBuf;
-  for (let i = 0, j = 0; i < d.length; i += 4, j += 3) {
-    buf[j] = d[i];
-    buf[j + 1] = d[i + 1];
-    buf[j + 2] = d[i + 2];
-  }
-
-  const { taps, kdxF, kdxR, kdy, kw, offF, offR, maxDx, maxDy } = edPlan(kernelId, kernel, w);
+  const loadRow = (srcY, slotBase) => {
+    if (srcY >= h) {
+      buf.fill(0, slotBase, slotBase + rowStride);
+      return;
+    }
+    let si = srcY * w * 4;
+    for (let j = slotBase, end = slotBase + rowStride; j < end; j += 3, si += 4) {
+      buf[j] = d[si];
+      buf[j + 1] = d[si + 1];
+      buf[j + 2] = d[si + 2];
+    }
+  };
+  for (let y = 0; y < ringRows; y++) loadRow(y, y * rowStride);
+  const rowBase = new Int32Array(ringRows);
 
   for (let y = 0; y < h; y++) {
     const reverse = serpentine && (y & 1) === 1;
@@ -220,11 +232,13 @@ export function errorDiffusion(imageData, palette, kernelId, { strength = 1, ser
     const xEnd = reverse ? -1 : w;
     const xStep = reverse ? -1 : 1;
     const adx = reverse ? kdxR : kdxF;
-    const off = reverse ? offR : offF;
     const safeRow = y + maxDy < h; // interior pixels skip all bounds checks
+    for (let dy = 0; dy < ringRows; dy++) rowBase[dy] = ((y + dy) % ringRows) * rowStride;
+    const currentBase = rowBase[0];
 
     for (let x = xStart; x !== xEnd; x += xStep) {
-      const j = (y * w + x) * 3;
+      const j = currentBase + x * 3;
+      const di = (y * w + x) * 4;
       const r = Math.min(255, Math.max(0, buf[j] + b));
       const g = Math.min(255, Math.max(0, buf[j + 1] + b));
       const bl = Math.min(255, Math.max(0, buf[j + 2] + b));
@@ -235,13 +249,13 @@ export function errorDiffusion(imageData, palette, kernelId, { strength = 1, ser
       const eg = (g - pg) * strength;
       const eb = (bl - pb) * strength;
 
-      buf[j] = pr;
-      buf[j + 1] = pg;
-      buf[j + 2] = pb;
+      d[di] = pr;
+      d[di + 1] = pg;
+      d[di + 2] = pb;
 
       if (safeRow && x >= maxDx && x < w - maxDx) {
         for (let t = 0; t < taps; t++) {
-          const k = j + off[t];
+          const k = rowBase[kdy[t]] + (x + adx[t]) * 3;
           const wgt = kw[t];
           buf[k] += er * wgt;
           buf[k + 1] += eg * wgt;
@@ -251,7 +265,7 @@ export function errorDiffusion(imageData, palette, kernelId, { strength = 1, ser
         for (let t = 0; t < taps; t++) {
           const nx = x + adx[t];
           if (nx < 0 || nx >= w || y + kdy[t] >= h) continue;
-          const k = j + off[t];
+          const k = rowBase[kdy[t]] + nx * 3;
           const wgt = kw[t];
           buf[k] += er * wgt;
           buf[k + 1] += eg * wgt;
@@ -259,12 +273,8 @@ export function errorDiffusion(imageData, palette, kernelId, { strength = 1, ser
         }
       }
     }
-  }
-
-  for (let i = 0, j = 0; i < d.length; i += 4, j += 3) {
-    d[i] = buf[j];
-    d[i + 1] = buf[j + 1];
-    d[i + 2] = buf[j + 2];
+    // This slot cannot receive another error until it represents y+ringRows.
+    loadRow(y + ringRows, currentBase);
   }
 }
 
@@ -279,16 +289,17 @@ export function orderedDither(imageData, palette, matrix, { strength = 1, bias =
   const { size, data: m } = matrix;
   // Spread scaled by palette density: fewer colors need a larger spread.
   const spread = (255 * strength) / Math.max(1, n - 1) * 1.5;
+  const threshold = bias * 255;
   const ox = ((Math.floor(offsetX) % size) + size) % size;
   const oy = ((Math.floor(offsetY) % size) + size) % size;
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
-      const t = m[((y + oy) % size) * size + ((x + ox) % size)] - 0.5 + bias;
-      const r = d[i] + t * spread;
-      const g = d[i + 1] + t * spread;
-      const b = d[i + 2] + t * spread;
+      const noise = (m[((y + oy) % size) * size + ((x + ox) % size)] - 0.5) * spread;
+      const r = d[i] + noise + threshold;
+      const g = d[i + 1] + noise + threshold;
+      const b = d[i + 2] + noise + threshold;
       const pi = nearestIndex(palette, n,
         Math.min(255, Math.max(0, r)),
         Math.min(255, Math.max(0, g)),
@@ -390,6 +401,7 @@ export function whiteNoiseDither(imageData, palette, { strength = 1, bias = 0, s
   const { width: w, height: h, data: d } = imageData;
   const n = palette.length / 3;
   const spread = (255 * strength) / Math.max(1, n - 1) * 1.5;
+  const threshold = bias * 255;
   const cl = (v) => Math.min(255, Math.max(0, v));
   // same reseed offsets as the shader so flow/shimmer animate on this path too
   const sx = Math.floor(ox) + seed * 91.7;
@@ -397,8 +409,11 @@ export function whiteNoiseDither(imageData, palette, { strength = 1, bias = 0, s
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
-      const t = hash12(x + sx, y + sy) - 0.5 + bias;
-      const pi = nearestIndex(palette, n, cl(d[i] + t * spread), cl(d[i + 1] + t * spread), cl(d[i + 2] + t * spread));
+      const noise = (hash12(x + sx, y + sy) - 0.5) * spread;
+      const pi = nearestIndex(palette, n,
+        cl(d[i] + noise + threshold),
+        cl(d[i + 1] + noise + threshold),
+        cl(d[i + 2] + noise + threshold));
       d[i] = palette[pi];
       d[i + 1] = palette[pi + 1];
       d[i + 2] = palette[pi + 2];

@@ -2,7 +2,7 @@
 // changes (mode, algorithm, palette, ramp); sliders/toggles mutate state and
 // call onChange() without a rebuild.
 
-import { MODES } from './state.js';
+import { CELL_SIZE_MIN, MODES } from './state.js';
 import { ALGORITHMS, getAlgorithm } from './engine/engine.js';
 import { PALETTES, getPalette } from './palettes.js';
 import { RAMPS, FONTS } from './engine/ascii.js';
@@ -13,6 +13,15 @@ import { GEN_SCENES } from './generate.js';
 // survives panel rebuilds — a collapsed section stays collapsed when the
 // user switches mode/algorithm/palette and the whole panel is reconstructed
 const sectionCollapsed = new Map();
+let controlId = 0;
+let sectionId = 0;
+
+function associateRowLabel(r, control) {
+  const label = r.firstElementChild;
+  if (!(label instanceof HTMLLabelElement)) return;
+  control.id = `dl-control-${++controlId}`;
+  label.htmlFor = control.id;
+}
 
 function section(mount, title, { collapsed = false } = {}) {
   const el = document.createElement('div');
@@ -20,11 +29,24 @@ function section(mount, title, { collapsed = false } = {}) {
   el.className = 'section' + (isCollapsed ? ' collapsed' : '');
   const h = document.createElement('h3');
   h.textContent = title;
-  h.onclick = () => {
-    sectionCollapsed.set(title, el.classList.toggle('collapsed'));
-  };
   const body = document.createElement('div');
   body.className = 'section-body';
+  body.id = `dl-section-${++sectionId}`;
+  h.setAttribute('role', 'button');
+  h.tabIndex = 0;
+  h.setAttribute('aria-controls', body.id);
+  h.setAttribute('aria-expanded', String(!isCollapsed));
+  const toggleSection = () => {
+    const nowCollapsed = el.classList.toggle('collapsed');
+    sectionCollapsed.set(title, nowCollapsed);
+    h.setAttribute('aria-expanded', String(!nowCollapsed));
+  };
+  h.onclick = toggleSection;
+  h.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    toggleSection();
+  });
   el.append(h, body);
   mount.appendChild(el);
   return body;
@@ -54,13 +76,17 @@ function slider(body, label, { min, max, step = 1, value, fmt = (v) => v, oninpu
   fill();
   const val = document.createElement('span');
   val.className = 'value';
-  val.textContent = fmt(value);
+  // Range inputs clamp an out-of-range shared state value immediately (for
+  // example Dots 3px -> Lattice min 6px). Read the clamped control value so
+  // the label can never claim a size different from the rendered result.
+  val.textContent = fmt(parseFloat(input.value));
   input.addEventListener('input', () => {
     const v = parseFloat(input.value);
     val.textContent = fmt(v);
     fill();
     oninput(v);
   });
+  associateRowLabel(r, input);
   r.append(input, val);
   return input;
 }
@@ -75,6 +101,7 @@ function toggle(body, label, { value, oninput }) {
   const knob = document.createElement('span');
   knob.className = 'knob';
   input.addEventListener('change', () => oninput(input.checked));
+  associateRowLabel(r, input);
   wrap.append(input, knob);
   r.appendChild(wrap);
   return input;
@@ -106,6 +133,7 @@ function select(body, label, { options, value, oninput }) {
     options.forEach((o) => addOption(sel, o));
   }
   sel.addEventListener('change', () => oninput(sel.value));
+  associateRowLabel(r, sel);
   r.appendChild(sel);
   return sel;
 }
@@ -116,6 +144,7 @@ function color(body, label, { value, oninput }) {
   input.type = 'color';
   input.value = value;
   input.addEventListener('input', () => oninput(input.value));
+  associateRowLabel(r, input);
   r.appendChild(input);
   return input;
 }
@@ -128,6 +157,7 @@ function textInput(body, label, { value, oninput, placeholder = '' }) {
   input.placeholder = placeholder;
   input.spellcheck = false;
   input.addEventListener('input', () => oninput(input.value));
+  associateRowLabel(r, input);
   r.appendChild(input);
   return input;
 }
@@ -183,7 +213,15 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
     const pill = document.createElement('div');
     pill.className = 'mode-pill' + (state.mode === m.id ? ' active' : '');
     pill.textContent = m.name;
+    pill.setAttribute('role', 'button');
+    pill.tabIndex = 0;
+    pill.setAttribute('aria-pressed', String(state.mode === m.id));
     pill.onclick = () => { state.mode = m.id; changeAndRefresh(); };
+    pill.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      pill.click();
+    });
     grid.appendChild(pill);
   }
   eff.appendChild(grid);
@@ -215,6 +253,14 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         value: state.serpentine,
         oninput: (v) => { state.serpentine = v; change(); },
       });
+      if (isLive) {
+        const hint = document.createElement('div');
+        hint.style.cssText = 'font-size:11px;color:var(--text-dim);line-height:1.5';
+        hint.textContent = algo.id === 'falsefloyd'
+          ? 'False Floyd uses a rougher three-neighbor pattern. Pause video for a higher-detail frame.'
+          : 'Fine settings use a larger live preview; pause video for a higher-detail Floyd frame.';
+        eff.appendChild(hint);
+      }
     }
     if (algo.id.startsWith('halftone')) {
       slider(eff, 'Dot scale', {
@@ -342,7 +388,7 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
   } else {
     const c = state.cells;
     slider(eff, 'Cell size', {
-      min: 6, max: 40, step: 1, value: c.size,
+      min: CELL_SIZE_MIN[state.mode] ?? 4, max: 40, step: 1, value: c.size,
       fmt: (v) => `${v}px`,
       oninput: (v) => { c.size = v; change(); },
     });
@@ -563,7 +609,7 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
   }
   const note = document.createElement('div');
   note.style.cssText = 'font-size:11.5px;color:var(--text-dim);line-height:1.5';
-  note.textContent = 'PNG / Video / GIF buttons live in the top bar. Video exports record the live preview in real time (with audio when the source has it).';
+  note.textContent = 'PNG / Video / GIF buttons live in the top bar. Frame-accurate video export is silent; the real-time fallback may preserve source audio.';
   ex.appendChild(note);
 }
 
@@ -576,9 +622,12 @@ export function buildPresetStrip({ mount, presets, onApply, onShuffle }) {
   mount.innerHTML = '';
   const thumbCanvases = new Map();
 
-  const card = (name, thumbInner, onClick, extraClass = '') => {
+  const card = (name, thumbInner, onClick, extraClass = '', selectable = false) => {
     const c = document.createElement('div');
     c.className = `preset-card ${extraClass}`.trim();
+    c.setAttribute('role', 'button');
+    c.tabIndex = 0;
+    if (selectable) c.setAttribute('aria-pressed', 'false');
     const thumb = document.createElement('div');
     thumb.className = 'preset-thumb';
     thumb.append(thumbInner);
@@ -587,6 +636,11 @@ export function buildPresetStrip({ mount, presets, onApply, onShuffle }) {
     label.textContent = name;
     c.append(thumb, label);
     c.onclick = onClick;
+    c.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      c.click();
+    });
     mount.appendChild(c);
     return c;
   };
@@ -602,17 +656,24 @@ export function buildPresetStrip({ mount, presets, onApply, onShuffle }) {
     canvas.height = 120;
     thumbCanvases.set(p.id, canvas);
     const c = card(p.name, canvas, () => {
-      mount.querySelectorAll('.preset-card').forEach((el) => el.classList.remove('active'));
+      mount.querySelectorAll('.preset-card').forEach((el) => {
+        el.classList.remove('active');
+        if (el.hasAttribute('aria-pressed')) el.setAttribute('aria-pressed', 'false');
+      });
       c.classList.add('active');
+      c.setAttribute('aria-pressed', 'true');
       onApply(p);
-    });
+    }, '', true);
     c.dataset.id = p.id;
   }
   return thumbCanvases;
 }
 
 export function clearActivePreset(mount) {
-  mount.querySelectorAll('.preset-card').forEach((el) => el.classList.remove('active'));
+  mount.querySelectorAll('.preset-card').forEach((el) => {
+    el.classList.remove('active');
+    if (el.hasAttribute('aria-pressed')) el.setAttribute('aria-pressed', 'false');
+  });
 }
 
 // ---------- toast ----------

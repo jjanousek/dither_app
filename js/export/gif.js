@@ -5,7 +5,9 @@
 // colors that fell in the bucket. Palettized dither output puts each distinct
 // color alone in its bucket -> exact colors, no quantization loss. If a clip
 // accumulates more than 256 buckets, a weighted median-cut reduces them to a
-// global 256-color table covering the WHOLE clip (not first-frame-wins).
+// global 256-color table covering the WHOLE clip (not first-frame-wins), and
+// each frame is Floyd–Steinberg-diffused against that table (offline, so the
+// continuous-tone content that overflowed the buckets doesn't posterize).
 
 class ByteBuffer {
   constructor() {
@@ -156,13 +158,84 @@ export class GifEncoder {
     this.loop = loop;
     this.buckets = new Map(); // 15-bit key -> bucket index
     this.sums = [];           // [rSum, gSum, bSum, count] per bucket
-    this.frames = [];         // Uint16Array of bucket indices per frame
+    this.frames = [];         // Uint8Array normally; lazily widens past 256 buckets
+    this._wide = false;
+    this._fsBuf = null;       // Float32 scratch for the >256-color diffusion
+  }
+
+  // Quantize one frame's bucket colors to the 256-entry palette with
+  // Floyd–Steinberg error diffusion. Overflowing 256 buckets only happens for
+  // continuous-tone content (smoothed dithers, grain/glow, ASCII colors) —
+  // a straight nearest-bucket remap posterizes exactly that content, and this
+  // is an offline path, so diffusion is affordable. Serpentine, luma-weighted
+  // nearest via a 15-bit LUT (a full 256-entry scan per pixel would take
+  // minutes over a whole clip; the LUT's ±4/channel quantization is invisible
+  // on already-continuous content).
+  #ditherFrame(src, colors, palette, lut) {
+    const w = this.w;
+    const h = this.h;
+    const n = w * h;
+    if (!this._fsBuf || this._fsBuf.length < n * 3) this._fsBuf = new Float32Array(n * 3);
+    const buf = this._fsBuf;
+    for (let i = 0, j = 0; i < n; i++, j += 3) {
+      const c = colors[src[i]];
+      buf[j] = c[0];
+      buf[j + 1] = c[1];
+      buf[j + 2] = c[2];
+    }
+    const nearest = (r, g, b) => {
+      const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+      let pi = lut[key];
+      if (pi < 0) {
+        let bd = Infinity;
+        pi = 0;
+        for (let p = 0; p < palette.length; p++) {
+          const dr = palette[p][0] - r, dg = palette[p][1] - g, db = palette[p][2] - b;
+          const d = dr * dr * 0.299 + dg * dg * 0.587 + db * db * 0.114;
+          if (d < bd) { bd = d; pi = p; }
+        }
+        lut[key] = pi;
+      }
+      return pi;
+    };
+    const cl = (v) => (v < 0 ? 0 : v > 255 ? 255 : v);
+    const outIdx = new Uint8Array(n);
+    for (let y = 0; y < h; y++) {
+      const rev = (y & 1) === 1;
+      const dx = rev ? -1 : 1;
+      for (let xi = 0; xi < w; xi++) {
+        const x = rev ? w - 1 - xi : xi;
+        const j = (y * w + x) * 3;
+        const r = cl(buf[j]), g = cl(buf[j + 1]), b = cl(buf[j + 2]);
+        const pi = nearest(r | 0, g | 0, b | 0);
+        outIdx[y * w + x] = pi;
+        const p = palette[pi];
+        const er = r - p[0], eg = g - p[1], eb = b - p[2];
+        if (x + dx >= 0 && x + dx < w) {
+          const k = j + dx * 3;
+          buf[k] += er * (7 / 16); buf[k + 1] += eg * (7 / 16); buf[k + 2] += eb * (7 / 16);
+        }
+        if (y + 1 < h) {
+          if (x - dx >= 0 && x - dx < w) {
+            const k = j + (w - dx) * 3;
+            buf[k] += er * (3 / 16); buf[k + 1] += eg * (3 / 16); buf[k + 2] += eb * (3 / 16);
+          }
+          const k = j + w * 3;
+          buf[k] += er * (5 / 16); buf[k + 1] += eg * (5 / 16); buf[k + 2] += eb * (5 / 16);
+          if (x + dx >= 0 && x + dx < w) {
+            const k2 = j + (w + dx) * 3;
+            buf[k2] += er * (1 / 16); buf[k2 + 1] += eg * (1 / 16); buf[k2 + 2] += eb * (1 / 16);
+          }
+        }
+      }
+    }
+    return outIdx;
   }
 
   // rgba: Uint8ClampedArray from ImageData
   addFrame(rgba) {
     const n = this.w * this.h;
-    const idx = new Uint16Array(n);
+    let idx = this._wide ? new Uint16Array(n) : new Uint8Array(n);
     const { buckets, sums } = this;
     for (let i = 0; i < n; i++) {
       const r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
@@ -172,6 +245,12 @@ export class GifEncoder {
         bi = sums.length;
         buckets.set(key, bi);
         sums.push([0, 0, 0, 0]);
+      }
+      if (bi >= 256 && idx.BYTES_PER_ELEMENT === 1) {
+        const wide = new Uint16Array(n);
+        wide.set(idx);
+        idx = wide;
+        this._wide = true;
       }
       const s = sums[bi];
       s[0] += r; s[1] += g; s[2] += b; s[3]++;
@@ -190,12 +269,14 @@ export class GifEncoder {
     ]);
     const counts = this.sums.map((s) => s[3]);
 
-    let palette, remap;
+    let palette, remap, nearestLut = null;
     if (colors.length <= 256) {
       palette = colors;
-      remap = null; // identity
+      remap = null; // identity — palettized content is stored exactly
     } else {
       ({ palette, remap } = medianCut(colors, counts, 256));
+      // shared nearest-palette LUT for the per-frame diffusion below
+      nearestLut = new Int16Array(32768).fill(-1);
     }
 
     const out = new ByteBuffer();
@@ -243,11 +324,10 @@ export class GifEncoder {
       out.byte(minCodeSize);
 
       let indices = this.frames[f];
-      if (remap) {
-        const mapped = new Uint8Array(indices.length);
-        for (let i = 0; i < indices.length; i++) mapped[i] = remap[indices[i]];
-        indices = mapped;
-      }
+      // >256 buckets: diffuse the palette-reduction error instead of a
+      // straight remap (which posterizes the continuous-tone content that
+      // overflowed the buckets in the first place)
+      if (remap) indices = this.#ditherFrame(indices, colors, palette, nearestLut);
       lzwEncode(indices, minCodeSize, out);
     }
     out.byte(0x3b); // trailer

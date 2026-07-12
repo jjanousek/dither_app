@@ -29,7 +29,7 @@ const MATRIX = [
 ];
 
 export class Mp4Muxer {
-  constructor(width, height, fps) {
+  constructor(width, height, fps, { maxBytes = Infinity } = {}) {
     this.w = width;
     this.h = height;
     this.fps = fps;
@@ -38,11 +38,17 @@ export class Mp4Muxer {
     this.sampleData = [];    // Uint8Array per sample (mdat payload)
     this.avcC = null;        // AVCDecoderConfigurationRecord bytes
     this.mdatBytes = 0;
+    this.maxBytes = maxBytes;
+    this.limitReached = false;
   }
 
   // chunk: EncodedVideoChunk, meta: EncodedVideoChunkMetadata (first carries
   // decoderConfig.description = the avcC record)
   addChunk(chunk, meta) {
+    if (this.mdatBytes + chunk.byteLength > this.maxBytes) {
+      this.limitReached = true;
+      return false;
+    }
     if (!this.avcC && meta?.decoderConfig?.description) {
       this.avcC = new Uint8Array(meta.decoderConfig.description);
     }
@@ -51,6 +57,7 @@ export class Mp4Muxer {
     this.sampleData.push(buf);
     this.samples.push({ size: buf.length, keyframe: chunk.type === 'key' });
     this.mdatBytes += buf.length;
+    return true;
   }
 
   #avc1() {
@@ -144,5 +151,12 @@ export class Mp4Muxer {
       new Uint8Array(moov),
     ];
     return new Blob(parts, { type: 'video/mp4' });
+  }
+
+  release() {
+    this.samples = [];
+    this.sampleData = [];
+    this.avcC = null;
+    this.mdatBytes = 0;
   }
 }
