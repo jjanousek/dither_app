@@ -96,7 +96,7 @@
           <button id="zoom-100" class="zbtn" title="Actual pixels (1)">1:1</button>
         </div>
         <div id="mask-cursor" hidden aria-hidden="true"><div id="mask-cursor-core"></div></div>
-        <div id="mask-brush-bar" role="toolbar" aria-label="Effect Mask brush controls" data-viewport-control hidden>
+        <div id="mask-brush-bar" role="toolbar" aria-label="Effect Mask brush controls" aria-describedby="mask-editor-hint" data-viewport-control hidden>
           <div class="mask-segment" role="group" aria-label="Brush operation">
             <button id="mask-tool-paint" class="mask-segment-btn active" type="button" aria-pressed="true">Paint</button>
             <button id="mask-tool-erase" class="mask-segment-btn" type="button" aria-pressed="false">Erase</button>
@@ -112,14 +112,14 @@
             <output id="mask-feather-value" for="mask-feather">30%</output>
           </label>
           <div class="mask-placement">
-            <span class="mask-placement-label">Painted shows</span>
+            <span class="mask-placement-label">Shows</span>
             <div class="mask-segment" role="group" aria-label="What painted areas show">
               <button id="mask-show-original" class="mask-segment-btn active" type="button" aria-pressed="true">Original</button>
               <button id="mask-show-effect" class="mask-segment-btn" type="button" aria-pressed="false">Effect</button>
             </div>
           </div>
           <details id="mask-actions" class="mask-actions">
-            <summary class="btn">Actions</summary>
+            <summary class="btn" title="Mask actions">More</summary>
             <div class="mask-actions-menu" role="menu">
               <button id="mask-clear-paint" type="button" role="menuitem">Clear paint</button>
               <button id="mask-effect-everywhere" type="button" role="menuitem">Effect everywhere</button>

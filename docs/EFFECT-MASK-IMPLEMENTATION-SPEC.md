@@ -195,6 +195,8 @@ While editing, show a compact floating bar at the top-center of the viewport:
 Actions [Clear paint | Effect everywhere | Original everywhere] · Done
 ```
 
+Keep the floating controls to one compact row whenever the stage can fit them. Shortcut/static-mask guidance remains available as the toolbar description and tooltip rather than occupying a second row over the image.
+
 Recommended v1 values:
 
 - Size: diameter from 0.5% to 40% of the source's shorter side; default 6%.
@@ -211,7 +213,7 @@ While editing:
 
 - `#mask-overlay` tints painted selection `s`, regardless of placement.
 - The tint explains “this is what you painted”; placement explains what it means.
-- Overlay opacity is approximately 18% accent color so the underlying composition remains judgeable.
+- Overlay opacity is approximately 6% accent color so the underlying composition remains judgeable even under a maximum-size brush.
 - The overlay lives in `#canvas-stack`, inherits zoom/pan, and always has `pointer-events: none`.
 - A DOM ring cursor displays brush diameter and feather core; eraser is dashed.
 - Static video playback does not repaint the guide canvas. Invalidate it only for a mask/editor/target-size change.
