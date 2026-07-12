@@ -671,7 +671,7 @@ main { display: flex; height: calc(100% - 52px); }
 
 /* rows */
 .row { display: flex; align-items: center; gap: 10px; min-height: 24px; }
-.row > label {
+.row > label:not(.toggle) {
   flex: 0 0 104px;
   font-size: 12px;
   color: var(--text-dim);
@@ -755,6 +755,10 @@ input[type='color']::-webkit-color-swatch { border: none; border-radius: 4px; }
 }
 .toggle input:checked + .knob { background: var(--accent); }
 .toggle input:checked + .knob::before { transform: translateX(15px); background: #fff; }
+.toggle input:focus-visible + .knob {
+  outline: 2px solid #cfc8ff;
+  outline-offset: 2px;
+}
 
 /* mode pills */
 .mode-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }

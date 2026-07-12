@@ -1,0 +1,19 @@
+{
+  "score": 99,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [],
+  "suggestions": [],
+  "reasoning": "The installed WebKit toggle now matches the expected compact switch pattern. Its on state is purple with the thumb fully right, its off state is charcoal with the thumb fully left, the focus ring is visible, and the control aligns cleanly with the surrounding sliders and label.",
+  "threshold": 90,
+  "threshold_pass": true,
+  "reference_images": [
+    "/var/folders/9g/n5_xn26s65jb1hq4886h646w0000gp/T/codex-clipboard-442e05a1-8e4e-4a70-a9d2-28620ecab4af.png"
+  ],
+  "generated_screenshot": "/tmp/dither-native-toggle-fixed-crop.png",
+  "additional_screenshots": [
+    "/tmp/dither-native-toggle-fixed-off-crop.png",
+    "/tmp/dither-toggle-minimum.png"
+  ],
+  "next_actions": []
+}
