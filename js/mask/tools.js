@@ -255,7 +255,9 @@ export class MaskEditor {
       context.drawImage(raster, 0, 0, overlay.width, overlay.height);
     }
     context.globalCompositeOperation = 'source-in';
-    context.fillStyle = 'rgba(139, 124, 255, 0.35)';
+    // This is an editing guide, not the rendered mask. Keep it light enough
+    // that the actual raw/effect blend remains judgeable while painting.
+    context.fillStyle = 'rgba(139, 124, 255, 0.18)';
     context.fillRect(0, 0, overlay.width, overlay.height);
     context.restore();
   }
@@ -719,10 +721,11 @@ export class MaskEditor {
         : `Mask · painted shows ${this.placement === 'inside' ? 'Effect' : 'Original'}`;
     }
     if (e.hint) {
+      const paintedResult = this.placement === 'inside' ? 'effect' : 'original';
       const text = this.mode === 'ascii'
-        ? 'ASCII edges snap to glyphs · Feather changes which glyphs are selected'
-        : 'Paint to reveal original · ⌥ drag to erase · Space drag to pan';
-      e.hint.textContent = this.sourceIsMoving ? `${text} · Static mask applies to every frame` : text;
+        ? `Purple = guide · Paint ${paintedResult} · Snaps to glyphs`
+        : `Purple = guide · Paint ${paintedResult} · ⌥ erase · Space pan`;
+      e.hint.textContent = this.sourceIsMoving ? `${text} · Static on video` : text;
     }
     this.#updateCursor();
   }

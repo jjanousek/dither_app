@@ -72,7 +72,7 @@ test('premultiplied pixel helper implements complementary branch addition', () =
   assert.throws(() => blendPremultipliedPixel({ processed: [1], raw: [1, 1, 1, 1], coverage: 1 }), /four-channel/);
 });
 
-test('Canvas compositor uses destination-in, destination-out, then lighter', () => {
+test('Canvas compositor masks processed in the destination and adds one raw scratch branch', () => {
   let next = 0;
   const compositor = new MaskCompositor({
     createCanvas: (width, height) => new TraceCanvas(width, height, `scratch-${next++}`),
@@ -86,18 +86,14 @@ test('Canvas compositor uses destination-in, destination-out, then lighter', () 
 
   assert.equal(compositor.compose({ processed, raw, effectCoverage: mask, destination }), destination);
   assert.deepEqual(
-    compositor.processedScratch.context.operations.map((operation) => operation.composite),
-    ['copy', 'destination-in'],
-  );
-  assert.deepEqual(
     compositor.rawScratch.context.operations.map((operation) => operation.composite),
     ['copy', 'destination-out'],
   );
   assert.deepEqual(
     destination.context.operations.map((operation) => operation.composite),
-    ['copy', 'lighter'],
+    ['copy', 'destination-in', 'lighter'],
   );
-  assert.equal(compositor.processedScratch.context.operations[0].smoothing, false);
+  assert.equal(destination.context.operations[0].source, processed);
   assert.equal(compositor.rawScratch.context.operations[0].smoothing, true);
   assert.equal(destination.context.globalCompositeOperation, 'xor', 'caller state is restored');
   assert.equal(destination.context.imageSmoothingEnabled, true);
@@ -119,17 +115,14 @@ test('scratch canvases are reused by size, resized safely, and explicitly releas
     destination: new TraceCanvas(width, height),
   });
   composeAt(2, 2);
-  const processedScratch = compositor.processedScratch;
   const rawScratch = compositor.rawScratch;
   composeAt(3, 1);
-  assert.equal(allocations.length, 2);
-  assert.equal(compositor.processedScratch, processedScratch);
+  assert.equal(allocations.length, 1);
   assert.equal(compositor.rawScratch, rawScratch);
-  assert.equal(compositor.estimateScratchBytes(3, 1), 24);
+  assert.equal(compositor.estimateScratchBytes(3, 1), 12);
   compositor.release();
-  assert.equal(processedScratch.width, 0);
   assert.equal(rawScratch.height, 0);
-  assert.equal(compositor.processedScratch, null);
+  assert.equal(compositor.rawScratch, null);
 });
 
 test('dimension mismatches fail before any branch draw', () => {
@@ -140,5 +133,5 @@ test('dimension mismatches fail before any branch draw', () => {
     effectCoverage: new TraceCanvas(2, 2),
     destination: new TraceCanvas(2, 2),
   }), /raw must be 2x2/);
-  assert.equal(compositor.processedScratch, null);
+  assert.equal(compositor.rawScratch, null);
 });

@@ -70,19 +70,17 @@ export function blendPremultipliedPixel({ processed, raw, coverage }) {
 export class MaskCompositor {
   constructor({ createCanvas = defaultCanvasFactory } = {}) {
     this.createCanvas = createCanvas;
-    this.processedScratch = null;
     this.rawScratch = null;
   }
 
   _ensureScratch(width, height) {
-    if (!this.processedScratch) this.processedScratch = this.createCanvas(width, height);
     if (!this.rawScratch) this.rawScratch = this.createCanvas(width, height);
-    for (const [canvas, name] of [[this.processedScratch, 'processed scratch'], [this.rawScratch, 'raw scratch']]) {
-      if (canvas.width !== width || canvas.height !== height) {
-        canvas.width = width;
-        canvas.height = height;
-      }
-      if (canvas.width !== width || canvas.height !== height) throw new Error(`${name} allocation failed at ${width}x${height}`);
+    if (this.rawScratch.width !== width || this.rawScratch.height !== height) {
+      this.rawScratch.width = width;
+      this.rawScratch.height = height;
+    }
+    if (this.rawScratch.width !== width || this.rawScratch.height !== height) {
+      throw new Error(`raw scratch allocation failed at ${width}x${height}`);
     }
   }
 
@@ -94,17 +92,8 @@ export class MaskCompositor {
     assertDimensions(destination, width, height, 'destination');
     this._ensureScratch(width, height);
 
-    const processedContext = context2d(this.processedScratch, 'processed scratch');
     const rawContext = context2d(this.rawScratch, 'raw scratch');
     const destinationContext = context2d(destination, 'destination');
-
-    withSavedContext(processedContext, () => {
-      resetContext(processedContext, false);
-      processedContext.globalCompositeOperation = 'copy';
-      processedContext.drawImage(processed, 0, 0, width, height);
-      processedContext.globalCompositeOperation = 'destination-in';
-      processedContext.drawImage(effectCoverage, 0, 0, width, height);
-    });
 
     withSavedContext(rawContext, () => {
       resetContext(rawContext, true);
@@ -117,7 +106,9 @@ export class MaskCompositor {
     withSavedContext(destinationContext, () => {
       resetContext(destinationContext, false);
       destinationContext.globalCompositeOperation = 'copy';
-      destinationContext.drawImage(this.processedScratch, 0, 0, width, height);
+      destinationContext.drawImage(processed, 0, 0, width, height);
+      destinationContext.globalCompositeOperation = 'destination-in';
+      destinationContext.drawImage(effectCoverage, 0, 0, width, height);
       destinationContext.globalCompositeOperation = 'lighter';
       destinationContext.drawImage(this.rawScratch, 0, 0, width, height);
     });
@@ -138,13 +129,11 @@ export class MaskCompositor {
   }
 
   estimateScratchBytes(width, height) {
-    return positiveInteger(width, 'width') * positiveInteger(height, 'height') * 4 * 2;
+    return positiveInteger(width, 'width') * positiveInteger(height, 'height') * 4;
   }
 
   release() {
-    releaseCanvas(this.processedScratch);
     releaseCanvas(this.rawScratch);
-    this.processedScratch = null;
     this.rawScratch = null;
   }
 }

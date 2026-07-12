@@ -188,7 +188,40 @@ test('synchronous publication owns both branches, uses intrinsic video crop, and
   assert.deepEqual(rawDraw.args.slice(4), [0, 0, 4, 2]);
   assert.equal(rawDraw.smoothing, true);
   assert.equal(bundle.processedTarget.context.operations[0].source, sharedFX);
-  assert.equal(fxCalls[0].stage.width, 0, 'temporary target stage is released after the shared FX copy');
+  assert.equal(fxCalls[0].stage.width, 4, 'temporary target stage is retained in the reuse pool');
+  manager.release();
+  assert.equal(fxCalls[0].stage.width, 0, 'release tears down the pooled backing store');
+});
+
+test('steady synchronous video reuses branch canvases after one double-buffer warmup', () => {
+  const allocations = [];
+  const manager = new FrameBundleManager({
+    createCanvas: (width, height) => {
+      const canvas = new TraceCanvas(width, height, `pooled-${allocations.length}`);
+      allocations.push(canvas);
+      return canvas;
+    },
+  });
+  const targetPlan = {
+    width: 4,
+    height: 2,
+    samplingKind: 'continuous',
+    targetRevision: 3,
+  };
+  for (let frameId = 1; frameId <= 5; frameId++) {
+    manager.buildSynchronous({
+      borrowedProcessed: new TraceCanvas(4, 2),
+      descriptor: { width: 4, height: 2, samplingKind: 'continuous' },
+      token: token({ frameId }),
+      targetPlan,
+      rawSource: {},
+      sourceWidth: 8,
+      sourceHeight: 4,
+    });
+  }
+  assert.equal(allocations.length, 4);
+  manager.release();
+  assert.ok(allocations.every((canvas) => canvas.width === 0 && canvas.height === 0));
 });
 
 test('allocation/Post-FX failure retains the previous complete bundle and releases partial surfaces', () => {

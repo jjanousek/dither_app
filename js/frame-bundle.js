@@ -507,10 +507,21 @@ export class FrameBundleManager {
     this._targetSignature = null;
     this._lockedTargetPlan = null;
     this.invalidatedReason = null;
+    // Two branch surfaces are replaced every live frame (three when Post FX
+    // returns a shared canvas). Keep a tiny same-size pool so steady video does
+    // not allocate and destroy multi-megabyte backing stores 30 times/second.
+    this._canvasPool = [];
+    this._maxPoolSurfaces = 3;
   }
 
   _allocate(width, height, label) {
-    const canvas = this.createCanvas(width, height);
+    for (let index = this._canvasPool.length - 1; index >= 0; index--) {
+      const pooled = this._canvasPool[index];
+      if (pooled.width === width && pooled.height === height) continue;
+      this._canvasPool.splice(index, 1);
+      releaseCanvas(pooled);
+    }
+    const canvas = this._canvasPool.pop() || this.createCanvas(width, height);
     canvas.width = width;
     canvas.height = height;
     if (canvas.width !== width || canvas.height !== height) {
@@ -519,6 +530,27 @@ export class FrameBundleManager {
     }
     context2d(canvas, label);
     return canvas;
+  }
+
+  _recycleCanvas(canvas) {
+    if (!canvas || canvas.width <= 0 || canvas.height <= 0) return;
+    if (this._canvasPool.includes(canvas)) return;
+    if (this._canvasPool.length >= this._maxPoolSurfaces) {
+      releaseCanvas(canvas);
+      return;
+    }
+    this._canvasPool.push(canvas);
+  }
+
+  _recycleBundle(bundle) {
+    if (!bundle) return;
+    this._recycleCanvas(bundle.rawTarget);
+    if (bundle.processedTarget !== bundle.rawTarget) this._recycleCanvas(bundle.processedTarget);
+  }
+
+  _releasePool() {
+    for (const canvas of this._canvasPool) releaseCanvas(canvas);
+    this._canvasPool.length = 0;
   }
 
   _preflight(targetPlan, prospectiveSurfaceCount, extraBytes = 0, inFlightRaw = this.inFlight) {
@@ -635,7 +667,7 @@ export class FrameBundleManager {
       }
       owned = this._allocate(width, height, 'owned processed target');
       drawCropped(context2d(owned, 'owned processed target'), fxResult, FULL_CROP, width, height, false);
-      releaseCanvas(stage);
+      this._recycleCanvas(stage);
       stage = null;
       return { processedTarget: owned, descriptor: acceptedDescriptor, grainPhase: fxPlan.options.grainPhase };
     } catch (error) {
@@ -664,7 +696,7 @@ export class FrameBundleManager {
     const previous = this.current;
     this.current = bundle;
     this.invalidatedReason = null;
-    releaseBundle(previous);
+    this._recycleBundle(previous);
     return bundle;
   }
 
@@ -827,6 +859,7 @@ export class FrameBundleManager {
 
   release() {
     this.invalidate('released');
+    this._releasePool();
     this.unlockTarget();
     this.targetPlan = null;
     this._targetSignature = null;

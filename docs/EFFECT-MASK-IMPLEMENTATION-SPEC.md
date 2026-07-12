@@ -825,6 +825,27 @@ maskCompositeMs
 
 The existing supersampling governor observes only effect-render cost on new content. Mask-only edits never train it. A compositor-dominated cadence failure must not trigger an `ss -> 1` change that enlarges the processed grid and makes composition more expensive.
 
+The measured GPU-dither path for opaque decoded video/webcam frames uses the
+browser compositor directly when Post FX is off:
+
+- display the Engine-owned WebGL canvas as the processed base layer;
+- draw the current raw video frame once into a reusable 2D target;
+- present only `raw * (1 - effectCoverage)` in a transparent canvas above it;
+- let normal source-over layer composition produce
+  `raw * (1 - effectCoverage) + processed * effectCoverage`;
+- keep the exact owned-canvas compositor for CPU dither, ASCII/cell modes,
+  Post FX, priming, exports, WebGL loss, and any source with meaningful alpha.
+
+This path must never copy the Engine WebGL canvas into Canvas 2D. It is valid
+only while both branches are opaque and aligned to the same target. Compare
+may cover it with an opaque raw frame; Split reads the paired reusable raw
+target. Mask overlays remain a separate guide layer and are never exported.
+
+Live masked motion targets at most 921,600 pixels after editing and 518,400
+pixels while the brush is open or a draft stroke is active. Crisp processed
+content still uses whole-number enlargement; continuous results may use smooth
+scaling. Final exports retain their independent target policy.
+
 Performance gate:
 
 - Benchmark unmasked and masked 1080p Blue Noise on the target browser and WKWebView build.
@@ -834,10 +855,11 @@ Performance gate:
 Fallback order if the gate fails:
 
 1. Verify no unnecessary rerasterization, source copy, Post-FX rerun, or cross-canvas allocation.
-2. Lower only the masked preview target while preserving whole-number crisp enlargement; do not degrade renderer supersampling through the wrong governor.
-3. Prototype a GPU final compositor and benchmark actual upload/readback costs.
-4. If GPU integration is required for the GPU-video path, prefer an Engine-owned final pass/FBO; separate WebGL contexts cannot share textures and may require expensive uploads.
-5. Preserve Canvas 2D as the correctness and WebGL-loss fallback.
+2. Reuse exact-size raw/processed branch canvases and compositor scratch surfaces after double-buffer warmup.
+3. For opaque GPU video without Post FX, use the direct layered compositor above so the WebGL result never crosses into Canvas 2D.
+4. Lower only the masked preview target while preserving whole-number crisp enlargement; do not degrade renderer supersampling through the wrong governor.
+5. If broader GPU integration is required, prefer an Engine-owned final pass/FBO; separate WebGL contexts cannot share textures and may require expensive uploads.
+6. Preserve Canvas 2D as the correctness and WebGL-loss fallback.
 
 Do not use a low-work-grid `mix()` inside `DITHER_FS` as an equivalent fidelity fallback. It recreates the blocky-original defect and covers only GPU dither.
 
@@ -855,7 +877,7 @@ MAX_MASKED_EXPORT_WORKING_BYTES  = 512 MiB
 - Count owned raw/processed bundles, mask rasters, compositor scratches, overlay, and Post-FX surfaces.
 - Before allocating or atomically replacing a preview bundle, run `estimatePreviewPeakBytes(targetPlan, currentBundle, inFlightRaw, fxState)`. Count the old displayed pair until successful publication, the prospective pair, in-flight raw, borrowed worker result while copying, mask, branch scratches, overlay/output, and persistent Post-FX canvases.
 - Evict disposable raster caches first. If required non-evictable surfaces still exceed 96 MiB, lower a continuous target scale or decrement crisp integer `k` and re-estimate. If crisp `k = 1` still cannot fit, reduce the upstream crisp render plan and retry once. On failure, keep the previous complete bundle and reject/roll back the activating edit with a clear memory message.
-- Reuse compositor scratches by dimension and purpose.
+- Reuse the compositor's single raw-branch scratch by dimension. Recycle exact-size owned branch canvases through a tiny bounded pool after double-buffer warmup.
 - Keep only committed plus one in-flight raw pair for CPU video.
 - Do not retain export rasters in the preview LRU.
 - The 512 MiB export ceiling includes encoder retention, not merely canvases. MP4 planning reserves the current 256 MiB muxed-sample ceiling before allocating frame surfaces. GIF planning reserves retained pixel indices up to its configured budget plus the worst-case `Float32Array(targetPixels * 3)` diffusion scratch and palette/working arrays. PNG reserves its asynchronous encoding surface. Target dimensions use only the remaining working set.
@@ -990,7 +1012,7 @@ No new package dependency is required.
 | Compare/Split | Compare is pure raw; Split is raw versus final masked composite. |
 | Cache | Static masks are not rerasterized per video frame; stale epoch/revision/target/crop entries cannot be reused. |
 | Governor | Mask-only work never trains renderer EMAs; compositor overload cannot trigger the wrong supersampling response. |
-| Performance | Static masked 1080p Blue Noise targets no more than 10% cadence loss on the release browser and WKWebView device. |
+| Performance | Static masked 1080p Blue Noise targets no more than 10% cadence loss on the release browser and WKWebView device; the steady opaque-GPU path performs no WebGL-to-2D effect copy and no per-frame canvas allocation. |
 | Memory | Preview peak-preflights atomic swaps within 96 MiB; masked exports include Engine/Post-FX/encoder retention within 512 MiB and cap before unsafe allocation. |
 | Native app | Browser and bundled WKWebView pass image, video, webcam, undo, PNG, GIF, and MP4 smoke scenarios. |
 
@@ -1046,6 +1068,8 @@ No new package dependency is required.
 - Unmasked/masked 1080p cadence and dropped-frame ratio.
 - CPU worker committed/in-flight bundle count under delayed completion.
 - Mask rasterization count over 300 unchanged video frames.
+- Canvas allocation count after direct-GPU and owned-bundle warmup.
+- Direct opaque-GPU preview versus exact Canvas 2D golden frames at hard and feathered coverage; verify Compare, Split, Done, pause/resume, and mask-only repaint transitions.
 - Pointer latency on paused 4K CPU dither and ASCII.
 - Separate effect/bundle/composite timing counters.
 - 1,000-stroke add/erase stress and replay at multiple target sizes.

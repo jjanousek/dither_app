@@ -46,6 +46,12 @@ const MAX_EXPORT_AREA = 64_000_000;
 const MAX_MASKED_EXPORT_AREA = 12_000_000;
 const MAX_MASKED_EXPORT_SIDE = 8_192;
 const MAX_MASKED_EXPORT_WORKING_BYTES = 512 * 1024 * 1024;
+// Final exports retain their full target policy. Live masked motion is a much
+// heavier pipeline (raw copy + processed copy + mask blend), so use a stable
+// 720p-class target and a 540p-class editing target instead of rebuilding five
+// full-HD surfaces for every decoded frame.
+const MAX_MASKED_MOTION_AREA = 921_600;
+const MAX_MASKED_EDIT_AREA = 518_400;
 const canRecord = typeof HTMLCanvasElement !== 'undefined'
   && typeof HTMLCanvasElement.prototype.captureStream === 'function'
   && !!window.MediaRecorder;
@@ -58,6 +64,13 @@ const cctx = cmp.getContext('2d');
 
 const engine = new Engine();
 const thumbEngine = new Engine();
+// GPU-dithered masked video can stay entirely on the browser compositor: the
+// WebGL result is displayed directly underneath a transparent raw-mask layer.
+// Slow/CPU/cell paths continue using the exact owned-canvas compositor.
+const maskEffectPreview = engine.glCanvas;
+maskEffectPreview.id = 'mask-effect-preview';
+maskEffectPreview.hidden = true;
+out.before(maskEffectPreview);
 const state = createState();
 const maskStore = new MaskRevisionStore();
 const maskRasterizer = new MaskRasterizer();
@@ -74,6 +87,7 @@ let maskDirty = false;
 let overlayDirty = true;
 let maskDraft = null;
 let liveMaskSession = null;
+let fastMaskPreview = null;
 let liveDraftStrokeId = null;
 let draftEffectCanvas = null;
 let sourceEpoch = 0;
@@ -197,10 +211,13 @@ const maskEditor = new MaskEditor({
     onEditingChanged: () => {
       overlayDirty = true;
       syncMaskEditor();
+      dirty = true;
     },
     onCompareRequested: (active) => {
       comparing = !!active;
-      if (!comparing && frameBundles.current && maskIsActive()) {
+      if (!comparing && fastMaskPreview && maskIsActive()) {
+        presentFastMaskPreview();
+      } else if (!comparing && frameBundles.current && maskIsActive()) {
         presentMaskedBundle();
       } else {
         dirty = true;
@@ -208,7 +225,7 @@ const maskEditor = new MaskEditor({
     },
     onMaskRepaintRequested: () => {
       overlayDirty = true;
-      if (maskDraft && frameBundles.current) maskDirty = true;
+      if (maskDraft && (frameBundles.current || fastMaskPreview)) maskDirty = true;
     },
   },
 });
@@ -276,6 +293,141 @@ function maskBypassed() {
 
 function maskIsActive() {
   return !maskBypassed();
+}
+
+function fastPreviewEligible(renderedResult = null) {
+  if (!renderedResult || renderedResult.canvas !== maskEffectPreview || !engine.gl) return false;
+  if (exporting || maskPriming || !['video', 'webcam'].includes(source?.type)) return false;
+  if (!(source.el instanceof HTMLVideoElement)) return false;
+  if (state.mode !== 'dither' || getAlgorithm(state.algorithm).type !== 'gpu') return false;
+  return !Object.values(state.fx).some((value) => +value > 0);
+}
+
+function hideFastMaskPreview({ release = true } = {}) {
+  maskEffectPreview.hidden = true;
+  maskEffectPreview.classList.remove('pixelated');
+  maskEffectPreview.style.width = '';
+  maskEffectPreview.style.height = '';
+  out.classList.remove('mask-fast-overlay');
+  if (release && fastMaskPreview?.rawTarget) {
+    fastMaskPreview.rawTarget.width = 0;
+    fastMaskPreview.rawTarget.height = 0;
+    fastMaskPreview = null;
+  }
+}
+
+function ensureFastRawTarget(width, height) {
+  let rawTarget = fastMaskPreview?.rawTarget || null;
+  if (!rawTarget) {
+    rawTarget = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(width, height)
+      : document.createElement('canvas');
+  }
+  if (rawTarget.width !== width || rawTarget.height !== height) {
+    rawTarget.width = width;
+    rawTarget.height = height;
+  }
+  if (rawTarget.width !== width || rawTarget.height !== height || !rawTarget.getContext('2d')) {
+    throw new Error(`fast mask raw target allocation failed at ${width}×${height}`);
+  }
+  return rawTarget;
+}
+
+function presentFastGpuMask(renderedResult, sourceWidth, sourceHeight, maxArea) {
+  const { canvas, descriptor } = renderedResult;
+  const targetPlan = resolveMaskedTarget(descriptor, sourceWidth, sourceHeight, maxArea);
+  const width = targetPlan.width;
+  const height = targetPlan.height;
+  const started = performance.now();
+  const enteringFastPath = !fastMaskPreview;
+  const rawTarget = ensureFastRawTarget(width, height);
+  const rawContext = rawTarget.getContext('2d');
+  rawContext.save();
+  try {
+    rawContext.setTransform(1, 0, 0, 1, 0, 0);
+    rawContext.globalAlpha = 1;
+    rawContext.globalCompositeOperation = 'copy';
+    rawContext.filter = 'none';
+    rawContext.imageSmoothingEnabled = true;
+    rawContext.imageSmoothingQuality = 'high';
+    rawContext.drawImage(source.el, 0, 0, sourceWidth, sourceHeight, 0, 0, width, height);
+  } finally {
+    rawContext.restore();
+  }
+
+  fastMaskPreview = {
+    rawTarget,
+    processedTarget: canvas,
+    descriptor,
+    targetPlan,
+    sourceWidth,
+    sourceHeight,
+    normalizedCrop: { u0: 0, v0: 0, u1: 1, v1: 1 },
+    targetWidth: width,
+    targetHeight: height,
+    asciiGridInfo: null,
+  };
+  // The direct path owns only its one raw target. Flush paired-bundle pools
+  // when entering it so dormant full-frame branch canvases do not sit beside
+  // the live compositor's memory for the rest of playback.
+  if (enteringFastPath) frameBundles.release();
+  else if (frameBundles.current || frameBundles.inFlight) {
+    frameBundles.invalidate('direct GPU mask preview');
+  }
+  bundleBuildMs = performance.now() - started;
+  return presentFastMaskPreview();
+}
+
+function presentFastMaskPreview() {
+  const preview = fastMaskPreview;
+  if (!preview) return false;
+  const started = performance.now();
+  const width = preview.targetWidth;
+  const height = preview.targetHeight;
+  const uniform = maskDraft ? null : maskUniformCoverage();
+  setOutputSize(width, height);
+  ensureLiveMaskSessionSize(width, height);
+
+  let effectCoverage = null;
+  if (uniform !== 0 && uniform !== 1) {
+    effectCoverage = maskDraft && liveMaskSession
+      ? ensureDraftEffectCanvas(liveMaskSession.selectionCanvas(), currentMaskRevision().placement)
+      : maskRasterizer.rasterFor(maskRasterRequest(preview));
+  }
+
+  octx.save();
+  try {
+    octx.setTransform(1, 0, 0, 1, 0, 0);
+    octx.globalAlpha = 1;
+    octx.filter = 'none';
+    octx.imageSmoothingEnabled = true;
+    octx.imageSmoothingQuality = 'high';
+    if (uniform === 1) {
+      octx.clearRect(0, 0, width, height);
+    } else {
+      octx.globalCompositeOperation = 'copy';
+      octx.drawImage(preview.rawTarget, 0, 0, width, height);
+      if (effectCoverage) {
+        octx.globalCompositeOperation = 'destination-out';
+        octx.drawImage(effectCoverage, 0, 0, width, height);
+      }
+    }
+  } finally {
+    octx.restore();
+  }
+
+  maskEffectPreview.hidden = false;
+  maskEffectPreview.style.width = `${width}px`;
+  maskEffectPreview.style.height = `${height}px`;
+  maskEffectPreview.classList.toggle('pixelated', preview.descriptor.samplingKind === 'crisp');
+  out.classList.add('mask-fast-overlay');
+  out.classList.remove('pixelated');
+  maskDirty = false;
+  overlayDirty = true;
+  maskCompositeMs = performance.now() - started;
+  syncMaskEditor();
+  if (view.splitOn && !view.splitSuppressed && !comparing && !exporting) drawSplitOverlay();
+  return true;
 }
 
 function sourceIsMoving() {
@@ -388,6 +540,7 @@ function setOutputSize(width, height) {
 
 function presentMaskedBundle(bundle = frameBundles.current) {
   if (!bundle) return false;
+  hideFastMaskPreview();
   const started = performance.now();
   const uniform = maskDraft ? null : maskUniformCoverage();
   if (uniform !== 0 && uniform !== 1) {
@@ -549,7 +702,7 @@ function setMaskDraft(draft) {
     }
   }
   overlayDirty = true;
-  if (frameBundles.current) maskDirty = true;
+  if (frameBundles.current || fastMaskPreview) maskDirty = true;
   if (needsFirstPrime) {
     void primeMaskPreview({
       activationRevisionId: maskRevisionId,
@@ -564,7 +717,7 @@ function rollbackMaskDraft() {
   releaseDraftEffectCanvas();
   liveDraftStrokeId = null;
   maskDraft = null;
-  maskDirty = !!frameBundles.current;
+  maskDirty = !!(frameBundles.current || fastMaskPreview);
   overlayDirty = true;
 }
 
@@ -624,18 +777,19 @@ function commitMaskProposal(proposal, { addHistory = true } = {}) {
   if (['clear', 'effect-everywhere', 'original-everywhere', 'reset'].includes(proposal.kind)) {
     maskRasterizer.releaseAll();
   }
-  maskDirty = after !== 1 && !!frameBundles.current;
+  maskDirty = after !== 1 && !!(frameBundles.current || fastMaskPreview);
   overlayDirty = true;
   syncMaskEditor();
   if (addHistory) commitHistory();
   pruneMaskHistory();
 
   if (after === 1) {
+    hideFastMaskPreview();
     frameBundles.invalidate('mask bypass restored');
     if (engine.cpu) engine.cpu.invalidate();
     maskCompositor.release();
     dirty = true;
-  } else if (!frameBundles.current) {
+  } else if (!frameBundles.current && !fastMaskPreview) {
     void primeMaskPreview({
       activationRevisionId: revision.revisionId,
       onFailure: () => {
@@ -682,6 +836,14 @@ function commitMaskStroke(strokeLike) {
 }
 
 function maskedPreviewAreaLimit() {
+  const videoMoving = source?.el instanceof HTMLVideoElement
+    && !source.el.paused && !source.el.ended;
+  const generatedMoving = source?.type === 'gen' || source?.type === 'animated-image';
+  if (!exporting && (videoMoving || generatedMoving)) {
+    return maskEditor.editing || maskDraft
+      ? MAX_MASKED_EDIT_AREA
+      : MAX_MASKED_MOTION_AREA;
+  }
   const fxOn = Object.values(state.fx).some((value) => +value > 0);
   return fxOn || maskDraft ? 1_600_000 : MAX_MASK_PREVIEW_AREA;
 }
@@ -800,6 +962,16 @@ function maskedPostFXPlan(token, sourceHeight, fast = true) {
 
 function handleDetailedMaskedRender(detail, sourceWidth, sourceHeight, maxArea = maskedPreviewAreaLimit()) {
   const started = performance.now();
+  if (fastPreviewEligible(detail.renderedResult)) {
+    try {
+      presentFastGpuMask(detail.renderedResult, sourceWidth, sourceHeight, maxArea);
+      bundleBuildMs = performance.now() - started;
+      return fastMaskPreview;
+    } catch (error) {
+      console.warn('direct GPU mask preview:', error);
+      hideFastMaskPreview();
+    }
+  }
   let published = null;
   if (detail.committedResult) {
     try {
@@ -1085,6 +1257,7 @@ function renderOnce(budgetOverride = null, contentNew = true, noFx = false, capt
 // noFx = present the raw render without the post-FX stack (the GIF exporter
 // applies fx itself, AFTER decimation, at the GIF's own resolution).
 function present(result, srcW, offline = false, noFx = false) {
+  hideFastMaskPreview();
   const fxOn = !noFx && Object.values(state.fx).some((v) => v > 0);
   let final = result;
   if (fxOn) {
@@ -1160,7 +1333,9 @@ function presentOriginal() {
 // Draw the untouched source over the left part of the frame (split view).
 function drawSplitOverlay() {
   if (!source || !view.splitOn || view.splitSuppressed) return;
-  const pairedRaw = maskIsActive() ? frameBundles.current?.rawTarget : null;
+  const pairedRaw = maskIsActive()
+    ? (fastMaskPreview?.rawTarget || frameBundles.current?.rawTarget)
+    : null;
   const [sourceWidth, sourceHeight] = srcDims();
   const raw = pairedRaw || source.el;
   const srcW = pairedRaw?.width || sourceWidth;
@@ -1274,6 +1449,8 @@ function loop(t) {
 
   if (comparing) {
     presentOriginal();
+  } else if (maskDirty && !contentNew && !cpuWake && fastMaskPreview) {
+    presentFastMaskPreview();
   } else if (maskDirty && !contentNew && !cpuWake && frameBundles.current) {
     presentMaskedBundle();
   } else {
@@ -1573,6 +1750,7 @@ function setSource(next) {
     return;
   }
   cancelMaskPriming();
+  hideFastMaskPreview();
   if (source) {
     maskEditor.beforeSourceChange();
     commitHistory();
@@ -2487,6 +2665,8 @@ async function doExportGIF() {
   const fxOn = Object.values(state.fx).some((v) => v > 0);
   let fxCanvas = null;
   let fxCtx = null;
+  let gifProcessedCanvas = null;
+  let gifProcessedCtx = null;
   const gifPostFXRefH = (gw, gh, sizeMeta = null) => {
     const descriptor = sizeMeta?.frameMeta?.descriptor;
     const renderedWidth = descriptor?.width || out.width;
@@ -2546,6 +2726,24 @@ async function doExportGIF() {
       renderFrame: () => {
         if (maskedExport) {
           const rendered = renderProcessedForExport(EXPORT_PIXELS);
+          // The GPU renderer's canvas already owns a WebGL context, so the GIF
+          // sampler cannot call getContext('2d') on it. Copy that branch into
+          // one reusable 2D staging canvas; CPU/ASCII/cell results are already
+          // readable and avoid the extra blit.
+          if (rendered.canvas === engine.glCanvas) {
+            if (!gifProcessedCanvas) {
+              gifProcessedCanvas = document.createElement('canvas');
+              gifProcessedCtx = gifProcessedCanvas.getContext('2d', { willReadFrequently: true });
+            }
+            if (gifProcessedCanvas.width !== rendered.canvas.width
+                || gifProcessedCanvas.height !== rendered.canvas.height) {
+              gifProcessedCanvas.width = rendered.canvas.width;
+              gifProcessedCanvas.height = rendered.canvas.height;
+            }
+            gifProcessedCtx.globalCompositeOperation = 'copy';
+            gifProcessedCtx.drawImage(rendered.canvas, 0, 0);
+            rendered.canvas = gifProcessedCanvas;
+          }
           return {
             canvas: rendered.canvas,
             meta: {
@@ -2804,7 +3002,8 @@ const endCompare = () => {
   if (comparing) {
     comparing = false;
     maskEditor.setComparing(false);
-    if (frameBundles.current && maskIsActive()) presentMaskedBundle();
+    if (fastMaskPreview && maskIsActive()) presentFastMaskPreview();
+    else if (frameBundles.current && maskIsActive()) presentMaskedBundle();
     else dirty = true;
   }
 };
@@ -2981,6 +3180,10 @@ window.__dl = {
       draft: !!maskDraft,
       editorDraft: maskEditor.hasDraft,
       liveSession: !!liveMaskSession,
+      fastPreview: !!fastMaskPreview,
+      fastTarget: fastMaskPreview
+        ? `${fastMaskPreview.targetWidth}x${fastMaskPreview.targetHeight}`
+        : null,
       exporting,
     };
   },

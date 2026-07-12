@@ -175,19 +175,37 @@ main { display: flex; height: calc(100% - 52px); }
 #canvas-stack canvas { display: block; }
 #canvas-stack canvas[hidden] { display: none; }
 #output {
+  position: relative;
+  z-index: 1;
   box-shadow: 0 14px 70px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05);
   border-radius: 2px;
   background: #000;
 }
-#output.pixelated, #compare-canvas.pixelated { image-rendering: pixelated; }
+#output.mask-fast-overlay {
+  box-shadow: none;
+  background: transparent;
+}
+#mask-effect-preview {
+  position: absolute;
+  z-index: 0;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  border-radius: 2px;
+  background: #000;
+  box-shadow: 0 14px 70px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05);
+}
+#output.pixelated, #compare-canvas.pixelated, #mask-effect-preview.pixelated { image-rendering: pixelated; }
 #compare-canvas {
   position: absolute;
+  z-index: 2;
   left: 0;
   top: 0;
   pointer-events: none;
 }
 #mask-overlay {
   position: absolute;
+  z-index: 3;
   left: 0;
   top: 0;
   pointer-events: none;
