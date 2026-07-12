@@ -12,7 +12,11 @@ import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlo
 import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js';
 import { Viewport } from './view.js';
 import { GenerativeSource } from './generate.js';
-import { LIVE_CPU_DITHER_BUDGETS, liveCpuDitherBudget } from './preview-policy.js';
+import {
+  LIVE_CPU_DITHER_BUDGETS,
+  liveCpuDitherBudget,
+  shouldSamplePlaybackCadence,
+} from './preview-policy.js';
 import {
   MASK_LIMITS,
   MaskRevisionStore,
@@ -1330,7 +1334,10 @@ function present(result, srcW, offline = false, noFx = false) {
     out.height = final.height;
     resized = true;
   }
-  octx.drawImage(final, 0, 0);
+  // Replace the destination instead of source-over painting it. Without an
+  // exact copy, transparent pixels can retain an earlier frame (most visibly
+  // when two same-sized sources are loaded back-to-back).
+  maskCompositor.copyRaw({ raw: final, destination: out });
   if (resized) maskEditor.onOutputResized(out.width, out.height);
   // Crisp dither wants nearest-neighbour upscaling (sharp dots); a box-resolved
   // (tone) result should scale smoothly. Use the engine's ACTUAL last-frame
@@ -1354,7 +1361,18 @@ function presentOriginal() {
   // Compare at the processed preview's bitmap size. Drawing a 48MP original
   // into a native-size canvas only to CSS-shrink it wastes memory and causes a
   // visible zoom jump; this is screen-identical at the current view scale.
-  octx.drawImage(source.el, 0, 0, out.width, out.height);
+  octx.save();
+  try {
+    octx.setTransform(1, 0, 0, 1, 0, 0);
+    octx.globalAlpha = 1;
+    octx.globalCompositeOperation = 'copy';
+    octx.filter = 'none';
+    octx.imageSmoothingEnabled = true;
+    octx.imageSmoothingQuality = 'high';
+    octx.drawImage(source.el, 0, 0, out.width, out.height);
+  } finally {
+    octx.restore();
+  }
   out.classList.remove('pixelated');
   if (view.splitOn) cctx.clearRect(0, 0, cmp.width, cmp.height);
 }
@@ -1500,7 +1518,7 @@ function loop(t) {
     }
   }
 
-  if (playing || animating) {
+  if (shouldSamplePlaybackCadence(playing, animating, contentNew)) {
     if (lastFrameT) {
       const fdt = t - lastFrameT;
       fpsEma = fpsEma ? fpsEma * 0.9 + fdt * 0.1 : fdt;
@@ -1517,7 +1535,7 @@ function loop(t) {
       if ($('seek').value !== String(seekValue)) $('seek').value = seekValue;
       updateVideoTime(el);
     }
-  } else {
+  } else if (!playing && !animating) {
     lastFrameT = 0;
     if (fpsText) { fpsText = ''; updateStatus(); }
   }

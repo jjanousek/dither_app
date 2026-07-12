@@ -99,6 +99,21 @@ test('Canvas compositor masks processed in the destination and adds one raw scra
   assert.equal(destination.context.imageSmoothingEnabled, true);
 });
 
+test('exact canvas copies replace transparent destination pixels and restore caller state', () => {
+  const compositor = new MaskCompositor({ createCanvas: (w, h) => new TraceCanvas(w, h) });
+  const source = new TraceCanvas(3, 2, 'source');
+  const destination = new TraceCanvas(3, 2, 'destination');
+  destination.context.globalCompositeOperation = 'xor';
+  destination.context.imageSmoothingEnabled = false;
+
+  assert.equal(compositor.copyRaw({ raw: source, destination }), destination);
+  assert.equal(destination.context.operations.length, 1);
+  assert.equal(destination.context.operations[0].source, source);
+  assert.equal(destination.context.operations[0].composite, 'copy');
+  assert.equal(destination.context.globalCompositeOperation, 'xor');
+  assert.equal(destination.context.imageSmoothingEnabled, false);
+});
+
 test('scratch canvases are reused by size, resized safely, and explicitly released', () => {
   const allocations = [];
   const compositor = new MaskCompositor({

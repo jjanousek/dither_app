@@ -821,3 +821,15 @@ input[type='color']::-webkit-color-swatch { border: none; border-radius: 4px; }
   .mask-range { grid-template-columns: auto minmax(52px, 74px) 42px; }
   .mask-range input[type='range'] { width: 66px; }
 }
+
+@media (max-width: 680px) {
+  /* The compact bar is intentionally one row. On narrow web viewports keep
+     every tool reachable by scrolling from the first control instead of
+     centering overflow off both sides of the screen. */
+  #mask-brush-bar {
+    justify-content: flex-start;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+}

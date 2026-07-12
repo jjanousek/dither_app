@@ -12,7 +12,11 @@ import {
 import { GifEncoder } from '../js/export/gif.js';
 import { Mp4Muxer } from '../js/export/mp4.js';
 import { exportGIF, GIF_RETAINED_PIXEL_BUDGET, gifFrameBudget } from '../js/export/exporters.js';
-import { LIVE_CPU_DITHER_BUDGETS, liveCpuDitherBudget } from '../js/preview-policy.js';
+import {
+  LIVE_CPU_DITHER_BUDGETS,
+  liveCpuDitherBudget,
+  shouldSamplePlaybackCadence,
+} from '../js/preview-policy.js';
 import { countGifFrames } from '../js/sources.js';
 
 const GOLDEN_PALETTE = new Float32Array([
@@ -133,6 +137,13 @@ test('1080p fine CPU dither settings keep distinct live work grids', () => {
   assert.deepEqual(fit(1), [1066, 600]);
   assert.deepEqual(fit(2), [864, 486]);
   assert.deepEqual(fit(3), [596, 335]);
+});
+
+test('playback FPS samples decoded content, not asynchronous worker wake-ups', () => {
+  assert.equal(shouldSamplePlaybackCadence(true, false, true), true);
+  assert.equal(shouldSamplePlaybackCadence(true, false, false), false);
+  assert.equal(shouldSamplePlaybackCadence(false, true, true), true);
+  assert.equal(shouldSamplePlaybackCadence(false, false, true), false);
 });
 
 const BW_PALETTE = new Float32Array([0, 0, 0, 255, 255, 255]);

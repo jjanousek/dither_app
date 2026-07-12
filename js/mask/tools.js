@@ -729,7 +729,7 @@ export class MaskEditor {
       const text = this.mode === 'ascii'
         ? `Purple = guide · Paint ${paintedResult} · Snaps to glyphs`
         : `Purple = guide · Paint ${paintedResult} · ⌥ erase · Space pan`;
-      e.hint.textContent = this.sourceIsMoving ? `${text} · Static on video` : text;
+      e.hint.textContent = this.sourceIsMoving ? `${text} · Static across frames` : text;
       if (e.bar) e.bar.title = e.hint.textContent;
     }
     this.#updateCursor();
