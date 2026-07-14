@@ -57,13 +57,21 @@ export function brushScreenSize({
   };
 }
 
-export function resolveStrokeOperation(event, selectedTool = 'paint', optionHeld = false) {
+export function resolveStrokeOperation(
+  event,
+  brushTarget = 'original',
+  placement = 'outside',
+  optionHeld = false,
+) {
   const penEraser = event?.pointerType === 'pen'
     && (event.button === 5 || ((event.buttons || 0) & 32) !== 0);
-  return selectedTool === 'erase' || optionHeld || event?.altKey
-    || event?.button === 2 || penEraser
-    ? 'erase'
-    : 'add';
+  const inverse = optionHeld || event?.altKey || event?.button === 2 || penEraser;
+  const requested = brushTarget === 'effect' ? 'effect' : 'original';
+  const effectiveTarget = inverse
+    ? (requested === 'original' ? 'effect' : 'original')
+    : requested;
+  const selectedCoverageShows = placement === 'inside' ? 'effect' : 'original';
+  return effectiveTarget === selectedCoverageShows ? 'add' : 'erase';
 }
 
 export function touchGestureMetrics(points) {
@@ -99,17 +107,16 @@ function resolveElements(root, supplied = {}) {
     cursorCore: get('cursorCore', 'mask-cursor-core'),
     bar: get('bar', 'mask-brush-bar'),
     priming: get('priming', 'mask-priming'),
-    paint: get('paint', 'mask-tool-paint'),
-    erase: get('erase', 'mask-tool-erase'),
+    brushOriginal: get('brushOriginal', 'mask-brush-original'),
+    brushEffect: get('brushEffect', 'mask-brush-effect'),
     size: get('size', 'mask-size'),
     sizeValue: get('sizeValue', 'mask-size-value'),
     feather: get('feather', 'mask-feather'),
     featherValue: get('featherValue', 'mask-feather-value'),
-    showOriginal: get('showOriginal', 'mask-show-original'),
-    showEffect: get('showEffect', 'mask-show-effect'),
-    actions: get('actions', 'mask-actions'),
-    clearPaint: get('clearPaint', 'mask-clear-paint'),
-    effectEverywhere: get('effectEverywhere', 'mask-effect-everywhere'),
+    actionsTrigger: get('actionsTrigger', 'mask-actions-trigger'),
+    actionsMenu: get('actionsMenu', 'mask-actions-menu'),
+    toggleGuide: get('toggleGuide', 'mask-toggle-guide'),
+    clearMask: get('clearMask', 'mask-clear-mask'),
     originalEverywhere: get('originalEverywhere', 'mask-original-everywhere'),
     done: get('done', 'mask-done'),
     hint: get('hint', 'mask-editor-hint'),
@@ -121,8 +128,6 @@ const CALLBACK_NAMES = [
   'onDraftChanged',
   'onStrokeCommitted',
   'onStrokeRolledBack',
-  'onPlacementRequested',
-  'onClearPaintRequested',
   'onEffectEverywhereRequested',
   'onOriginalEverywhereRequested',
   'onEditingChanged',
@@ -144,6 +149,7 @@ export class MaskEditor {
   constructor({ view, root = globalThis.document, elements = {}, callbacks = {} } = {}) {
     if (!view) throw new Error('MaskEditor requires a Viewport');
     this.view = view;
+    this.root = root;
     this.elements = resolveElements(root, elements);
     this.callbacks = {};
     for (const name of CALLBACK_NAMES) this.callbacks[name] = callbacks[name] || noop;
@@ -155,7 +161,8 @@ export class MaskEditor {
     this.compareHeld = false;
     this.spaceHeld = false;
     this.optionHeld = false;
-    this.selectedTool = 'paint';
+    this.brushTarget = 'original';
+    this.guideVisible = false;
     this.diameterShortNorm = 0.06;
     this.feather = 0.3;
     this.placement = 'outside';
@@ -175,6 +182,10 @@ export class MaskEditor {
     this.touchGesture = null;
     this.hover = null;
     this.splitDisabledBeforeEditing = false;
+    this.splitActiveBeforeEditing = false;
+    this.splitTitleBeforeEditing = '';
+    this.focusBeforeEditing = null;
+    this.actionsOpen = false;
     this._listeners = [];
 
     this.#bindControls();
@@ -185,6 +196,7 @@ export class MaskEditor {
   }
 
   get hasDraft() { return !!this.draft; }
+  get isGuideVisible() { return this.guideVisible; }
 
   sync({
     revisionId = this.revisionId,
@@ -267,11 +279,23 @@ export class MaskEditor {
   open() {
     if (this.editing || this.locked || this.priming) return false;
     this.editing = true;
+    this.focusBeforeEditing = this.root?.activeElement || null;
     this.splitDisabledBeforeEditing = !!this.elements.splitButton?.disabled;
-    if (this.elements.splitButton) this.elements.splitButton.disabled = true;
+    this.splitActiveBeforeEditing = !!this.elements.splitButton?.classList?.contains('active');
+    this.splitTitleBeforeEditing = this.elements.splitButton?.title || '';
+    if (this.elements.splitButton) {
+      this.elements.splitButton.disabled = true;
+      this.elements.splitButton.classList?.remove('active');
+      if (this.splitActiveBeforeEditing) {
+        this.elements.splitButton.title = 'Split view is paused while editing the mask';
+      }
+    }
     this.view.setSplitSuppressed?.(true);
     this.callbacks.onEditingChanged(true);
     this.#syncUi();
+    const focusBrush = () => this.elements.brushOriginal?.focus?.({ preventScroll: true });
+    if (typeof queueMicrotask === 'function') queueMicrotask(focusBrush);
+    else focusBrush();
     return true;
   }
 
@@ -286,10 +310,18 @@ export class MaskEditor {
     this.touchPointers.clear();
     this.touchInhibit = false;
     this.touchGesture = null;
+    this.#setActionsOpen(false);
     this.view.setSplitSuppressed?.(false);
-    if (this.elements.splitButton) this.elements.splitButton.disabled = this.splitDisabledBeforeEditing;
+    if (this.elements.splitButton) {
+      this.elements.splitButton.disabled = this.splitDisabledBeforeEditing;
+      this.elements.splitButton.classList?.toggle('active', this.splitActiveBeforeEditing);
+      this.elements.splitButton.title = this.splitTitleBeforeEditing;
+    }
     this.callbacks.onEditingChanged(false);
     this.#syncUi();
+    const restore = this.focusBeforeEditing?.focus ? this.focusBeforeEditing : this.elements.maskButton;
+    restore?.focus?.({ preventScroll: true });
+    this.focusBeforeEditing = null;
     return true;
   }
 
@@ -355,19 +387,18 @@ export class MaskEditor {
     }
     if (code === 'Escape') {
       prevent();
+      if (this.actionsOpen) {
+        this.#setActionsOpen(false, { restoreFocus: true });
+        return true;
+      }
       if (this.locked || this.priming) return true;
       this.close({ commitDraft: false });
       return true;
     }
     if (this.locked || this.priming) return false;
-    if (code === 'KeyE') {
+    if (code === 'KeyE' || code === 'KeyX') {
       prevent();
-      if (!event.repeat) this.#setSelectedTool(this.selectedTool === 'paint' ? 'erase' : 'paint');
-      return true;
-    }
-    if (code === 'KeyX') {
-      prevent();
-      if (!event.repeat && !this.draft) this.#requestPlacement(this.placement === 'outside' ? 'inside' : 'outside');
+      if (!event.repeat) this.#setBrushTarget(this.brushTarget === 'original' ? 'effect' : 'original');
       return true;
     }
     if (code === 'BracketLeft' || code === 'BracketRight') {
@@ -384,6 +415,7 @@ export class MaskEditor {
     const code = event.code || '';
     if (code === 'AltLeft' || code === 'AltRight') {
       this.optionHeld = false;
+      if (this.hover) this.hover.altKey = false;
       this.#syncUi();
       return this.editing;
     }
@@ -434,7 +466,7 @@ export class MaskEditor {
 
     this.callbacks.onBeginDiscreteEdit();
     this.draft = {
-      operation: resolveStrokeOperation(event, this.selectedTool, this.optionHeld),
+      operation: resolveStrokeOperation(event, this.brushTarget, this.placement, this.optionHeld),
       radiusShortNorm: this.diameterShortNorm / 2,
       feather: this.feather,
       points: [point.u, point.v],
@@ -539,21 +571,42 @@ export class MaskEditor {
       else this.open();
     });
     on(e.status, 'click', () => this.open());
-    on(e.paint, 'click', () => this.#setSelectedTool('paint'));
-    on(e.erase, 'click', () => this.#setSelectedTool('erase'));
+    on(e.brushOriginal, 'click', () => this.#setBrushTarget('original'));
+    on(e.brushEffect, 'click', () => this.#setBrushTarget('effect'));
     on(e.size, 'input', () => this.#setDiameter(Number(e.size.value)));
     on(e.feather, 'input', () => this.#setFeather(Number(e.feather.value)));
-    on(e.showOriginal, 'click', () => this.#requestPlacement('outside'));
-    on(e.showEffect, 'click', () => this.#requestPlacement('inside'));
-    on(e.clearPaint, 'click', () => this.#requestAction('onClearPaintRequested'));
-    on(e.effectEverywhere, 'click', () => this.#requestAction('onEffectEverywhereRequested'));
-    on(e.originalEverywhere, 'click', () => this.#requestAction('onOriginalEverywhereRequested'));
+    on(e.actionsTrigger, 'click', () => this.#setActionsOpen(!this.actionsOpen));
+    on(e.actionsTrigger, 'keydown', (event) => {
+      if (event.key !== 'ArrowDown') return;
+      event.preventDefault?.();
+      this.#setActionsOpen(true, { focusFirst: true });
+    });
+    on(e.actionsMenu, 'keydown', (event) => this.#handleActionsKeyDown(event));
+    on(e.toggleGuide, 'click', () => {
+      this.guideVisible = !this.guideVisible;
+      this.#setActionsOpen(false, { restoreFocus: true });
+      this.callbacks.onMaskRepaintRequested();
+      this.#syncUi();
+    });
+    on(e.clearMask, 'click', () => {
+      this.#setBrushTarget('original');
+      this.#requestAction('onEffectEverywhereRequested');
+    });
+    on(e.originalEverywhere, 'click', () => {
+      this.#setBrushTarget('effect');
+      this.#requestAction('onOriginalEverywhereRequested');
+    });
     on(e.done, 'click', () => this.close({ commitDraft: true }));
+    on(this.root, 'pointerdown', (event) => {
+      if (!this.actionsOpen) return;
+      if (event.target?.closest?.('#mask-actions-trigger, #mask-actions-menu')) return;
+      this.#setActionsOpen(false);
+    });
   }
 
-  #setSelectedTool(tool) {
+  #setBrushTarget(target) {
     if (this.locked || this.priming) return;
-    this.selectedTool = tool === 'erase' ? 'erase' : 'paint';
+    this.brushTarget = target === 'effect' ? 'effect' : 'original';
     this.#syncUi();
   }
 
@@ -569,20 +622,65 @@ export class MaskEditor {
     this.#syncUi();
   }
 
-  #requestPlacement(placement) {
-    if (this.locked || this.priming || this.draft || placement === this.placement) return;
-    this.callbacks.onBeginDiscreteEdit();
-    this.placement = placement;
-    this.callbacks.onPlacementRequested(placement);
-    if (this.elements.actions) this.elements.actions.open = false;
-    this.#syncUi();
-  }
-
   #requestAction(callbackName) {
     if (this.locked || this.priming || this.draft) return;
     this.callbacks.onBeginDiscreteEdit();
     this.callbacks[callbackName]();
-    if (this.elements.actions) this.elements.actions.open = false;
+    this.#setActionsOpen(false);
+  }
+
+  #menuItems() {
+    return Array.from(this.elements.actionsMenu?.querySelectorAll?.('button:not(:disabled)') || []);
+  }
+
+  #setActionsOpen(open, { focusFirst = false, restoreFocus = false } = {}) {
+    this.actionsOpen = !!open && this.editing && !this.locked && !this.priming;
+    const trigger = this.elements.actionsTrigger;
+    const menu = this.elements.actionsMenu;
+    if (trigger) trigger.setAttribute?.('aria-expanded', String(this.actionsOpen));
+    if (menu) menu.hidden = !this.actionsOpen;
+    if (this.actionsOpen) {
+      this.#positionActionsMenu();
+      if (focusFirst) this.#menuItems()[0]?.focus?.({ preventScroll: true });
+    } else if (restoreFocus) {
+      trigger?.focus?.({ preventScroll: true });
+    }
+  }
+
+  #positionActionsMenu() {
+    const trigger = this.elements.actionsTrigger;
+    const menu = this.elements.actionsMenu;
+    const viewport = this.elements.viewport;
+    if (!trigger?.getBoundingClientRect || !menu?.getBoundingClientRect || !viewport?.getBoundingClientRect) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const viewportRect = viewport.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const width = menuRect.width || 176;
+    const left = clamp(triggerRect.right - viewportRect.left - width, 8, Math.max(8, viewportRect.width - width - 8));
+    const top = Math.max(8, triggerRect.bottom - viewportRect.top + 7);
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
+
+  #handleActionsKeyDown(event) {
+    if (event.key === 'Escape') {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      this.#setActionsOpen(false, { restoreFocus: true });
+      return;
+    }
+    const items = this.#menuItems();
+    if (!items.length) return;
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp' && event.key !== 'Home' && event.key !== 'End') return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    const current = Math.max(0, items.indexOf(this.root?.activeElement));
+    const next = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? items.length - 1
+        : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+    items[next]?.focus?.({ preventScroll: true });
   }
 
   #requestCompare(active) {
@@ -684,6 +782,7 @@ export class MaskEditor {
   #syncUi() {
     const e = this.elements;
     const disabled = this.locked || this.priming;
+    if (disabled && this.actionsOpen) this.#setActionsOpen(false);
     if (e.maskButton) {
       e.maskButton.classList?.toggle('active', this.editing);
       e.maskButton.classList?.toggle('mask-present', this.uniformCoverage !== 1);
@@ -692,22 +791,29 @@ export class MaskEditor {
     }
     if (e.bar) e.bar.hidden = !this.editing;
     if (e.priming) e.priming.hidden = !this.priming;
-    if (e.overlay) e.overlay.hidden = !this.editing || this.comparing || this.locked || this.priming;
+    if (e.overlay) {
+      e.overlay.hidden = !this.editing || !this.guideVisible
+        || this.comparing || this.locked || this.priming;
+    }
     e.viewport?.classList?.toggle('mask-editing', this.editing);
     e.viewport?.classList?.toggle('mask-painting', !!this.draft);
     e.viewport?.classList?.toggle('mask-space-pan', this.spaceHeld);
 
-    const effectiveErase = this.selectedTool === 'erase' || this.optionHeld;
-    e.viewport?.classList?.toggle('mask-erasing', effectiveErase);
-    this.#press(e.paint, this.selectedTool === 'paint');
-    this.#press(e.erase, this.selectedTool === 'erase');
-    this.#press(e.showOriginal, this.placement === 'outside');
-    this.#press(e.showEffect, this.placement === 'inside');
+    e.viewport?.classList?.toggle('mask-opposite-brush', this.optionHeld);
+    this.#press(e.brushOriginal, this.brushTarget === 'original');
+    this.#press(e.brushEffect, this.brushTarget === 'effect');
 
-    for (const control of [e.paint, e.erase, e.size, e.feather, e.showOriginal,
-      e.showEffect, e.clearPaint, e.effectEverywhere, e.originalEverywhere, e.done]) {
+    for (const control of [e.brushOriginal, e.brushEffect, e.size, e.feather,
+      e.actionsTrigger, e.toggleGuide, e.clearMask, e.originalEverywhere, e.done]) {
       if (control) control.disabled = disabled;
     }
+    if (e.toggleGuide) {
+      e.toggleGuide.textContent = this.guideVisible ? 'Hide guide' : 'Show guide';
+      e.toggleGuide.setAttribute?.('aria-checked', String(this.guideVisible));
+    }
+    if (e.actionsTrigger) e.actionsTrigger.setAttribute?.('aria-expanded', String(this.actionsOpen));
+    if (e.actionsMenu) e.actionsMenu.hidden = !this.actionsOpen;
+    if (this.actionsOpen) this.#positionActionsMenu();
     if (e.sizeValue) {
       const px = this.sourceWidth && this.sourceHeight
         ? Math.max(1, Math.round(this.diameterShortNorm * Math.min(this.sourceWidth, this.sourceHeight)))
@@ -722,13 +828,14 @@ export class MaskEditor {
       e.status.hidden = this.uniformCoverage === 1;
       e.status.textContent = this.uniformCoverage === 0
         ? 'Mask · Original everywhere'
-        : `Mask · painted shows ${this.placement === 'inside' ? 'Effect' : 'Original'}`;
+        : 'Mask · Original + Effect';
     }
     if (e.hint) {
-      const paintedResult = this.placement === 'inside' ? 'effect' : 'original';
+      const opposite = this.brushTarget === 'original' ? 'Effect' : 'Original';
+      const target = this.brushTarget === 'original' ? 'Original' : 'Effect';
       const text = this.mode === 'ascii'
-        ? `Purple = guide · Paint ${paintedResult} · Snaps to glyphs`
-        : `Purple = guide · Paint ${paintedResult} · ⌥ erase · Space pan`;
+        ? `Brush ${target} · ⌥ ${opposite} · Raster mask snaps to whole glyphs · Text export stays full-frame`
+        : `Brush ${target} · ⌥ ${opposite} · Space pan`;
       e.hint.textContent = this.sourceIsMoving ? `${text} · Static across frames` : text;
       if (e.bar) e.bar.title = e.hint.textContent;
     }
@@ -761,10 +868,8 @@ export class MaskEditor {
     const cursorHeight = `${Math.max(2, size.height)}px`;
     if (cursor.style.width !== cursorWidth) cursor.style.width = cursorWidth;
     if (cursor.style.height !== cursorHeight) cursor.style.height = cursorHeight;
-    const cursorOperation = this.draft?.operation || resolveStrokeOperation(
-      { altKey: point.altKey }, this.selectedTool, this.optionHeld,
-    );
-    cursor.classList?.toggle('eraser', cursorOperation === 'erase');
+    const inverse = this.optionHeld || point.altKey;
+    cursor.classList?.toggle('opposite', !!inverse);
     const core = this.elements.cursorCore;
     if (core) {
       const fraction = Math.max(0, 1 - this.feather);

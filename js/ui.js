@@ -2,8 +2,14 @@
 // changes (mode, algorithm, palette, ramp); sliders/toggles mutate state and
 // call onChange() without a rebuild.
 
-import { CELL_SIZE_MIN, MODES } from './state.js';
+import {
+  CELL_SIZE_MIN,
+  MODES,
+  transitionAlgorithm,
+  transitionMode,
+} from './state.js';
 import { ALGORITHMS, getAlgorithm } from './engine/engine.js';
+import { exportPanelPolicy } from './export-settings.js';
 import { PALETTES, getPalette } from './palettes.js';
 import { RAMPS, FONTS } from './engine/ascii.js';
 import { GEN_SCENES } from './generate.js';
@@ -65,7 +71,9 @@ function row(body, labelText) {
   return r;
 }
 
-function slider(body, label, { min, max, step = 1, value, fmt = (v) => v, oninput }) {
+function slider(body, label, {
+  min, max, step = 1, value, fmt = (v) => v, oninput, disabled = false,
+}) {
   const r = row(body, label);
   const input = document.createElement('input');
   input.type = 'range';
@@ -73,6 +81,7 @@ function slider(body, label, { min, max, step = 1, value, fmt = (v) => v, oninpu
   input.max = max;
   input.step = step;
   input.value = value;
+  input.disabled = disabled;
   syncRangeProgress(input);
   const val = document.createElement('span');
   val.className = 'value';
@@ -107,7 +116,7 @@ function toggle(body, label, { value, oninput }) {
   return input;
 }
 
-function select(body, label, { options, value, oninput }) {
+function select(body, label, { options, value, oninput, disabled = false }) {
   const r = row(body, label);
   const sel = document.createElement('select');
   const addOption = (parent, o) => {
@@ -132,6 +141,7 @@ function select(body, label, { options, value, oninput }) {
   } else {
     options.forEach((o) => addOption(sel, o));
   }
+  sel.disabled = disabled;
   sel.addEventListener('change', () => oninput(sel.value));
   associateRowLabel(r, sel);
   r.appendChild(sel);
@@ -162,15 +172,46 @@ function textInput(body, label, { value, oninput, placeholder = '' }) {
   return input;
 }
 
+function inlineNote(body, text, className = '') {
+  const note = document.createElement('div');
+  note.className = `control-note${className ? ` ${className}` : ''}`;
+  note.textContent = text;
+  body.appendChild(note);
+  return note;
+}
+
 const pct = (v) => `${Math.round(v * 100)}%`;
 
 // ---------- panel ----------
 
-export function buildPanel({ state, mount, onChange, exportSettings, gen = null, onGenChange = null, isLive = false }) {
+export function buildPanel({
+  state,
+  mount,
+  onChange,
+  onBeforeDiscreteChange = null,
+  onExportChange = null,
+  exportSettings,
+  sourceType = null,
+  gen = null,
+  onGenChange = null,
+  isLive = false,
+}) {
   mount.innerHTML = '';
-  const refresh = () => buildPanel({ state, mount, onChange, exportSettings, gen, onGenChange, isLive });
-  const change = () => onChange();
-  const changeAndRefresh = () => { onChange(); refresh(); };
+  const refresh = () => buildPanel({
+    state,
+    mount,
+    onChange,
+    onBeforeDiscreteChange,
+    onExportChange,
+    exportSettings,
+    sourceType,
+    gen,
+    onGenChange,
+    isLive,
+  });
+  const change = (meta) => onChange(meta);
+  const changeAndRefresh = (meta) => { onChange(meta); refresh(); };
+  const beforeDiscrete = () => onBeforeDiscreteChange?.();
 
   // --- SCENE (generated sources only) ---
   if (gen) {
@@ -216,7 +257,12 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
     pill.setAttribute('role', 'button');
     pill.tabIndex = 0;
     pill.setAttribute('aria-pressed', String(state.mode === m.id));
-    pill.onclick = () => { state.mode = m.id; changeAndRefresh(); };
+    pill.onclick = () => {
+      if (state.mode === m.id) return;
+      beforeDiscrete();
+      transitionMode(state, m.id);
+      changeAndRefresh({ discrete: true });
+    };
     pill.addEventListener('keydown', (event) => {
       if (event.key !== 'Enter' && event.key !== ' ') return;
       event.preventDefault();
@@ -230,7 +276,12 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
     select(eff, 'Algorithm', {
       options: ALGORITHMS.map((a) => ({ value: a.id, label: a.name, group: a.group })),
       value: state.algorithm,
-      oninput: (v) => { state.algorithm = v; changeAndRefresh(); },
+      oninput: (v) => {
+        if (state.algorithm === v) return;
+        beforeDiscrete();
+        transitionAlgorithm(state, v);
+        changeAndRefresh({ discrete: true });
+      },
     });
     slider(eff, 'Pixel size', {
       min: 1, max: 32, step: 1, value: state.pixelSize,
@@ -315,11 +366,28 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         oninput: (v) => { a.rampId = v; changeAndRefresh(); },
       });
       if (a.rampId === 'custom') {
-        textInput(eff, 'Custom set', {
+        const customInput = textInput(eff, 'Custom set', {
           value: a.customChars,
           placeholder: 'any glyphs — coverage is measured',
-          oninput: (v) => { a.customChars = v || '@ '; change(); },
+          oninput: (v) => { a.customChars = v; change(); },
         });
+        const validateCustomSet = () => {
+          const valid = [...customInput.value].length >= 2;
+          customInput.setAttribute('aria-invalid', String(!valid));
+          customInput.setCustomValidity(valid ? '' : 'Use at least two characters');
+          return valid;
+        };
+        customInput.addEventListener('input', validateCustomSet);
+        customInput.addEventListener('change', () => {
+          if (validateCustomSet()) return;
+          customInput.value = '@ ';
+          a.customChars = '@ ';
+          customInput.setAttribute('aria-invalid', 'false');
+          customInput.setCustomValidity('');
+          change();
+        });
+        validateCustomSet();
+        inlineNote(eff, 'Use at least two characters. An empty set resets visibly to “@ ” when you leave the field.');
       }
     }
     if (a.renderer === 'shape') {
@@ -447,7 +515,8 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         const input = document.createElement('input');
         input.type = 'color';
         input.value = cHex;
-        input.title = 'Right-click to remove';
+        input.title = `Custom color ${i + 1}`;
+        input.setAttribute('aria-label', `Custom color ${i + 1}`);
         // 'input' fires continuously while the native picker is open; a panel
         // rebuild would destroy the picker mid-edit. Update in place instead
         // and rebuild only on the final 'change'.
@@ -460,19 +529,40 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         input.addEventListener('contextmenu', (e) => {
           e.preventDefault();
           if (state.customColors.length > 2) {
+            beforeDiscrete();
             state.customColors.splice(i, 1);
-            changeAndRefresh();
+            changeAndRefresh({ discrete: true });
           }
         });
-        sw.appendChild(input);
+        const entry = document.createElement('div');
+        entry.className = 'swatch-entry';
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'swatch-remove';
+        remove.textContent = '×';
+        remove.setAttribute('aria-label', `Remove custom color ${i + 1}`);
+        remove.title = `Remove custom color ${i + 1}`;
+        remove.disabled = state.customColors.length <= 2;
+        remove.onclick = () => {
+          if (state.customColors.length <= 2) return;
+          beforeDiscrete();
+          state.customColors.splice(i, 1);
+          changeAndRefresh({ discrete: true });
+        };
+        entry.append(input, remove);
+        sw.appendChild(entry);
       });
       if (state.customColors.length < 32) {
         const add = document.createElement('button');
         add.className = 'btn';
+        add.type = 'button';
         add.textContent = '+';
+        add.setAttribute('aria-label', 'Add custom color');
+        add.title = 'Add custom color';
         add.onclick = () => {
+          beforeDiscrete();
           state.customColors.push('#808080');
-          changeAndRefresh();
+          changeAndRefresh({ discrete: true });
         };
         sw.appendChild(add);
       }
@@ -504,7 +594,12 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
   const an = section(mount, 'Animation');
   // flow/shimmer drift the dither pattern — meaningless for error diffusion
   // (no fixed lattice) and for non-dither modes, so say it in the option
-  const patternOk = state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'gpu';
+  const animationAlgorithm = getAlgorithm(state.algorithm);
+  const patternOk = state.mode === 'dither'
+    && animationAlgorithm.type === 'gpu'
+    && animationAlgorithm.mode >= 1;
+  const patternStyle = state.anim.style === 'flow' || state.anim.style === 'shimmer';
+  const animationActive = state.anim.style !== 'none' && (!patternStyle || patternOk);
   select(an, 'Style', {
     options: [
       { value: 'none', label: 'None' },
@@ -512,13 +607,21 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
       { value: 'pulse', label: 'Pulse (heartbeat)' },
       { value: 'sweep', label: 'Sweep (light band)' },
       { value: 'wave', label: 'Wave (distortion)' },
-      { value: 'flow', label: patternOk ? 'Flow (pattern drift)' : 'Flow — needs a pattern dither', disabled: !patternOk },
-      { value: 'shimmer', label: patternOk ? 'Shimmer (pattern jitter)' : 'Shimmer — needs a pattern dither', disabled: !patternOk },
+      {
+        value: 'flow',
+        label: patternOk ? 'Flow (pattern drift)' : 'Flow — paused',
+        disabled: !patternOk && state.anim.style !== 'flow',
+      },
+      {
+        value: 'shimmer',
+        label: patternOk ? 'Shimmer (pattern jitter)' : 'Shimmer — paused',
+        disabled: !patternOk && state.anim.style !== 'shimmer',
+      },
     ],
     value: state.anim.style,
     oninput: (v) => { state.anim.style = v; changeAndRefresh(); },
   });
-  if (state.anim.style !== 'none') {
+  if (animationActive) {
     slider(an, 'Speed', {
       min: 1, max: 10, step: 0.5, value: state.anim.speed,
       fmt: (v) => `${v}×`,
@@ -542,20 +645,17 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         oninput: (v) => { state.anim.direction = v; change(); },
       });
     }
-    if ((state.anim.style === 'flow' || state.anim.style === 'shimmer') && !patternOk) {
-      const hint = document.createElement('div');
-      hint.style.cssText = 'font-size:11px;color:var(--text-dim);line-height:1.5';
-      hint.textContent = 'Flow and Shimmer move the pattern of ordered, noise and halftone algorithms. The current algorithm has no fixed pattern to animate — pick Bayer, Blue Noise or Halftone to see it.';
-      an.appendChild(hint);
-    }
-    const hint2 = document.createElement('div');
-    hint2.style.cssText = 'font-size:11px;color:var(--text-dim);line-height:1.5';
-    hint2.textContent = 'Animated still images can be exported as looping GIFs or recorded as video.';
-    an.appendChild(hint2);
+    inlineNote(an, 'Animated still images can be exported as looping GIFs or recorded as video.');
+  } else if (patternStyle) {
+    const destination = state.mode === 'dither'
+      ? 'Choose Bayer, Blue Noise, White Noise, or Halftone to resume it.'
+      : 'Return to Dither with a pattern algorithm to resume it.';
+    inlineNote(an, `${state.anim.style === 'flow' ? 'Flow' : 'Shimmer'} is paused. Its speed and intensity are preserved. ${destination}`, 'paused-note');
   }
 
   // --- EXPORT ---
   const ex = section(mount, 'Export');
+  const exportPolicy = exportPanelPolicy({ sourceType, animationActive });
   select(ex, 'PNG size', {
     options: state.mode === 'dither'
       ? [
@@ -568,27 +668,43 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         { value: 'source2x', label: '2× resolution' },
       ],
     value: exportSettings.pngSize === 'work' && state.mode !== 'dither' ? 'source' : exportSettings.pngSize,
-    oninput: (v) => { exportSettings.pngSize = v; },
+    oninput: (v) => {
+      beforeDiscrete();
+      exportSettings.pngSize = v;
+      onExportChange?.({ discrete: true });
+    },
   });
-  select(ex, 'GIF quality', {
-    options: [
-      { value: '360', label: 'Small (~360px)' },
-      { value: '480', label: 'Medium (~480px)' },
-      { value: '720', label: 'Large (~720px)' },
-      { value: 'native', label: 'Native (1:1 pixels)' },
-    ],
-    value: exportSettings.gifSize,
-    oninput: (v) => { exportSettings.gifSize = v; },
-  });
-  select(ex, 'Record length', {
-    options: [
-      { value: '3', label: '3 seconds' },
-      { value: '5', label: '5 seconds' },
-      { value: '10', label: '10 seconds' },
-    ],
-    value: exportSettings.recordSeconds,
-    oninput: (v) => { exportSettings.recordSeconds = v; },
-  });
+  if (exportPolicy.showGifSize) {
+    select(ex, 'GIF size', {
+      options: [
+        { value: '360', label: 'Small (~360px)' },
+        { value: '480', label: 'Medium (~480px)' },
+        { value: '720', label: 'Large (~720px)' },
+        { value: 'native', label: 'Native (1:1 pixels)' },
+      ],
+      value: exportSettings.gifSize,
+      oninput: (v) => {
+        beforeDiscrete();
+        exportSettings.gifSize = v;
+        onExportChange?.({ discrete: true });
+      },
+    });
+  }
+  if (exportPolicy.durationLabel) {
+    select(ex, exportPolicy.durationLabel, {
+      options: [
+        { value: '3', label: '3 seconds' },
+        { value: '5', label: '5 seconds' },
+        { value: '10', label: '10 seconds' },
+      ],
+      value: exportSettings.recordSeconds,
+      oninput: (v) => {
+        beforeDiscrete();
+        exportSettings.recordSeconds = v;
+        onExportChange?.({ discrete: true });
+      },
+    });
+  }
   if (state.mode === 'ascii') {
     select(ex, 'Text format', {
       options: [
@@ -597,13 +713,18 @@ export function buildPanel({ state, mount, onChange, exportSettings, gen = null,
         { value: 'html', label: 'Web page (.html)' },
       ],
       value: exportSettings.txtFormat,
-      oninput: (v) => { exportSettings.txtFormat = v; },
+      oninput: (v) => {
+        beforeDiscrete();
+        exportSettings.txtFormat = v;
+        onExportChange?.({ discrete: true });
+      },
     });
+    inlineNote(ex, 'Text downloads and copy use the full ASCII frame. Effect Mask applies to PNG, GIF, and video only.');
     const copyRow = row(ex, null);
     const copyBtn = document.createElement('button');
     copyBtn.className = 'btn';
     copyBtn.style.flex = '1';
-    copyBtn.textContent = 'Copy ASCII to clipboard';
+    copyBtn.textContent = 'Copy full-frame ASCII';
     copyBtn.onclick = () => exportSettings.onCopyText?.();
     copyRow.appendChild(copyBtn);
   }

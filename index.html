@@ -37,7 +37,7 @@
       <button id="btn-redo" class="btn btn-icon" title="Redo (⇧⌘Z)" disabled>
         <svg viewBox="0 0 16 16"><path d="M10 3.5l3 3-3 3M12.5 6.5h-6a3.5 3.5 0 0 0 0 7H10"/></svg>
       </button>
-      <button id="btn-reset" class="btn btn-icon" title="Reset all settings">
+      <button id="btn-reset" class="btn btn-icon" title="Reset settings, export choices, and mask">
         <svg viewBox="0 0 16 16"><path d="M2.5 8a5.5 5.5 0 1 1 1.6 3.9M2.5 12V8.8h3.2"/></svg>
       </button>
     </div>
@@ -49,11 +49,11 @@
         <svg viewBox="0 0 16 16"><path d="M1.5 4.5h3l6 7h4M14.5 11.5l-2-2m2 2-2 2M1.5 11.5h3l1.7-2M8.7 6.6l1.8-2.1h4M14.5 4.5l-2-2m2 2-2 2"/></svg>
         <span>Shuffle</span>
       </button>
-      <button id="btn-compare" class="btn" title="Hold to see the original (or hold C)">
+      <button id="btn-compare" class="btn" title="Hold to see the original (or hold C)" aria-pressed="false">
         <svg viewBox="0 0 16 16"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></svg>
         <span>Compare</span>
       </button>
-      <button id="btn-split" class="btn" title="Toggle before/after split view">
+      <button id="btn-split" class="btn" title="Toggle before/after split view" aria-pressed="false">
         <svg viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M8 1.5v13"/></svg>
         <span>Split</span>
       </button>
@@ -79,7 +79,7 @@
           <canvas id="compare-canvas" hidden></canvas>
           <canvas id="mask-overlay" hidden aria-hidden="true"></canvas>
         </div>
-        <div id="split-divider" hidden>
+        <div id="split-divider" role="slider" tabindex="0" aria-label="Before and after split" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" aria-valuetext="50% original" aria-orientation="vertical" hidden>
           <div class="split-labels"><span>before</span><span>after</span></div>
           <div class="split-handle" title="Drag to move the split">
             <svg viewBox="0 0 16 16"><path d="M6 5 3 8l3 3M10 5l3 3-3 3"/></svg>
@@ -93,13 +93,16 @@
           <button id="zoom-fit" class="zbtn" title="Fit to view (0)">
             <svg viewBox="0 0 16 16"><path d="M6 2H2v4M10 2h4v4M6 14H2v-4M10 14h4v-4"/></svg>
           </button>
-          <button id="zoom-100" class="zbtn" title="Actual pixels (1)">1:1</button>
+          <button id="zoom-100" class="zbtn" title="Source pixels at 1:1 (1)">1:1</button>
         </div>
         <div id="mask-cursor" hidden aria-hidden="true"><div id="mask-cursor-core"></div></div>
         <div id="mask-brush-bar" role="toolbar" aria-label="Effect Mask brush controls" aria-describedby="mask-editor-hint" data-viewport-control hidden>
-          <div class="mask-segment" role="group" aria-label="Brush operation">
-            <button id="mask-tool-paint" class="mask-segment-btn active" type="button" aria-pressed="true">Paint</button>
-            <button id="mask-tool-erase" class="mask-segment-btn" type="button" aria-pressed="false">Erase</button>
+          <div class="mask-brush-choice">
+            <span>Brush</span>
+            <div class="mask-segment" role="group" aria-label="Brush result">
+              <button id="mask-brush-original" class="mask-segment-btn active" type="button" aria-pressed="true">Original</button>
+              <button id="mask-brush-effect" class="mask-segment-btn" type="button" aria-pressed="false">Effect</button>
+            </div>
           </div>
           <label class="mask-range" for="mask-size">
             <span>Size</span>
@@ -111,34 +114,25 @@
             <input id="mask-feather" type="range" min="0" max="1" step="0.01" value="0.3">
             <output id="mask-feather-value" for="mask-feather">30%</output>
           </label>
-          <div class="mask-placement">
-            <span class="mask-placement-label">Shows</span>
-            <div class="mask-segment" role="group" aria-label="What painted areas show">
-              <button id="mask-show-original" class="mask-segment-btn active" type="button" aria-pressed="true">Original</button>
-              <button id="mask-show-effect" class="mask-segment-btn" type="button" aria-pressed="false">Effect</button>
-            </div>
-          </div>
-          <details id="mask-actions" class="mask-actions">
-            <summary class="btn" title="Mask actions">More</summary>
-            <div class="mask-actions-menu" role="menu">
-              <button id="mask-clear-paint" type="button" role="menuitem">Clear paint</button>
-              <button id="mask-effect-everywhere" type="button" role="menuitem">Effect everywhere</button>
-              <button id="mask-original-everywhere" type="button" role="menuitem">Original everywhere</button>
-            </div>
-          </details>
+          <button id="mask-actions-trigger" class="btn" type="button" title="Mask actions" aria-haspopup="menu" aria-expanded="false">More</button>
           <button id="mask-done" class="btn" type="button">Done</button>
-          <div id="mask-editor-hint" class="mask-editor-hint">Purple = guide · Paint original · ⌥ erase · Space pan</div>
+          <div id="mask-editor-hint" class="mask-editor-hint">Brush Original · ⌥ Effect · Space pan</div>
+        </div>
+        <div id="mask-actions-menu" class="mask-actions-menu" role="menu" aria-label="Mask actions" data-viewport-control hidden>
+          <button id="mask-toggle-guide" type="button" role="menuitemcheckbox" aria-checked="false">Show guide</button>
+          <button id="mask-clear-mask" type="button" role="menuitem">Clear mask</button>
+          <button id="mask-original-everywhere" type="button" role="menuitem">Original everywhere</button>
         </div>
         <div id="mask-priming" role="status" aria-live="polite" data-viewport-control hidden>Preparing mask…</div>
         <div id="drop-hint"><span class="kbd-hint">drop an image or video · paste from clipboard · drag to pan · scroll to zoom</span></div>
-        <div id="busy" hidden><div class="busy-box"><div id="busy-label">Exporting…</div><div class="busy-bar"><div id="busy-fill"></div></div><button id="busy-cancel" class="btn">Cancel</button></div></div>
+        <div id="busy" role="dialog" aria-modal="true" aria-labelledby="busy-label" hidden><div class="busy-box"><div id="busy-label">Exporting…</div><div id="busy-progress" class="busy-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="busy-fill"></div></div><button id="busy-cancel" class="btn">Cancel</button></div></div>
       </div>
 
       <div id="video-bar" hidden>
-        <button id="btn-play" class="btn btn-icon">❚❚</button>
-        <input id="seek" type="range" min="0" max="1000" value="0" step="1">
+        <button id="btn-play" class="btn btn-icon" title="Pause video" aria-label="Pause video">❚❚</button>
+        <input id="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Video position" aria-describedby="time" aria-valuetext="0:00 of 0:00">
         <span id="time">0:00 / 0:00</span>
-        <select id="speed" class="mini-select" title="Playback speed">
+        <select id="speed" class="mini-select" title="Preview speed" aria-label="Preview speed">
           <option value="0.25">0.25×</option>
           <option value="0.5">0.5×</option>
           <option value="1" selected>1×</option>
@@ -158,7 +152,7 @@
     <aside id="panel"></aside>
   </main>
 
-  <div id="toast" hidden></div>
+  <div id="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

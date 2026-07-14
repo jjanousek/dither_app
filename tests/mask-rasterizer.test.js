@@ -183,8 +183,11 @@ test('source-space brush stays round and placement is the exact effect complemen
   const selection = rasterizeSelectionData(request);
   assert.ok(Math.abs(selection[5 * 20 + 11] - selection[6 * 20 + 10]) < 1e-7);
   const effect = rasterizeCoverageData({ ...request, coverageKind: 'effect' }, blueNoise);
+  const original = rasterizeCoverageData({ ...request, coverageKind: 'original' }, blueNoise);
   for (let index = 0; index < selection.length; index++) {
     assert.ok(Math.abs(effect[index] - (1 - selection[index])) < 1e-7);
+    assert.ok(Math.abs(original[index] - selection[index]) < 1e-7);
+    assert.ok(Math.abs(original[index] + effect[index] - 1) < 1e-7);
   }
 });
 

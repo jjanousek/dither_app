@@ -22,6 +22,8 @@ export class Viewport {
     this.fitMode = true;
     this._lastW = 0;
     this._lastH = 0;
+    this.referenceWidth = 0;
+    this.referenceHeight = 0;
 
     this.splitOn = false;
     this.splitFrac = 0.5;
@@ -88,6 +90,18 @@ export class Viewport {
     this.apply();
   }
 
+  setReferenceSize(width, height) {
+    this.referenceWidth = Math.max(0, Number(width) || 0);
+    this.referenceHeight = Math.max(0, Number(height) || 0);
+  }
+
+  displayZoom() {
+    const outputArea = this.output.width * this.output.height;
+    const referenceArea = this.referenceWidth * this.referenceHeight;
+    if (!(outputArea > 0) || !(referenceArea > 0)) return this.zoom;
+    return this.zoom * Math.sqrt(outputArea / referenceArea);
+  }
+
   fit() {
     const vw = this.el.clientWidth - PADDING;
     const vh = this.el.clientHeight - PADDING;
@@ -102,7 +116,12 @@ export class Viewport {
   }
 
   actualSize() {
-    this.#zoomTo(1, this.el.clientWidth / 2, this.el.clientHeight / 2);
+    const outputArea = this.output.width * this.output.height;
+    const referenceArea = this.referenceWidth * this.referenceHeight;
+    const rawZoom = outputArea > 0 && referenceArea > 0
+      ? Math.sqrt(referenceArea / outputArea)
+      : 1;
+    this.#zoomTo(rawZoom, this.el.clientWidth / 2, this.el.clientHeight / 2);
   }
 
   zoomBy(factor, cx, cy) {
@@ -149,12 +168,27 @@ export class Viewport {
     this.splitOn = !!on;
     this.#syncSplitVisibility();
     this.#positionDivider();
+    this.#syncSplitAria();
   }
 
   setSplitSuppressed(on) {
     this.splitSuppressed = !!on;
     this.#syncSplitVisibility();
     this.#positionDivider();
+    this.#syncSplitAria();
+  }
+
+  setSplitFrac(value, { notify = true } = {}) {
+    this.splitFrac = Math.min(1, Math.max(0, Number(value) || 0));
+    this.#positionDivider();
+    this.#syncSplitAria();
+    if (notify) this.onSplitDrag?.();
+  }
+
+  #syncSplitAria() {
+    const percent = Math.round(this.splitFrac * 100);
+    this.divider.setAttribute?.('aria-valuenow', String(percent));
+    this.divider.setAttribute?.('aria-valuetext', `${percent}% original`);
   }
 
   #syncSplitVisibility() {
@@ -296,9 +330,7 @@ export class Viewport {
       const x = e.clientX - rect.left;
       const w = this.output.width * this.zoom;
       if (w > 0) {
-        this.splitFrac = Math.min(1, Math.max(0, (x - this.tx) / w));
-        this.#positionDivider();
-        this.onSplitDrag?.(); // let the app redraw the before/after overlay
+        this.setSplitFrac((x - this.tx) / w); // redraws the before/after overlay
       }
     });
     const endSplit = (e) => {
@@ -307,6 +339,17 @@ export class Viewport {
     };
     this.divider.addEventListener('pointerup', endSplit);
     this.divider.addEventListener('pointercancel', endSplit);
+    this.divider.addEventListener('keydown', (e) => {
+      const step = e.shiftKey ? 0.1 : 0.02;
+      let next = null;
+      if (e.key === 'ArrowLeft') next = this.splitFrac - step;
+      else if (e.key === 'ArrowRight') next = this.splitFrac + step;
+      else if (e.key === 'Home') next = 0;
+      else if (e.key === 'End') next = 1;
+      if (next == null) return;
+      e.preventDefault();
+      this.setSplitFrac(next);
+    });
 
     window.addEventListener('resize', () => {
       if (this.fitMode) this.fit();

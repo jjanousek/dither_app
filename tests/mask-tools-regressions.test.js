@@ -60,9 +60,9 @@ class FakeElement {
 function makeElements() {
   const names = [
     'viewport', 'maskButton', 'splitButton', 'status', 'overlay', 'cursor',
-    'cursorCore', 'bar', 'priming', 'paint', 'erase', 'size', 'sizeValue',
-    'feather', 'featherValue', 'showOriginal', 'showEffect', 'actions',
-    'clearPaint', 'effectEverywhere', 'originalEverywhere', 'done', 'hint',
+    'cursorCore', 'bar', 'priming', 'brushOriginal', 'brushEffect', 'size', 'sizeValue',
+    'feather', 'featherValue', 'actionsTrigger', 'actionsMenu', 'toggleGuide',
+    'clearMask', 'originalEverywhere', 'done', 'hint',
   ];
   return Object.fromEntries(names.map((name) => [name, new FakeElement()]));
 }
@@ -121,7 +121,9 @@ function key(code, overrides = {}) {
     metaKey: false,
     target: null,
     prevented: false,
+    stopped: false,
     preventDefault() { this.prevented = true; },
+    stopPropagation() { this.stopped = true; },
     ...overrides,
   };
 }
@@ -145,12 +147,18 @@ test('cursor geometry follows source-space roundness under stretched output', ()
   assert.equal(size.height, 100);
 });
 
-test('stroke operation resolves tool, Option, right button, and pen eraser', () => {
-  assert.equal(resolveStrokeOperation(pointer(), 'paint', false), 'add');
-  assert.equal(resolveStrokeOperation(pointer(), 'erase', false), 'erase');
-  assert.equal(resolveStrokeOperation(pointer({ altKey: true }), 'paint', false), 'erase');
-  assert.equal(resolveStrokeOperation(pointer({ button: 2 }), 'paint', false), 'erase');
-  assert.equal(resolveStrokeOperation(pointer({ pointerType: 'pen', button: 5 })), 'erase');
+test('stroke operation maps direct visual targets onto internal placement', () => {
+  assert.equal(resolveStrokeOperation(pointer(), 'original', 'outside', false), 'add');
+  assert.equal(resolveStrokeOperation(pointer(), 'effect', 'outside', false), 'erase');
+  assert.equal(resolveStrokeOperation(pointer(), 'original', 'inside', false), 'erase');
+  assert.equal(resolveStrokeOperation(pointer(), 'effect', 'inside', false), 'add');
+});
+
+test('Option, right button, and pen eraser temporarily paint the opposite result', () => {
+  assert.equal(resolveStrokeOperation(pointer({ altKey: true }), 'original', 'outside', false), 'erase');
+  assert.equal(resolveStrokeOperation(pointer({ button: 2 }), 'original', 'outside', false), 'erase');
+  assert.equal(resolveStrokeOperation(pointer({ pointerType: 'pen', button: 5 }), 'original', 'outside', false), 'erase');
+  assert.equal(resolveStrokeOperation(pointer(), 'effect', 'inside', true), 'erase');
 });
 
 test('touch gesture metrics use centroid and stable nonzero distance', () => {
@@ -175,9 +183,12 @@ test('MaskEditor locks stroke operation and distinguishes commit from rollback',
     },
   });
   editor.sync({ sourceWidth: 1000, sourceHeight: 500, outputWidth: 400, outputHeight: 200 });
+  elements.splitButton.classList.add('active');
+  elements.splitButton.setAttribute('aria-pressed', 'true');
   editor.open();
   assert.equal(view.splitSuppressed, true);
   assert.equal(elements.splitButton.disabled, true);
+  assert.equal(elements.splitButton.classList.contains('active'), false, 'suppressed Split stops looking active');
 
   const down = pointer();
   assert.equal(editor.pointerDown(down, view.clientToNormalized(20, 20)), 'tool');
@@ -192,6 +203,7 @@ test('MaskEditor locks stroke operation and distinguishes commit from rollback',
   assert.equal(rolledBack, 1);
   assert.equal(editor.editing, false);
   assert.equal(view.splitSuppressed, false);
+  assert.equal(elements.splitButton.classList.contains('active'), true, 'Split appearance returns after Mask closes');
   editor.destroy();
 });
 
@@ -304,18 +316,52 @@ test('MaskEditor keyboard routing uses physical bracket keys and repeat guards',
   assert.equal(editor.handleKeyDown(key('BracketRight', { ctrlKey: true })), false);
   assert.equal(editor.feather, featherAfterShortcut, 'modified brackets remain available to the host');
   const placementBeforeChord = editor.placement;
+  const brushBeforeChord = editor.brushTarget;
   assert.equal(editor.handleKeyDown(key('KeyX', { altKey: true })), false);
   assert.equal(editor.placement, placementBeforeChord, 'Option-X cannot change mask placement');
+  assert.equal(editor.brushTarget, brushBeforeChord, 'Option-X cannot change brush target');
   assert.equal(editor.handleKeyDown(key('AltLeft', { altKey: true })), true);
-  assert.equal(editor.optionHeld, true, 'the bare Option key still enables temporary erase');
+  assert.equal(editor.optionHeld, true, 'the bare Option key temporarily paints the opposite result');
   assert.equal(editor.handleKeyDown(key('KeyE', { altKey: true })), false);
   editor.handleKeyUp(key('AltLeft'));
   assert.equal(editor.optionHeld, false);
+  editor.handleKeyDown(key('KeyX'));
+  assert.notEqual(editor.brushTarget, brushBeforeChord, 'X swaps the direct brush target');
   editor.handleKeyDown(key('KeyC'));
   editor.handleKeyUp(key('KeyC'));
   assert.deepEqual(compare, [true, false]);
   const field = { closest: () => field };
   assert.equal(editor.handleKeyDown(key('KeyE', { target: field })), false);
+  editor.destroy();
+});
+
+test('releasing Option immediately clears the temporary opposite cursor', () => {
+  const view = makeView();
+  const elements = makeElements();
+  const editor = new MaskEditor({ view, root: null, elements });
+  editor.sync({ sourceWidth: 100, sourceHeight: 100, outputWidth: 100, outputHeight: 100 });
+  editor.open();
+  editor.pointerHover(pointer({ altKey: true }), view.clientToNormalized(20, 20));
+  assert.equal(elements.cursor.classList.contains('opposite'), true);
+  editor.handleKeyUp(key('AltLeft'));
+  assert.equal(elements.cursor.classList.contains('opposite'), false);
+  editor.destroy();
+});
+
+test('Escape in the actions menu dismisses only the menu', () => {
+  const view = makeView();
+  const elements = makeElements();
+  const editor = new MaskEditor({ view, root: null, elements });
+  editor.open();
+  elements.actionsTrigger.dispatch('click');
+  assert.equal(elements.actionsMenu.hidden, false);
+
+  const event = key('', { key: 'Escape' });
+  elements.actionsMenu.dispatch('keydown', event);
+  assert.equal(event.prevented, true);
+  assert.equal(event.stopped, true, 'the app-level Escape handler must not also see this key');
+  assert.equal(elements.actionsMenu.hidden, true);
+  assert.equal(editor.editing, true, 'dismissing More keeps the Mask editor open');
   editor.destroy();
 });
 
@@ -337,10 +383,26 @@ test('Viewport preserves legacy pan when inactive and routes claimed pointers on
     const comparison = new FakeElement();
     comparison.hidden = true;
     const view = new Viewport({ viewport: viewportEl, stack, output, divider, comparison });
+    view.setReferenceSize(800, 400);
+    view.zoom = 2;
+    assert.equal(view.displayZoom(), 1, 'zoom readout is relative to source pixels, not work-canvas pixels');
 
     view.setSplit(true);
     assert.equal(divider.hidden, false);
     assert.equal(comparison.hidden, false);
+    assert.equal(divider.getAttribute('aria-valuenow'), '50');
+    let splitChanges = 0;
+    view.onSplitDrag = () => { splitChanges++; };
+    divider.dispatch('keydown', key('', { key: 'ArrowRight' }));
+    assert.equal(view.splitFrac, 0.52);
+    assert.equal(divider.getAttribute('aria-valuenow'), '52');
+    divider.dispatch('keydown', key('', { key: 'ArrowLeft', shiftKey: true }));
+    assert.ok(Math.abs(view.splitFrac - 0.42) < 1e-9);
+    divider.dispatch('keydown', key('', { key: 'Home' }));
+    assert.equal(view.splitFrac, 0);
+    divider.dispatch('keydown', key('', { key: 'End' }));
+    assert.equal(view.splitFrac, 1);
+    assert.equal(splitChanges, 4);
     view.setSplitSuppressed(true);
     assert.equal(divider.hidden, true);
     assert.equal(comparison.hidden, true, 'suppression hides the comparison image as well as its divider');

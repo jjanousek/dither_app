@@ -24,6 +24,62 @@ export const CELL_SIZE_MIN = Object.freeze({
   mosaic: 3,
 });
 
+const MODE_SIZE_RANGES = Object.freeze({
+  dither: Object.freeze({ min: 1, max: 32, field: 'pixelSize' }),
+  ascii: Object.freeze({ min: 4, max: 32, field: 'ascii.cellSize' }),
+  dots: Object.freeze({ min: CELL_SIZE_MIN.dots, max: 40, field: 'cells.size' }),
+  lego: Object.freeze({ min: CELL_SIZE_MIN.lego, max: 40, field: 'cells.size' }),
+  voxel: Object.freeze({ min: CELL_SIZE_MIN.voxel, max: 40, field: 'cells.size' }),
+  led: Object.freeze({ min: CELL_SIZE_MIN.led, max: 40, field: 'cells.size' }),
+  lattice: Object.freeze({ min: CELL_SIZE_MIN.lattice, max: 40, field: 'cells.size' }),
+  mosaic: Object.freeze({ min: CELL_SIZE_MIN.mosaic, max: 40, field: 'cells.size' }),
+});
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, Number(value)));
+
+export function modeSizeRange(mode) {
+  const range = MODE_SIZE_RANGES[mode];
+  if (!range) throw new RangeError(`unknown mode: ${mode}`);
+  return { ...range };
+}
+
+function readModeSize(state, mode) {
+  if (mode === 'dither') return state.pixelSize;
+  if (mode === 'ascii') return state.ascii.cellSize;
+  return state.cells.size;
+}
+
+function writeModeSize(state, mode, value) {
+  if (mode === 'dither') state.pixelSize = value;
+  else if (mode === 'ascii') state.ascii.cellSize = value;
+  else state.cells.size = value;
+}
+
+// Carry the visible scale between renderers without touching unrelated or
+// dormant settings. A quality floor maps to the next renderer's own floor;
+// every other value is preserved and only clamped when the target requires it.
+export function transitionMode(state, nextMode) {
+  const previousMode = state.mode;
+  if (previousMode === nextMode) return false;
+  const previousRange = modeSizeRange(previousMode);
+  const nextRange = modeSizeRange(nextMode);
+  const previousValue = clamp(readModeSize(state, previousMode), previousRange.min, previousRange.max);
+  const nextValue = previousValue <= previousRange.min
+    ? nextRange.min
+    : clamp(previousValue, nextRange.min, nextRange.max);
+  writeModeSize(state, nextMode, nextValue);
+  state.mode = nextMode;
+  return true;
+}
+
+// Algorithm-specific controls are deliberately dormant rather than reset.
+// Switching back to an algorithm restores the exact values the user left.
+export function transitionAlgorithm(state, nextAlgorithm) {
+  if (state.algorithm === nextAlgorithm) return false;
+  state.algorithm = nextAlgorithm;
+  return true;
+}
+
 export const DEFAULTS = {
   mode: 'dither',
 

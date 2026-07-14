@@ -1,0 +1,55 @@
+{
+  "scope": "ditherlab-ui-audit",
+  "score": 78,
+  "verdict": "revise",
+  "category_match": true,
+  "differences": [
+    "The mask toolbar exposes selection mechanics through Paint/Erase plus Original/Effect, so common combinations appear to perform the opposite action.",
+    "At the supported 980px minimum width, the mask toolbar clips its first and last controls and the Video/GIF export actions extend beyond the window.",
+    "At narrow web widths, the mask More menu opens beneath an overflow-clipped toolbar and is covered by the canvas.",
+    "Static sources show GIF quality and Record length settings while the corresponding export actions are unavailable; GIF quality is actually an output-size control.",
+    "Flow can remain selected after switching to an unsupported effect mode, leaving enabled controls that do nothing and hiding the animation export actions.",
+    "Split remains visually active when Mask temporarily disables and suppresses it, producing contradictory state feedback.",
+    "Native WebKit select controls retain a metallic system appearance that conflicts with the otherwise coherent dark interface.",
+    "Video transport and several before-after interactions lack complete keyboard and announced-state semantics."
+  ],
+  "suggestions": [
+    "Replace Paint/Erase plus Shows Original/Effect with a direct Brush: Original/Effect choice and make drag always apply the selected visual result.",
+    "Make toolbar compaction depend on available stage width and keep the export group visible at the 980px native minimum.",
+    "Portal or reposition the More popover outside the horizontally scrolling toolbar.",
+    "Render export settings only when they affect an available action; rename GIF quality to GIF size and scope record duration to the relevant source types.",
+    "Reset or disable unsupported animation styles when changing mode and explain the transition inline.",
+    "Expose pressed/suspended states for Split and full keyboard semantics for Compare, the divider, media controls, menus, sliders, toasts, and progress UI.",
+    "Normalize select styling in WKWebView with an explicit appearance and chevron treatment."
+  ],
+  "reasoning": "Ditherlab has a cohesive and attractive desktop visual system, but several controls contradict the visible result or fail at sizes the native app officially supports. The most damaging issues are the mask interaction model, minimum-width clipping, silent source-dependent state changes, and controls that remain visible while having no effect.",
+  "threshold": 90,
+  "threshold_pass": false,
+  "reference_images": [
+    "/var/folders/9g/n5_xn26s65jb1hq4886h646w0000gp/T/codex-clipboard-137e06f5-136c-40e2-aa18-3a205da7117b.png",
+    "/var/folders/9g/n5_xn26s65jb1hq4886h646w0000gp/T/codex-clipboard-1b7dcee9-c88e-4f43-81f5-f31dd0153cc9.png"
+  ],
+  "generated_screenshot": "/tmp/ui-audit-10-native-min-mask-video.png",
+  "additional_screenshots": [
+    "/tmp/ui-audit-08-mask-painted-original.png",
+    "/tmp/ui-audit-09-mask-painted-effect.png",
+    "/tmp/ui-audit-11-narrow-mask-more.png",
+    "/tmp/ui-audit-12-mask-suppresses-split.png",
+    "/tmp/ui-audit-14-still-export-settings.png",
+    "/tmp/ui-audit-15b-inactive-flow-controls.png",
+    "/tmp/ui-audit-16-all-presets-traversed.png"
+  ],
+  "verified_positive_paths": [
+    "All eight effect modes rendered and exposed coherent mode-specific controls.",
+    "All 26 named preset cards activated the expected mode and active state, including keyboard activation, with no console errors.",
+    "PNG and TXT downloads completed successfully.",
+    "Video play, pause, seek, and playback-speed controls changed the underlying media state correctly.",
+    "Generated-scene, split-view, compare, undo, redo, reset, and panel-disclosure paths were exercised successfully at desktop width."
+  ],
+  "next_actions": [
+    "Simplify the mask interaction model and retest all mask placement combinations.",
+    "Repair native-minimum toolbar and export-group layout before further visual polish.",
+    "Make source, mode, animation, history, and export states internally consistent.",
+    "Complete keyboard and assistive-technology semantics, then rerun the visual pass at all target sizes."
+  ]
+}

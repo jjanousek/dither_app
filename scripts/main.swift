@@ -299,7 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   style.dispatchEvent(new Event('change', { bubbles: true }));
                   setTimeout(() => {
                     const lengthRow = [...document.querySelectorAll('.row')]
-                      .find((el) => el.querySelector('label')?.textContent === 'Record length');
+                    .find((el) => el.querySelector('label')?.textContent === 'Video length');
                     const length = lengthRow?.querySelector('select');
                     if (length) {
                       length.value = '3';

@@ -10,6 +10,13 @@ import { PRESETS, shuffleParams } from './presets.js';
 import { loadFile, openWebcam, demoImage, demoPhoto, bindDropAndPaste } from './sources.js';
 import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob, canFrameExport, exportVideoFrameAccurate, exportLoopFrameAccurate } from './export/exporters.js';
 import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js';
+import {
+  createExportSettings,
+  EXPORT_DEFAULTS,
+  restoreExportSettings,
+  snapshotExportSettings,
+  textExportDescriptor,
+} from './export-settings.js';
 import { Viewport } from './view.js';
 import { GenerativeSource } from './generate.js';
 import {
@@ -82,8 +89,7 @@ const maskRasterizer = new MaskRasterizer();
 const maskCompositor = new MaskCompositor();
 const frameBundles = new FrameBundleManager({ applyPostFX });
 let maskRevisionId = maskStore.createInitial();
-const EXPORT_DEFAULTS = Object.freeze({ pngSize: 'source', gifSize: '480', recordSeconds: '5', txtFormat: 'plain' });
-const exportSettings = { ...EXPORT_DEFAULTS };
+const exportSettings = createExportSettings();
 
 let source = null;
 let sourceLoadToken = 0;
@@ -96,6 +102,7 @@ let appliedMaskDraft = null;
 let fastMaskPreview = null;
 let liveDraftStrokeId = null;
 let draftEffectCanvas = null;
+let draftOriginalCanvas = null;
 let sourceEpoch = 0;
 let frameId = 0;
 let effectRevision = 0;
@@ -166,7 +173,8 @@ const isAnimating = () => {
   if (s === 'flow' || s === 'shimmer') {
     // these drift the pattern of ordered/noise/halftone dithers; on every
     // other mode/algorithm they are no-ops — don't burn a core on them
-    return state.mode === 'dither' && getAlgorithm(state.algorithm).type === 'gpu';
+    const algorithm = getAlgorithm(state.algorithm);
+    return state.mode === 'dither' && algorithm.type === 'gpu' && algorithm.mode >= 1;
   }
   return true;
 };
@@ -196,8 +204,8 @@ const view = new Viewport({
   stack: $('canvas-stack'),
   output: out,
   divider: $('split-divider'),
-  onChange: (zoom) => {
-    $('zoom-readout').textContent = `${Math.round(zoom * 100)}%`;
+  onChange: () => {
+    $('zoom-readout').textContent = `${Math.round(view.displayZoom() * 100)}%`;
     updateStatus();
   },
 });
@@ -210,8 +218,6 @@ const maskEditor = new MaskEditor({
     onDraftChanged: (draft) => setMaskDraft(draft),
     onStrokeCommitted: (stroke) => commitMaskStroke(stroke),
     onStrokeRolledBack: () => rollbackMaskDraft(),
-    onPlacementRequested: (placement) => commitMaskProposal(maskStore.proposePlacement(maskRevisionId, placement)),
-    onClearPaintRequested: () => commitMaskProposal(maskStore.proposeClear(maskRevisionId)),
     onEffectEverywhereRequested: () => commitMaskProposal(maskStore.proposeEffectEverywhere(maskRevisionId)),
     onOriginalEverywhereRequested: () => commitMaskProposal(maskStore.proposeOriginalEverywhere(maskRevisionId)),
     onEditingChanged: () => {
@@ -219,16 +225,7 @@ const maskEditor = new MaskEditor({
       syncMaskEditor();
       dirty = true;
     },
-    onCompareRequested: (active) => {
-      comparing = !!active;
-      if (!comparing && fastMaskPreview && maskIsActive()) {
-        presentFastMaskPreview();
-      } else if (!comparing && frameBundles.current && maskIsActive()) {
-        presentMaskedBundle();
-      } else {
-        dirty = true;
-      }
-    },
+    onCompareRequested: (active) => setComparing(active),
     onMaskRepaintRequested: () => {
       overlayDirty = true;
       if (maskDraft && (frameBundles.current || fastMaskPreview)) maskDirty = true;
@@ -245,6 +242,7 @@ $('zoom-100').onclick = () => view.actualSize();
 $('btn-split').onclick = () => {
   view.setSplit(!view.splitOn);
   $('btn-split').classList.toggle('active', view.splitOn);
+  $('btn-split').setAttribute('aria-pressed', String(view.splitOn));
   dirty = true;
 };
 
@@ -512,11 +510,47 @@ function ensureDraftEffectCanvas(selectionCanvas, placement) {
   return draftEffectCanvas;
 }
 
+function ensureDraftOriginalCanvas(selectionCanvas, placement) {
+  const width = selectionCanvas.width;
+  const height = selectionCanvas.height;
+  if (!draftOriginalCanvas) draftOriginalCanvas = document.createElement('canvas');
+  if (draftOriginalCanvas.width !== width || draftOriginalCanvas.height !== height) {
+    draftOriginalCanvas.width = width;
+    draftOriginalCanvas.height = height;
+  }
+  const context = draftOriginalCanvas.getContext('2d');
+  context.save();
+  try {
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.globalAlpha = 1;
+    context.filter = 'none';
+    if (placement === 'outside') {
+      context.globalCompositeOperation = 'copy';
+      context.drawImage(selectionCanvas, 0, 0, width, height);
+    } else {
+      context.globalCompositeOperation = 'copy';
+      context.fillStyle = '#fff';
+      context.fillRect(0, 0, width, height);
+      context.globalCompositeOperation = 'destination-out';
+      context.drawImage(selectionCanvas, 0, 0, width, height);
+    }
+  } finally {
+    context.restore();
+  }
+  return draftOriginalCanvas;
+}
+
 function releaseDraftEffectCanvas() {
-  if (!draftEffectCanvas) return;
-  draftEffectCanvas.width = 0;
-  draftEffectCanvas.height = 0;
-  draftEffectCanvas = null;
+  if (draftEffectCanvas) {
+    draftEffectCanvas.width = 0;
+    draftEffectCanvas.height = 0;
+    draftEffectCanvas = null;
+  }
+  if (draftOriginalCanvas) {
+    draftOriginalCanvas.width = 0;
+    draftOriginalCanvas.height = 0;
+    draftOriginalCanvas = null;
+  }
 }
 
 function ensureLiveMaskSessionSize(width, height) {
@@ -661,14 +695,17 @@ function presentMaskedBundle(bundle = frameBundles.current) {
 
 function updateMaskOverlay() {
   overlayDirty = false;
-  if (!maskEditor.editing || !source || !out.width || !out.height) {
+  if (!maskEditor.editing || !maskEditor.isGuideVisible || !source || !out.width || !out.height) {
     maskEditor.setOverlayRaster(null);
     return;
   }
   try {
     if (maskDraft) flushLiveMaskDraft();
     if (liveMaskSession) {
-      maskEditor.setOverlayRaster(liveMaskSession.selectionCanvas());
+      maskEditor.setOverlayRaster(ensureDraftOriginalCanvas(
+        liveMaskSession.selectionCanvas(),
+        currentMaskRevision().placement,
+      ));
       return;
     }
     const [sourceWidth, sourceHeight] = srcDims();
@@ -685,7 +722,7 @@ function updateMaskOverlay() {
       width: out.width,
       height: out.height,
       normalizedCrop: { u0: 0, v0: 0, u1: 1, v1: 1 },
-      coverageKind: 'selection',
+      coverageKind: 'original',
       quantization: CONTINUOUS_QUANTIZATION,
     });
     maskEditor.setOverlayRaster(selection);
@@ -898,7 +935,8 @@ function prepareMaskedPreviewMemory(targetPlan, {
   const liveDraftBytes = liveMaskSession
     ? targetBytes * 2 // Float32 selection + RGBA8 live canvas
     : 0;
-  const draftCanvasBytes = draftEffectCanvas ? targetBytes : 0;
+  const draftCanvasBytes = (draftEffectCanvas ? targetBytes : 0)
+    + (draftOriginalCanvas ? targetBytes : 0);
   const transientRasterBytes = includeRasterTransient && !liveMaskSession
     ? estimateRasterAllocationBytes(width, height).totalBytes
     : 0;
@@ -1501,7 +1539,9 @@ function loop(t) {
   } else if (maskDirty && !contentNew && !cpuWake && frameBundles.current) {
     presentMaskedBundle();
   } else {
-    const t0 = performance.now();
+    // Safari may suspend performance.now() while an app window is occluded;
+    // Date.now() keeps the requested recording length tied to real wall time.
+    const t0 = Date.now();
     const maskedRender = maskIsActive();
     renderOnce(null, contentNew);
     // Only track cost while producing new LIVE frames — not idle wake-ups,
@@ -1550,7 +1590,22 @@ const fmtTime = (s) => {
 function updateVideoTime(video) {
   const text = `${fmtTime(video.currentTime)} / ${fmtTime(video.duration)}`;
   if ($('time').textContent !== text) $('time').textContent = text;
+  $('seek').setAttribute('aria-valuetext', `${fmtTime(video.currentTime)} of ${fmtTime(video.duration)}`);
   syncRangeProgress($('seek'));
+}
+
+function syncVideoTransport(video) {
+  if (!video || source?.el !== video) return;
+  const playing = !video.paused && !video.ended;
+  const button = $('btn-play');
+  button.textContent = playing ? '❚❚' : '▶';
+  button.title = playing ? 'Pause video' : 'Play video';
+  button.setAttribute('aria-label', button.title);
+  const seekValue = isFinite(video.duration) && video.duration
+    ? Math.round((video.currentTime / video.duration) * 1000)
+    : 0;
+  if (!scrubbing && $('seek').value !== String(seekValue)) $('seek').value = String(seekValue);
+  updateVideoTime(video);
 }
 
 function updateStatus() {
@@ -1560,7 +1615,7 @@ function updateStatus() {
     const left = `${source.name || source.type} · ${w}×${h} · ${modeName}`;
     if ($('st-left').textContent !== left) $('st-left').textContent = left;
   }
-  const z = `${Math.round(view.zoom * 100)}%`;
+  const z = `${Math.round(view.displayZoom() * 100)}%`;
   const right = fpsText ? `${fpsText} · ${z}` : z;
   if ($('st-right').textContent !== right) $('st-right').textContent = right;
 }
@@ -1581,6 +1636,7 @@ function updateUndoButtons() {
 function snapshotStr() {
   return JSON.stringify({
     s: state,
+    x: snapshotExportSettings(exportSettings),
     g: source?.type === 'gen'
       ? { sourceEpoch, params: source.gen.params }
       : null,
@@ -1622,6 +1678,7 @@ function restoreSnapshot(snap, {
   const parsed = JSON.parse(snap);
   resetState(state);
   applyParams(state, parsed.s || parsed);
+  restoreExportSettings(exportSettings, parsed.x);
   if (Number.isSafeInteger(parsed.m) && maskStore.has(parsed.m)) maskRevisionId = parsed.m;
   if (parsed.g?.sourceEpoch === sourceEpoch && parsed.g.params && source?.type === 'gen') {
     Object.assign(source.gen.params, parsed.g.params);
@@ -1762,35 +1819,21 @@ async function renderPresetThumbs() {
 // ---------------------------------------------------------------------------
 // sources
 // ---------------------------------------------------------------------------
-// For moving video, a temporally-stable blue-noise dither looks
-// far smoother than Bayer (whose regular grid crawls/moirés on pans) or
-// per-frame error diffusion (which flickers). Apply a video-friendly profile
-// when entering a live source from a still (or cold start) — not on every
-// video→video swap, so a user's per-clip tweaks carry over to the next clip.
-function applyVideoProfile() {
-  if (state.mode !== 'dither') return;
-  if (getAlgorithm(state.algorithm).type === 'cpu' || state.algorithm.startsWith('bayer')) {
-    state.algorithm = 'bluenoise';
-  }
-  // Video / Smooth starting point: smoother + finer grain out of
-  // the box (the user's request). All reversible — drag Smoothness to 0 for a
-  // crisp full-resolution 1-bit look.
-  state.smoothness = 0.5;
-  state.temporal = 0.4;
-  state.videoDenoise = 0.2;
-}
-
 function disposeSource(s) {
   if (!s) return;
   if (s.stream) s.stream.getTracks().forEach((tr) => tr.stop());
   if (s.el instanceof HTMLVideoElement && !s.stream) s.el.pause();
   if (s._seekHandler) s.el.removeEventListener('seeked', s._seekHandler);
+  if (s._transportHandler) {
+    for (const event of ['play', 'pause', 'ended', 'timeupdate', 'loadedmetadata', 'durationchange']) {
+      s.el.removeEventListener(event, s._transportHandler);
+    }
+  }
   if (s._rvfc != null && s.el.cancelVideoFrameCallback) s.el.cancelVideoFrameCallback(s._rvfc);
   if (s.url) URL.revokeObjectURL(s.url);
 }
 
 function setSource(next) {
-  const prevType = source?.type;
   if (exporting) {
     // don't yank the source out from under a running export
     disposeSource(next);
@@ -1824,10 +1867,6 @@ function setSource(next) {
     octx.clearRect(0, 0, out.width, out.height);
     cctx.clearRect(0, 0, cmp.width, cmp.height);
   }
-  const nowLive = next.type === 'video' || next.type === 'webcam';
-  const wasLive = prevType === 'video' || prevType === 'webcam';
-  const profileApplied = nowLive && !wasLive;
-  if (profileApplied) applyVideoProfile();
   fpsEma = 0;
   fpsText = '';
   lastStatusT = 0;
@@ -1873,7 +1912,6 @@ function setSource(next) {
   }
   if (source.type === 'video') {
     source.el.playbackRate = parseFloat($('speed').value) || 1;
-    $('btn-play').textContent = '❚❚';
     // re-render when the user seeks a paused video (exporters render themselves)
     // a seek is a temporal discontinuity — drop history so the landed frame
     // doesn't ghost-blend with wherever we jumped from
@@ -1887,10 +1925,16 @@ function setSource(next) {
       }
     };
     source.el.addEventListener('seeked', source._seekHandler);
-    source.el.play().catch(() => {});
+    source._transportHandler = () => syncVideoTransport(source.el);
+    for (const event of ['play', 'pause', 'ended', 'timeupdate', 'loadedmetadata', 'durationchange']) {
+      source.el.addEventListener(event, source._transportHandler);
+    }
+    syncVideoTransport(source.el);
+    source.el.play().catch(() => syncVideoTransport(source.el));
   }
   $('video-bar').hidden = source.type !== 'video';
   $('drop-hint').hidden = !source.isDemo;
+  view.setReferenceSize(...srcDims());
   view.fitMode = true;
   view.fit(); // re-fit even when the new output has identical dimensions
   updateExportButtons();
@@ -1898,12 +1942,9 @@ function setSource(next) {
   rebuildPanel(); // scene controls appear only for generated sources
   syncMaskEditor();
   dirty = true;
-  // record the auto-applied video profile as its own undo step, so the first
-  // subsequent slider edit doesn't revert the whole profile in one undo
-  if (profileApplied) commitHistory();
   setTimeout(renderPresetThumbs, 250);
   // a slow webcam can arrive with 0×0 dims and fill them in a moment later
-  if (keptMask) toast('Mask kept · Clear paint or Effect everywhere to remove', 4000);
+  if (keptMask) toast('Mask kept · Use Mask → More → Clear mask to remove', 4000);
   else {
     toast(source.width
       ? `${source.name || source.type} · ${source.width}×${source.height}`
@@ -1937,26 +1978,46 @@ function updateExportButtons() {
   // a static image would make a pointless single-frame "animated" GIF
   $('btn-export-gif').hidden = !(isVideo || isWebcam || isAnimatedImage || isGen || animatedStill);
   $('btn-export-txt').hidden = state.mode !== 'ascii';
+  const textDescriptor = textExportDescriptor(exportSettings.txtFormat);
+  $('btn-export-txt').textContent = textDescriptor.label;
+  $('btn-export-txt').title = textDescriptor.title;
 }
 
 // ---------------------------------------------------------------------------
 // busy overlay
 // ---------------------------------------------------------------------------
 let busyCancel = null;
+let busyPreviousFocus = null;
 function showBusy(label, onCancel) {
   $('busy-label').textContent = label;
   $('busy-fill').style.width = '0%';
+  $('busy-progress').setAttribute('aria-valuenow', '0');
+  busyPreviousFocus = document.activeElement;
   $('busy').hidden = false;
+  document.querySelector('main')?.setAttribute('aria-busy', 'true');
   busyCancel = onCancel;
+  $('busy-cancel').disabled = typeof onCancel !== 'function';
+  requestAnimationFrame(() => $('busy-cancel').focus({ preventScroll: true }));
 }
 function busyProgress(f) {
-  $('busy-fill').style.width = `${Math.round(f * 100)}%`;
+  const percent = Math.round(Math.min(1, Math.max(0, Number(f) || 0)) * 100);
+  $('busy-fill').style.width = `${percent}%`;
+  $('busy-progress').setAttribute('aria-valuenow', String(percent));
 }
 function hideBusy() {
   $('busy').hidden = true;
+  document.querySelector('main')?.removeAttribute('aria-busy');
   busyCancel = null;
+  const restore = busyPreviousFocus;
+  busyPreviousFocus = null;
+  if (restore?.isConnected) restore.focus?.({ preventScroll: true });
 }
 $('busy-cancel').onclick = () => busyCancel && busyCancel();
+$('busy').addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape' || !busyCancel) return;
+  event.preventDefault();
+  busyCancel();
+});
 
 function lockMaskForExport() {
   activeExportMaskRasterizer?.releaseAll();
@@ -2383,7 +2444,7 @@ function recordCanvasSeconds(secs, filename) {
     const stream = out.captureStream(30);
     rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
     const chunks = [];
-    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
     rec.onstop = () => {
       clearInterval(iv);
       stream.getTracks().forEach((tr) => tr.stop());
@@ -2402,7 +2463,7 @@ function recordCanvasSeconds(secs, filename) {
     const t0 = performance.now();
     iv = setInterval(() => {
       const elapsed = (performance.now() - t0) / 1000;
-      busyProgress(Math.min(1, elapsed / secs));
+      busyProgress(elapsed / secs);
       if (elapsed >= secs) { clearInterval(iv); rec.stop(); }
     }, 100);
     showBusy(`Recording ${secs}s…`, () => {
@@ -2880,6 +2941,7 @@ function rebuildPanel() {
     state,
     mount: $('panel'),
     exportSettings,
+    sourceType: source?.type || null,
     isLive: source?.type === 'video' || source?.type === 'webcam',
     gen: source?.type === 'gen' ? source.gen : null,
     onGenChange: () => {
@@ -2892,13 +2954,20 @@ function rebuildPanel() {
       frameBundles.invalidate('generative change', { releaseCurrent: false });
       dirty = true;
     },
-    onChange: () => {
+    onBeforeDiscreteChange: () => commitHistory(),
+    onExportChange: ({ discrete } = {}) => {
+      updateExportButtons();
+      if (discrete) commitHistory();
+      else pushHistory();
+    },
+    onChange: ({ discrete } = {}) => {
       if (exporting || maskPriming) return;
       clearActivePreset($('preset-strip'));
       updateExportButtons();
       updateStatus();
       syncMaskEditor();
-      pushHistory();
+      if (discrete) commitHistory();
+      else pushHistory();
       effectRevision++;
       frameBundles.invalidate('effect change', { releaseCurrent: false });
       dirty = true;
@@ -3044,27 +3113,42 @@ $('btn-shuffle').onclick = () => {
   toast('Shuffled');
 };
 
-// hold-to-compare
-const startCompare = (e) => {
-  if (exporting || maskPriming || maskEditor.hasDraft) return;
-  e.preventDefault();
-  comparing = true;
-  maskEditor.setComparing(true);
-  dirty = true;
+// Hold-to-compare, with one state path for pointer, keyboard, and Mask editor.
+function setComparing(active) {
+  const next = !!active;
+  if (next && (exporting || maskPriming || maskEditor.hasDraft)) return false;
+  if (comparing === next) return true;
+  comparing = next;
+  maskEditor.setComparing(next);
+  $('btn-compare').classList.toggle('active', next);
+  $('btn-compare').setAttribute('aria-pressed', String(next));
+  if (!next && fastMaskPreview && maskIsActive()) presentFastMaskPreview();
+  else if (!next && frameBundles.current && maskIsActive()) presentMaskedBundle();
+  else dirty = true;
+  return true;
+}
+const startCompare = (event) => {
+  if (event?.button != null && event.button !== 0) return;
+  if (setComparing(true)) event?.preventDefault?.();
 };
-const endCompare = () => {
-  if (comparing) {
-    comparing = false;
-    maskEditor.setComparing(false);
-    if (fastMaskPreview && maskIsActive()) presentFastMaskPreview();
-    else if (frameBundles.current && maskIsActive()) presentMaskedBundle();
-    else dirty = true;
-  }
-};
-$('btn-compare').addEventListener('mousedown', startCompare);
-$('btn-compare').addEventListener('touchstart', startCompare, { passive: false });
-window.addEventListener('mouseup', endCompare);
-window.addEventListener('touchend', endCompare);
+const endCompare = () => setComparing(false);
+const compareButton = $('btn-compare');
+compareButton.addEventListener('pointerdown', startCompare);
+compareButton.addEventListener('keydown', (event) => {
+  if (!['Enter', ' '].includes(event.key) || event.repeat) return;
+  event.preventDefault();
+  event.stopPropagation();
+  setComparing(true);
+});
+compareButton.addEventListener('keyup', (event) => {
+  if (!['Enter', ' '].includes(event.key)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  endCompare();
+});
+compareButton.addEventListener('blur', endCompare);
+window.addEventListener('pointerup', endCompare);
+window.addEventListener('pointercancel', endCompare);
 window.addEventListener('blur', endCompare); // keyup can be lost on window switch
 window.addEventListener('blur', () => maskEditor.handleBlur());
 document.addEventListener('visibilitychange', () => {
@@ -3088,7 +3172,7 @@ window.addEventListener('keydown', (e) => {
   }
   const inField = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
   if (inField || e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.key === 'c' && !e.repeat) { comparing = true; dirty = true; }
+  if (e.key === 'c' && !e.repeat) setComparing(true);
   if (e.key === ' ' && source?.type === 'video') {
     e.preventDefault();
     togglePlay();
@@ -3113,8 +3197,15 @@ $('btn-export-txt').onclick = doExportTxt;
 function togglePlay() {
   if (exporting) return;
   const el = source.el;
-  if (el.paused) { el.play(); $('btn-play').textContent = '❚❚'; }
-  else { el.pause(); $('btn-play').textContent = '▶'; }
+  if (el.paused || el.ended) {
+    if (el.ended && isFinite(el.duration)) el.currentTime = 0;
+    el.play().catch(() => {
+      syncVideoTransport(el);
+      toast('Video playback could not start');
+    });
+  } else {
+    el.pause();
+  }
   transportRevision++;
   frameBundles.invalidate('transport change', { releaseCurrent: false });
   // Paused error-diffusion is allowed a higher-detail still render; resuming

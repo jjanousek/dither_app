@@ -45,11 +45,11 @@ The feature is called **Effect Mask**, while **Brush** is the tool that edits it
 
 ### 2.1 Selection and effect coverage
 
-The brush edits a painted selection `s` in `[0,1]`. Placement converts that selection into effect coverage `m`:
+The canonical document stores a selection `s` in `[0,1]`. Its internal placement converts that selection into effect coverage `m`:
 
 ```text
-Painted shows Original / effect outside:  m = 1 - s
-Painted shows Effect / effect inside:     m = s
+Outside basis (selected coverage means Original):  m = 1 - s
+Inside basis (selected coverage means Effect):     m = s
 ```
 
 The final premultiplied pixel is:
@@ -67,7 +67,7 @@ Meanings are exact:
 
 ### 2.2 Default and empty states
 
-The default is **Painted shows: Original** with an empty selection:
+The default is the **Original** brush with an empty/outside selection:
 
 ```text
 s = 0, placement = outside, m = 1
@@ -75,13 +75,12 @@ s = 0, placement = outside, m = 1
 
 This is the sole structural no-op state and preserves today's output exactly.
 
-Empty selection semantics do not change merely because the selection is empty:
+Placement is an implementation detail, not an editor toggle. Empty selection semantics remain exact:
 
-- Empty + Painted shows Original = effect everywhere; bypass is legal.
-- Empty + Painted shows Effect = original everywhere; finalization is required.
-- Clear Paint empties `s` but retains the Painted shows setting.
-- Effect Everywhere empties `s` and sets placement to outside.
-- Original Everywhere empties `s` and sets placement to inside.
+- Empty/outside = effect everywhere; bypass is legal.
+- Empty/inside = original everywhere; finalization is required.
+- **Clear mask** empties `s`, sets placement to outside, and selects the Original brush.
+- **Original everywhere** empties `s`, sets placement to inside, and selects the Effect brush.
 
 There is no special “empty mask always bypasses” exception.
 
@@ -111,7 +110,7 @@ The v1 mask is static in frame coordinates and applies to every frame. It does n
 - The UI states `Static mask · applies to every frame` for video, webcam, and animated media.
 - Painting may continue during playback after a valid paired frame bundle exists.
 - The first transition from the unmasked bypass into an active mask temporarily holds a playing video, creates one correct paired bundle, and resumes automatically if playback was running and the user did not change transport state during priming.
-- Placement changes or Undo/Redo that cross the bypass boundary use the same priming rule.
+- Global mask actions or Undo/Redo that cross the bypass boundary use the same priming rule.
 
 ---
 
@@ -179,8 +178,7 @@ The button controls editing mode, not whether the mask applies. Closing the tool
 Whenever effective coverage is not the full-effect bypass, the toolbar button and status bar show a persistent indicator:
 
 ```text
-Mask · painted shows Original
-Mask · painted shows Effect
+Mask · Original + Effect
 Mask · Original everywhere
 ```
 
@@ -191,8 +189,8 @@ Clicking the indicator reopens the editor. This prevents invisible closed-tool s
 While editing, show a compact floating bar at the top-center of the viewport:
 
 ```text
-[Paint | Erase] · Size · Feather · [Painted shows: Original | Effect]
-Actions [Clear paint | Effect everywhere | Original everywhere] · Done
+Brush [Original | Effect] · Size · Feather · More · Done
+More [Show guide | Clear mask | Original everywhere]
 ```
 
 Keep the floating controls to one compact row whenever the stage can fit them. Shortcut/static-mask guidance remains available as the toolbar description and tooltip rather than occupying a second row over the image.
@@ -211,11 +209,11 @@ Opacity is deliberately deferred. Applying opacity independently to overlapping 
 
 While editing:
 
-- `#mask-overlay` tints painted selection `s`, regardless of placement.
-- The tint explains “this is what you painted”; placement explains what it means.
-- Overlay opacity is approximately 6% accent color so the underlying composition remains judgeable even under a maximum-size brush.
+- The main canvas always shows the actual composite; dragging always paints the selected visual result directly.
+- `#mask-overlay` is an optional guide for effective Original coverage, not raw internal selection `s`.
+- The guide is off by default so the image remains judgeable. When explicitly shown, use a subtle accent tint.
 - The overlay lives in `#canvas-stack`, inherits zoom/pan, and always has `pointer-events: none`.
-- A DOM ring cursor displays brush diameter and feather core; eraser is dashed.
+- A DOM ring cursor displays brush diameter and feather core; the temporary opposite-result brush is dashed.
 - Static video playback does not repaint the guide canvas. Invalidate it only for a mask/editor/target-size change.
 - Avoid moving-video backdrop filters and blend modes in the editor chrome. Move the cursor with a compositor transform rather than changing layout coordinates.
 - The cursor grows on screen when zooming because brush size is source-relative.
@@ -230,21 +228,20 @@ One authoritative tool router owns brush-versus-pan arbitration. Extend `Viewpor
 Tool-active controls:
 
 - `B`: open/close Mask tool globally.
-- `E`: toggle Paint/Eraser.
-- Hold `Option`: temporary eraser.
-- `X`: switch Painted shows Original / Effect.
+- `E` or `X`: swap the direct brush result between Original and Effect.
+- Hold `Option`: temporarily paint the opposite result.
 - `[` and `]`: decrease/increase size, detected with `KeyboardEvent.code` `BracketLeft` / `BracketRight`.
 - `Shift-[` and `Shift-]`: decrease/increase feather using those same physical key codes; do not depend on `e.key` remaining `[` or `]` under Shift.
 - `Esc`: roll back an in-progress stroke, then close the editor without removing the committed mask.
 - Hold Space and drag: pan; suppress video play/pause and ignore key repeat while held.
-- Right-drag: erase; suppress `contextmenu` while the tool is active.
-- Pen eraser end maps to Erase.
+- Right-drag: paint the opposite result; suppress `contextmenu` while the tool is active.
+- Pen eraser end paints the opposite result.
 
 All shortcuts honor the existing text-field guards and are disabled while exporting. Ignore `e.repeat` for B, E, X, Compare, and Space state transitions; allow repeat only for size/feather adjustment. Clear temporary Option, Space-pan, and Compare states on blur or visibility loss.
 
 Pointer behavior:
 
-- Primary pointer begins one stroke. Lock Paint/Erase operation, size, and feather at pointerdown; modifier or tool changes affect only the next stroke.
+- Primary pointer begins one stroke. Resolve and lock the direct Original/Effect result, internal add/erase operation, size, and feather at pointerdown; modifier or brush changes affect only the next stroke.
 - Pointerup commits. Browser/OS pointercancel, blur, or hidden-document transition commits the already-visible partial stroke as one undo action.
 - Use `getCoalescedEvents()` when available.
 - Ignore samples outside the content rectangle; clip a segment that crosses the boundary.
@@ -271,7 +268,7 @@ Source switching keeps the current mask revision, placement, and history. The us
 On replacement:
 
 ```text
-Mask kept · Clear paint or Effect everywhere to remove
+Mask kept · Use Mask → More → Clear mask to remove
 ```
 
 - discard any uncommitted source-bound stroke before disposing the old source;
@@ -282,7 +279,7 @@ Mask kept · Clear paint or Effect everywhere to remove
 - keep the persistent mask indicator and show the toast above;
 - if the mask is active, build a fresh paired bundle for the new source before presenting it—no old-source pixels may survive the transition.
 
-An aspect-ratio change intentionally stretches the normalized mask with the new source, matching the application's existing full-frame mapping. Clear Paint and Effect Everywhere remain immediately available.
+An aspect-ratio change intentionally stretches the normalized mask with the new source, matching the application's existing full-frame mapping. Clear mask remains immediately available.
 
 Mask state is session-only in v1: it survives source, preset, and mode changes while Ditherlab remains open, but closing/reloading the app clears it. Long-term project persistence or explicit mask files are deferred.
 
@@ -313,7 +310,7 @@ Metadata-only text renders skip raw capture, Post FX, mask rasterization, and pi
 {
   version: 1,
   revisionId: 184,              // monotonic, never positional or rebased
-  placement: 'outside',         // outside = painted shows Original; inside = painted shows Effect
+  placement: 'outside',         // internal basis: selected coverage means Original; inside means Effect
   strokes: [{
     id: 93,
     operation: 'add',           // add | erase
@@ -324,7 +321,7 @@ Metadata-only text renders skip raw capture, Post FX, mask rasterization, and pi
 }
 ```
 
-Completed revisions are immutable and structurally share unchanged stroke chunks. A placement change, completed stroke, Clear Paint, Effect Everywhere, Original Everywhere, or Reset creates a new stable `revisionId`.
+Completed revisions are immutable and structurally share unchanged stroke chunks. A completed stroke, Clear mask, Original everywhere, or Reset creates a new stable `revisionId`.
 
 Placement is revision state, not a destructive rewrite of stroke data. There is no redundant separate invert operation.
 
@@ -397,7 +394,7 @@ No fixed-resolution raster baseline is permitted.
 
 - History snapshots reference stable revision IDs.
 - Undo followed by a new edit truncates the app redo stack, then prunes mask revisions unreachable from retained history or the current document.
-- When no retained history entry predates a Clear Paint revision, strokes before that clear are discarded.
+- When no retained history entry predates a Clear mask revision, strokes before that clear are discarded.
 - Completed point arrays use compact numeric storage rather than point objects.
 - Soft limit: 2,048 live strokes or 131,072 point pairs; show diagnostics and increase simplification only within the documented `radius / 16` error bound.
 - Hard limit: 4,096 live strokes or 262,144 point pairs. Stop accepting additional strokes with a clear `Mask complexity limit reached · clear the selection to continue` message. Never silently raster-bake or degrade old strokes.
@@ -424,7 +421,7 @@ Placement is already part of the immutable revision. `sourceEpoch` prevents a cr
 - Use a byte-budget LRU, not a fixed entry count.
 - Preview raster cache budget: at most 64 MiB, subordinate to the aggregate 96 MiB mask-subsystem budget; evict rasters earlier when owned bundles/scratches need the space.
 - Export rasters are released after export and may evict preview rasters before allocation.
-- Clear Paint releases all obsolete raster surfaces.
+- Clear mask releases all obsolete raster surfaces.
 
 ---
 
@@ -684,7 +681,7 @@ JSON.stringify({
 `restoreSnapshot()` resolves the stable mask revision ID regardless of the current source epoch and updates the mask before repainting. It restores `g.params` only when `g.sourceEpoch` matches the current generated source.
 
 - Flush any pending 350 ms settings debounce before beginning a discrete mask edit.
-- One completed stroke, placement change, Clear Paint, Effect Everywhere, Original Everywhere, or Reset is one immediate history entry.
+- One completed stroke, Clear mask, Original everywhere, or Reset is one immediate history entry.
 - Mask-only revisions do not serialize stroke arrays into every settings snapshot.
 - New edit after Undo truncates app redo and then prunes unreachable mask revisions.
 
@@ -708,7 +705,7 @@ Source replacement follows §4.6:
 
 Mask history is intentionally source-independent. Undoing an older mask action after a source switch applies that normalized revision to the current source. Generative scene parameters remain source-bound: snapshots carry their own source epoch and `restoreSnapshot()` ignores `g` when its epoch does not match the current generated source.
 
-Clear Paint and Effect Everywhere release obsolete mask rasters. Export teardown releases export-only frames and restores the live target.
+Clear mask releases obsolete mask rasters. Export teardown releases export-only frames and restores the live target.
 
 ---
 
@@ -952,7 +949,7 @@ No new package dependency is required.
 - Add explicit sampling metadata and target algorithms.
 - Add app-owned processed/raw bundles and stable grain phase.
 - Split effect/bundle/mask invalidation.
-- Add viewport tool routing, Mask toolbar button, floating bar, overlay, cursor, shortcuts, and status indicator.
+- Add viewport tool routing, direct Original/Effect brush targets, Mask toolbar button, compact floating bar, optional guide, cursor, shortcuts, and status indicator.
 - Integrate immediate mask history commits and debounce arbitration.
 - Integrate all still-image modes, Compare/Split, presets, automatic cross-source mask retention, Reset, and PNG.
 
@@ -995,7 +992,7 @@ No new package dependency is required.
 | Area | Required result |
 | --- | --- |
 | No-op compatibility | Empty/outside coverage uses the untouched legacy path, allocates no mask resources, preserves preview/PNG/GIF deterministic output, and preserves exact MP4 pre-encoder pixels/dimensions/config/timestamps. |
-| Fill semantics | Empty/outside is full effect; empty/inside is full raw; placement is the exact complement without rewriting strokes. |
+| Fill semantics | Original always paints raw and Effect always paints processed, regardless of the revision's internal placement; empty/outside is full effect and empty/inside is full raw. |
 | Alpha | Opaque and translucent inputs at multiple coverage values match the premultiplied equations without dark/light/transparent seams. |
 | Raw fidelity | Raw regions are smoothly sampled at the final target, never reconstructed from the renderer work grid. |
 | Sampling | Crisp dither receives whole-number nearest enlargement in masked preview; continuous modes and raw photography use smooth sampling. |
@@ -1061,10 +1058,10 @@ No new package dependency is required.
 
 ### Browser/native tests
 
-- Still -> paint -> erase -> feather -> placement -> Undo/Redo -> PNG.
+- Still -> paint Original -> paint Effect -> feather -> Undo/Redo -> PNG.
 - Video -> first stroke temporarily holds/primes -> automatic resume -> paint live -> seek -> GIF -> MP4.
 - Switch Dither -> ASCII -> LEGO while preserving alignment.
-- Replace source -> retained mask on new media -> verify toast, per-axis mapping, and no stale frame/cache -> Clear Paint.
+- Replace source -> retained mask on new media -> verify toast, per-axis mapping, and no stale frame/cache -> Clear mask.
 - Generated scene and animated-image loop export.
 - Webcam static mask and real-time recording.
 - Lose/restore WebGL and confirm Canvas 2D fallback.
@@ -1097,7 +1094,7 @@ No new package dependency is required.
 | Fixed-resolution raster baseline compaction | Invalidates exact replay at new resolutions and can break history revision references. |
 | Whole-canvas `image-rendering: pixelated` | Pixelates the raw photographic branch. |
 | Automatic per-stamp opacity in v1 | Overlapping interpolation stamps make the labelled opacity inaccurate. |
-| Automatically clearing masks on source replacement | Destroys deliberate mask work; the user can Clear Paint or choose Effect Everywhere explicitly. |
+| Automatically clearing masks on source replacement | Destroys deliberate mask work; the user can choose Clear mask explicitly. |
 | Clearing all settings history on source replacement | Unnecessary collateral behavior change. |
 | Tracking/segmentation/keyframes in v1 | Separate product and runtime scope; can later provide masks to the same finalizer. |
 

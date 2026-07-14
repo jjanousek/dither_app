@@ -584,6 +584,9 @@ export class VideoExporter {
 
       // Play the clip through exactly once from the start.
       video.loop = false;
+      // Playback speed is a preview preference. Keep fallback exports at the
+      // source duration, matching frame-accurate MP4 and seek-sampled GIF.
+      video.playbackRate = 1;
       video.pause();
       if (video.currentTime > 0.01) {
         video.currentTime = 0;

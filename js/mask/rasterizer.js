@@ -113,7 +113,9 @@ export function makeRasterCacheKey({
   const q = normalizeQuantization(quantization);
   const rid = revisionId ?? revision?.revisionId;
   if (!Number.isSafeInteger(Number(rid))) throw new TypeError('revisionId is required');
-  if (coverageKind !== 'selection' && coverageKind !== 'effect') throw new TypeError('coverageKind must be selection or effect');
+  if (!['selection', 'effect', 'original'].includes(coverageKind)) {
+    throw new TypeError('coverageKind must be selection, effect, or original');
+  }
   const quantizationKey = q.kind === 'continuous'
     ? 'continuous'
     : `ascii-grid:${q.cols}x${q.rows}:${q.rasterWidth}x${q.rasterHeight}:v${q.thresholdVersion}`;
@@ -197,7 +199,9 @@ function validateRasterRequest(request) {
   const height = integerPositive(request.height, 'height');
   const normalizedCrop = normalizeCrop(request.normalizedCrop);
   const coverageKind = request.coverageKind ?? 'effect';
-  if (coverageKind !== 'selection' && coverageKind !== 'effect') throw new TypeError('coverageKind must be selection or effect');
+  if (!['selection', 'effect', 'original'].includes(coverageKind)) {
+    throw new TypeError('coverageKind must be selection, effect, or original');
+  }
   return {
     ...request,
     sourceEpoch: Number(request.sourceEpoch) || 0,
@@ -285,6 +289,13 @@ function effectDataFromSelection(selection, placement) {
   return effect;
 }
 
+function originalDataFromSelection(selection, placement) {
+  if (placement === 'outside') return selection.slice();
+  const original = new Float32Array(selection.length);
+  for (let i = 0; i < selection.length; i++) original[i] = 1 - selection[i];
+  return original;
+}
+
 function asciiEffectData(request, blueNoise) {
   const q = request.quantization;
   const fullRequest = {
@@ -338,15 +349,19 @@ export function rasterizeCoverageData(rawRequest, blueNoise = getBlueNoise()) {
   const request = validateRasterRequest(rawRequest);
   if (request.quantization.kind === 'ascii-grid') {
     if (request.coverageKind !== 'effect') {
-      // The editor overlay always represents the continuous painted selection.
-      return rasterizeSelectionData(request);
+      const selection = rasterizeSelectionData(request);
+      return request.coverageKind === 'original'
+        ? originalDataFromSelection(selection, request.revision.placement)
+        : selection;
     }
     return asciiEffectData(request, blueNoise);
   }
   const selection = rasterizeSelectionData(request);
-  return request.coverageKind === 'selection'
-    ? selection
-    : effectDataFromSelection(selection, request.revision.placement);
+  if (request.coverageKind === 'selection') return selection;
+  if (request.coverageKind === 'original') {
+    return originalDataFromSelection(selection, request.revision.placement);
+  }
+  return effectDataFromSelection(selection, request.revision.placement);
 }
 
 function writeCoverageCanvas(canvas, coverage, width, height, reusableImage = null) {

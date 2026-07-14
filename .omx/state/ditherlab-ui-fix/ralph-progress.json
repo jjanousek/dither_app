@@ -1,0 +1,42 @@
+{
+  "scope": "ditherlab-ui-fix",
+  "iteration": 4,
+  "threshold": 90,
+  "score": 96,
+  "verdict": "pass",
+  "threshold_pass": true,
+  "completed": true,
+  "category_match": true,
+  "screenshot": "/tmp/ditherlab-fix-10-480x800-fixed.png",
+  "differences": [
+    "The mask toolbar is now a compact direct-result Brush control and no longer blocks a large central band of the image.",
+    "The optional purple guide is off by default, leaving the processed video unobscured while painting.",
+    "Selects, range fills, and top-bar controls now share the same native-dark visual language instead of showing Aqua-style widgets.",
+    "The toolbar remains fully visible in one row at the 1440 by 900 reference viewport.",
+    "Direct Effect painting is immediately legible against the full-original frame without requiring a separate placement interpretation.",
+    "At 480px, the brush toolbar and More menu fit and remain clickable.",
+    "The narrow top bar now keeps Open, Undo, Redo, Reset, Mask, and every applicable export action visible while collapsing secondary controls.",
+    "At 800 by 500, the mask toolbar remains a single compact row and the canvas, transport, presets, and settings retain usable space."
+  ],
+  "suggestions": [
+    "Retain the current primary-action priority order at narrow widths.",
+    "Keep the More menu transient because it necessarily overlays a small portion of the image on phone-width layouts."
+  ],
+  "reasoning": "The supplied problem areas are resolved across desktop, native-minimum, narrow, and short-window screenshots. Range feedback is visible, Mask no longer obscures the image by default, direct brush intent is legible, and all primary actions remain reachable without horizontal overflow.",
+  "additional_screenshots": [
+    "/tmp/ditherlab-fix-05-mask-video.png",
+    "/tmp/ditherlab-fix-07-effect-brush.png",
+    "/tmp/ditherlab-fix-08-980x620.png",
+    "/tmp/ditherlab-fix-11-800x500.png"
+  ],
+  "verified": [
+    "Direct Original and Effect painting, temporary opposite brush, guide toggle, More-menu keyboard behavior, mask retention, and Split suppression.",
+    "Shared settings preservation, renderer-minimum size mapping, paused Flow restoration, and Reset-then-Undo restoration of export choices.",
+    "Compare and Split keyboard semantics, media labels and seek announcements, ASCII validation, custom palette controls, focus rings, and cancellable export progress.",
+    "1080p masked video held 30 to 31 fps at Floyd 4px, 28 fps at Floyd 1px, and 30 fps on the GPU fast path.",
+    "114 automated tests, all JavaScript syntax checks, git diff whitespace validation, native universal build, code-sign verification, and native PNG/GIF exports passed."
+  ],
+  "next_actions": [
+    "None."
+  ]
+}
