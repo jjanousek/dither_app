@@ -57,6 +57,14 @@ test('export panel exposes only settings that affect the current source', () => 
     showGifSize: true,
     durationLabel: 'Capture length',
   });
+  assert.deepEqual(exportPanelPolicy({
+    sourceType: 'image',
+    animationActive: true,
+    oneShotAnimation: true,
+  }), {
+    showGifSize: false,
+    durationLabel: null,
+  });
 });
 
 test('text export descriptor follows the selected file format', () => {
@@ -71,5 +79,9 @@ test('text export descriptor follows the selected file format', () => {
   assert.deepEqual(textExportDescriptor('html'), {
     label: 'HTML',
     title: 'Download full-frame HTML text',
+  });
+  assert.deepEqual(textExportDescriptor('interactive'), {
+    label: 'WEB',
+    title: 'Download click-triggered Gravity HTML',
   });
 });

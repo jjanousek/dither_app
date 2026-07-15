@@ -460,16 +460,21 @@ function targetSignature(plan) {
 
 function normalizePostFXPlan(plan, token, targetHeight) {
   if (!plan) {
-    return Object.freeze({ fx: null, options: Object.freeze({
-      grainPhase: grainPhaseForFrame(token.frameId),
-      refH: targetHeight,
-    }) });
+    return Object.freeze({
+      fx: null,
+      options: Object.freeze({
+        grainPhase: grainPhaseForFrame(token.frameId),
+        refH: targetHeight,
+      }),
+      defer: false,
+    });
   }
   const hasEnvelope = Object.prototype.hasOwnProperty.call(plan, 'fx')
     || Object.prototype.hasOwnProperty.call(plan, 'options')
     || Object.prototype.hasOwnProperty.call(plan, 'grainPhase')
     || Object.prototype.hasOwnProperty.call(plan, 'refH')
-    || Object.prototype.hasOwnProperty.call(plan, 'fast');
+    || Object.prototype.hasOwnProperty.call(plan, 'fast')
+    || Object.prototype.hasOwnProperty.call(plan, 'defer');
   const fx = hasEnvelope ? (plan.fx ?? null) : plan;
   const supplied = hasEnvelope ? (plan.options ?? {}) : {};
   const options = Object.freeze({
@@ -478,7 +483,7 @@ function normalizePostFXPlan(plan, token, targetHeight) {
     refH: plan.refH ?? supplied.refH ?? targetHeight,
     ...(plan.fast == null ? null : { fast: !!plan.fast }),
   });
-  return Object.freeze({ fx, options });
+  return Object.freeze({ fx, options, defer: !!plan.defer });
 }
 
 function snapshotPostFXPlan(plan, token, targetHeight) {
@@ -486,7 +491,11 @@ function snapshotPostFXPlan(plan, token, targetHeight) {
   const fx = normalized.fx && typeof normalized.fx === 'object'
     ? Object.freeze({ ...normalized.fx })
     : normalized.fx;
-  return Object.freeze({ fx, options: Object.freeze({ ...normalized.options }) });
+  return Object.freeze({
+    fx,
+    options: Object.freeze({ ...normalized.options }),
+    defer: normalized.defer,
+  });
 }
 
 export class FrameBundleManager {
@@ -659,9 +668,27 @@ export class FrameBundleManager {
         targetPlan.samplingKind === SAMPLING_CONTINUOUS,
       );
       const fxPlan = normalizePostFXPlan(postFXPlan, token, height);
+      // Post-FX-only animations need to repaint at a new phase without
+      // invoking the renderer again. Keep the owned, pre-FX branch in the
+      // bundle and let the presenter apply the current phase on demand.
+      if (fxPlan.defer) {
+        return {
+          processedTarget: stage,
+          descriptor: acceptedDescriptor,
+          grainPhase: fxPlan.options.grainPhase,
+          postFXPlan: snapshotPostFXPlan(fxPlan, token, height),
+        };
+      }
       const fxResult = this.applyPostFX(stage, fxPlan.fx, fxPlan.options);
       if (!fxResult) throw new Error('Post-FX returned no canvas');
-      if (fxResult === stage) return { processedTarget: stage, descriptor: acceptedDescriptor, grainPhase: fxPlan.options.grainPhase };
+      if (fxResult === stage) {
+        return {
+          processedTarget: stage,
+          descriptor: acceptedDescriptor,
+          grainPhase: fxPlan.options.grainPhase,
+          postFXPlan: null,
+        };
+      }
       if (fxResult.width !== width || fxResult.height !== height) {
         throw new RangeError('Post-FX result dimensions changed');
       }
@@ -669,7 +696,12 @@ export class FrameBundleManager {
       drawCropped(context2d(owned, 'owned processed target'), fxResult, FULL_CROP, width, height, false);
       this._recycleCanvas(stage);
       stage = null;
-      return { processedTarget: owned, descriptor: acceptedDescriptor, grainPhase: fxPlan.options.grainPhase };
+      return {
+        processedTarget: owned,
+        descriptor: acceptedDescriptor,
+        grainPhase: fxPlan.options.grainPhase,
+        postFXPlan: null,
+      };
     } catch (error) {
       releaseCanvas(stage);
       releaseCanvas(owned);
@@ -677,7 +709,18 @@ export class FrameBundleManager {
     }
   }
 
-  _makeBundle({ token, descriptor, targetPlan, rawTarget, processedTarget, sourceWidth, sourceHeight, crop, grainPhase }) {
+  _makeBundle({
+    token,
+    descriptor,
+    targetPlan,
+    rawTarget,
+    processedTarget,
+    sourceWidth,
+    sourceHeight,
+    crop,
+    grainPhase,
+    postFXPlan = null,
+  }) {
     return Object.freeze({
       token,
       sourceWidth: positiveFinite(sourceWidth, 'sourceWidth'),
@@ -689,6 +732,7 @@ export class FrameBundleManager {
       rawTarget,
       asciiGridInfo: descriptor.asciiGridInfo,
       grainPhase,
+      postFXPlan,
     });
   }
 
@@ -747,6 +791,7 @@ export class FrameBundleManager {
         sourceHeight,
         crop,
         grainPhase: processed.grainPhase,
+        postFXPlan: processed.postFXPlan,
       });
       rawTarget = null;
       processedTarget = null;
@@ -832,6 +877,7 @@ export class FrameBundleManager {
         sourceHeight: accepted.sourceHeight,
         crop: accepted.normalizedCrop,
         grainPhase: processed.grainPhase,
+        postFXPlan: processed.postFXPlan,
       });
       processedTarget = null;
       return this._publish(bundle);

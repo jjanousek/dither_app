@@ -23,17 +23,25 @@ export function restoreExportSettings(target, snapshot = null) {
   return target;
 }
 
-export function exportPanelPolicy({ sourceType, animationActive = false } = {}) {
+export function exportPanelPolicy({
+  sourceType,
+  animationActive = false,
+  oneShotAnimation = false,
+} = {}) {
   const moving = ['video', 'webcam', 'animated-image', 'gen'].includes(sourceType);
-  const showGifSize = moving || (sourceType === 'image' && animationActive);
+  const showGifSize = !oneShotAnimation
+    && (moving || (sourceType === 'image' && animationActive));
   let durationLabel = null;
   if (sourceType === 'webcam' || sourceType === 'animated-image') durationLabel = 'Capture length';
-  else if (sourceType === 'gen' || (sourceType === 'image' && animationActive)) durationLabel = 'Video length';
+  else if (sourceType === 'gen' || (sourceType === 'image' && animationActive && !oneShotAnimation)) {
+    durationLabel = 'Video length';
+  }
   return { showGifSize, durationLabel };
 }
 
 export function textExportDescriptor(format) {
   if (format === 'ansi') return { label: 'ANSI', title: 'Download full-frame ANSI text' };
   if (format === 'html') return { label: 'HTML', title: 'Download full-frame HTML text' };
+  if (format === 'interactive') return { label: 'WEB', title: 'Download click-triggered Gravity HTML' };
   return { label: 'TXT', title: 'Download full-frame ASCII text' };
 }

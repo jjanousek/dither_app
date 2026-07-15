@@ -193,6 +193,54 @@ test('synchronous publication owns both branches, uses intrinsic video crop, and
   assert.equal(fxCalls[0].stage.width, 0, 'release tears down the pooled backing store');
 });
 
+test('deferred Post-FX publishes an owned pre-FX branch and a frozen repaint plan', () => {
+  const fxCalls = [];
+  const manager = new FrameBundleManager({
+    createCanvas: (width, height) => new TraceCanvas(width, height),
+    applyPostFX: (...args) => {
+      fxCalls.push(args);
+      return args[0];
+    },
+  });
+  const mutablePlan = {
+    fx: { grain: 0.1 },
+    options: {
+      fast: true,
+      animationStyle: 'command',
+      animationPhase: 0.25,
+      animationIntensity: 0.82,
+    },
+    defer: true,
+  };
+  const borrowed = new TraceCanvas(2, 1, 'borrowed-command-frame');
+  const bundle = manager.buildSynchronous({
+    borrowedProcessed: borrowed,
+    descriptor: { width: 2, height: 1, samplingKind: 'continuous' },
+    token: token(),
+    targetPlan: {
+      width: 4,
+      height: 2,
+      samplingKind: 'continuous',
+      targetRevision: 3,
+    },
+    rawSource: {},
+    sourceWidth: 8,
+    sourceHeight: 4,
+    postFXPlan: mutablePlan,
+  });
+
+  assert.equal(fxCalls.length, 0, 'deferred plans must not bake a stale animation phase');
+  assert.notEqual(bundle.processedTarget, borrowed);
+  assert.equal(bundle.processedTarget.context.operations[0].source, borrowed);
+  assert.equal(bundle.postFXPlan.defer, true);
+  assert.deepEqual(bundle.postFXPlan.fx, { grain: 0.1 });
+  assert.equal(bundle.postFXPlan.options.animationStyle, 'command');
+  mutablePlan.fx.grain = 0.9;
+  mutablePlan.options.animationPhase = 0.75;
+  assert.equal(bundle.postFXPlan.fx.grain, 0.1);
+  assert.equal(bundle.postFXPlan.options.animationPhase, 0.25);
+});
+
 test('steady synchronous video reuses branch canvases after one double-buffer warmup', () => {
   const allocations = [];
   const manager = new FrameBundleManager({
@@ -396,6 +444,67 @@ test('async acceptance snapshots Post-FX settings before yielding to the worker'
   });
   assert.equal(calls[0].fx.grain, 0.2);
   assert.equal(calls[0].options.fast, true);
+});
+
+test('async deferred Post-FX retains an owned pre-FX frame and the accepted phase snapshot', () => {
+  const calls = [];
+  const manager = new FrameBundleManager({
+    createCanvas: (w, h) => new TraceCanvas(w, h),
+    applyPostFX: (...args) => {
+      calls.push(args);
+      return args[0];
+    },
+  });
+  const renderToken = token({ samplingKind: 'crisp' });
+  const targetPlan = {
+    width: 4,
+    height: 2,
+    integerScale: 2,
+    samplingKind: 'crisp',
+    targetRevision: 3,
+  };
+  const mutablePlan = {
+    fx: { grain: 0.1, scanlines: 0.26 },
+    options: {
+      fast: true,
+      animationStyle: 'command',
+      animationPhase: 0.25,
+      animationIntensity: 0.82,
+    },
+    defer: true,
+  };
+
+  manager.acceptAsync({
+    acceptedJob: { token: renderToken, targetPlan },
+    rawSource: {},
+    sourceWidth: 8,
+    sourceHeight: 4,
+    postFXPlan: mutablePlan,
+  });
+  mutablePlan.fx.grain = 0.9;
+  mutablePlan.options.animationPhase = 0.75;
+
+  const borrowedWorkerFrame = new TraceCanvas(2, 1, 'borrowed-worker-frame');
+  const bundle = manager.commitAsync({
+    committedResult: {
+      token: renderToken,
+      canvas: borrowedWorkerFrame,
+      descriptor: { width: 2, height: 1, samplingKind: 'crisp' },
+    },
+  });
+
+  assert.equal(calls.length, 0, 'deferred animation phases must not be baked during async commit');
+  assert.notEqual(bundle.processedTarget, borrowedWorkerFrame,
+    'the published branch must not retain the worker-owned canvas');
+  assert.equal(bundle.processedTarget.context.operations[0].source, borrowedWorkerFrame);
+  assert.equal(bundle.postFXPlan.defer, true);
+  assert.deepEqual(bundle.postFXPlan.fx, { grain: 0.1, scanlines: 0.26 });
+  assert.equal(bundle.postFXPlan.options.animationStyle, 'command');
+  assert.equal(bundle.postFXPlan.options.animationPhase, 0.25);
+  assert.equal(bundle.postFXPlan.options.animationIntensity, 0.82);
+  assert.equal(Object.isFrozen(bundle.postFXPlan), true);
+  assert.equal(Object.isFrozen(bundle.postFXPlan.fx), true);
+  assert.equal(Object.isFrozen(bundle.postFXPlan.options), true);
 });
 
 test('target revisions change only with the plan and recording locks freeze the target', () => {

@@ -14,6 +14,8 @@ import { PALETTES, getPalette } from './palettes.js';
 import { RAMPS, FONTS } from './engine/ascii.js';
 import { GEN_SCENES } from './generate.js';
 import { syncRangeProgress } from './range-progress.js';
+import { gravityAnimationSupported } from './animation-policy.js';
+import { gravityDurationSeconds } from './effects/ascii-gravity.js';
 
 // ---------- tiny component helpers ----------
 
@@ -180,6 +182,19 @@ function inlineNote(body, text, className = '') {
   return note;
 }
 
+function actionButton(body, label, { onclick, title = '' } = {}) {
+  const actionRow = row(body, null);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn';
+  button.style.flex = '1';
+  button.textContent = label;
+  if (title) button.title = title;
+  button.onclick = onclick;
+  actionRow.appendChild(button);
+  return button;
+}
+
 const pct = (v) => `${Math.round(v * 100)}%`;
 
 // ---------- panel ----------
@@ -194,6 +209,8 @@ export function buildPanel({
   sourceType = null,
   gen = null,
   onGenChange = null,
+  onAnimationReplay = null,
+  isFlutedSupported = () => true,
   isLive = false,
 }) {
   mount.innerHTML = '';
@@ -207,6 +224,8 @@ export function buildPanel({
     sourceType,
     gen,
     onGenChange,
+    onAnimationReplay,
+    isFlutedSupported,
     isLive,
   });
   const change = (meta) => onChange(meta);
@@ -599,12 +618,32 @@ export function buildPanel({
     && animationAlgorithm.type === 'gpu'
     && animationAlgorithm.mode >= 1;
   const patternStyle = state.anim.style === 'flow' || state.anim.style === 'shimmer';
-  const animationActive = state.anim.style !== 'none' && (!patternStyle || patternOk);
+  const gravityStyle = state.anim.style === 'gravity';
+  const flutedStyle = state.anim.style === 'fluted';
+  // Keep WebGL2 lazy: capability is probed only after the user selects the
+  // optical effect, not every time the panel opens.
+  const flutedOk = !flutedStyle || isFlutedSupported();
+  const gravityOk = gravityAnimationSupported({
+    mode: state.mode,
+    sourceType,
+    colorMode: state.ascii.colorMode,
+  });
+  const animationActive = state.anim.style !== 'none'
+    && (!patternStyle || patternOk)
+    && (!gravityStyle || gravityOk)
+    && (!flutedStyle || flutedOk);
   select(an, 'Style', {
     options: [
       { value: 'none', label: 'None' },
       { value: 'breathe', label: 'Breathe (exposure)' },
       { value: 'pulse', label: 'Pulse (heartbeat)' },
+      { value: 'command', label: 'Command sequence' },
+      {
+        value: 'fluted',
+        label: flutedStyle && !flutedOk
+          ? 'Fluted glass — unavailable'
+          : 'Fluted glass (refraction)',
+      },
       { value: 'sweep', label: 'Sweep (light band)' },
       { value: 'wave', label: 'Wave (distortion)' },
       {
@@ -617,17 +656,44 @@ export function buildPanel({
         label: patternOk ? 'Shimmer (pattern jitter)' : 'Shimmer — paused',
         disabled: !patternOk && state.anim.style !== 'shimmer',
       },
+      {
+        value: 'gravity',
+        label: gravityOk ? 'Gravity fall (ASCII)' : 'Gravity fall — paused',
+        disabled: !gravityOk && state.anim.style !== 'gravity',
+      },
     ],
     value: state.anim.style,
-    oninput: (v) => { state.anim.style = v; changeAndRefresh(); },
+    oninput: (v) => {
+      beforeDiscrete();
+      state.anim.style = v;
+      changeAndRefresh({ discrete: true, animationRestart: true });
+    },
   });
   if (animationActive) {
-    slider(an, 'Speed', {
+    if (gravityStyle) {
+      select(an, 'Fall', {
+        options: [
+          { value: 'drizzle', label: 'Drizzle — gentle' },
+          { value: 'cascade', label: 'Cascade — top-down' },
+          { value: 'flutter', label: 'Flutter — windy' },
+          { value: 'collapse', label: 'Collapse — heavy' },
+        ],
+        value: state.anim.gravityMode || 'drizzle',
+        oninput: (v) => {
+          beforeDiscrete();
+          state.anim.gravityMode = v;
+          changeAndRefresh({ discrete: true, animationRestart: true });
+        },
+      });
+    }
+    slider(an, gravityStyle ? 'Pace' : 'Speed', {
       min: 1, max: 10, step: 0.5, value: state.anim.speed,
-      fmt: (v) => `${v}×`,
+      fmt: (v) => gravityStyle
+        ? `${gravityDurationSeconds(v, state.anim.gravityMode).toFixed(1)}s`
+        : `${v}×`,
       oninput: (v) => { state.anim.speed = v; change(); },
     });
-    slider(an, 'Intensity', {
+    slider(an, gravityStyle ? 'Scatter' : 'Intensity', {
       min: 0, max: 1, step: 0.01, value: state.anim.intensity, fmt: pct,
       oninput: (v) => { state.anim.intensity = v; change(); },
     });
@@ -645,17 +711,39 @@ export function buildPanel({
         oninput: (v) => { state.anim.direction = v; change(); },
       });
     }
-    inlineNote(an, 'Animated still images can be exported as looping GIFs or recorded as video.');
+    if (gravityStyle) {
+      actionButton(an, 'Replay fall', {
+        title: 'Restart the one-shot gravity animation',
+        onclick: () => onAnimationReplay?.(),
+      });
+      inlineNote(an, 'One-shot effect · characters fall out below the frame · Pace sets the video length · Replay to trigger it again.');
+    } else if (flutedStyle) {
+      inlineNote(an, 'Refracts the rendered image · Raster, GIF, and video exports include the motion; text exports stay unchanged.');
+    } else {
+      inlineNote(an, 'Animated still images can be exported as looping GIFs or recorded as video.');
+    }
+  } else if (flutedStyle) {
+    inlineNote(an, 'Fluted glass is unavailable because WebGL 2 is not available. Its settings are preserved.', 'paused-note');
   } else if (patternStyle) {
     const destination = state.mode === 'dither'
       ? 'Choose Bayer, Blue Noise, White Noise, or Halftone to resume it.'
       : 'Return to Dither with a pattern algorithm to resume it.';
     inlineNote(an, `${state.anim.style === 'flow' ? 'Flow' : 'Shimmer'} is paused. Its speed and intensity are preserved. ${destination}`, 'paused-note');
+  } else if (gravityStyle) {
+    let destination = 'Load a still image in ASCII mode to use it.';
+    if (state.mode !== 'ascii') destination = 'Return to ASCII to use it.';
+    else if (state.ascii.colorMode === 'bg') destination = 'Choose Mono or Colored glyphs to use it.';
+    else if (sourceType && sourceType !== 'image') destination = 'Gravity currently supports still images only.';
+    inlineNote(an, `Gravity fall is paused. Its fall mode, pace, and scatter are preserved. ${destination}`, 'paused-note');
   }
 
   // --- EXPORT ---
   const ex = section(mount, 'Export');
-  const exportPolicy = exportPanelPolicy({ sourceType, animationActive });
+  const exportPolicy = exportPanelPolicy({
+    sourceType,
+    animationActive,
+    oneShotAnimation: gravityStyle && gravityOk,
+  });
   select(ex, 'PNG size', {
     options: state.mode === 'dither'
       ? [
@@ -706,12 +794,18 @@ export function buildPanel({
     });
   }
   if (state.mode === 'ascii') {
+    const textFormats = [
+      { value: 'plain', label: 'Plain text (.txt)' },
+      { value: 'ansi', label: 'ANSI colors (.ans)' },
+      { value: 'html', label: 'Static web page (.html)' },
+    ];
+    if (gravityStyle && gravityOk) {
+      textFormats.push({ value: 'interactive', label: 'Interactive fall (.html)' });
+    } else if (exportSettings.txtFormat === 'interactive') {
+      textFormats.push({ value: 'interactive', label: 'Interactive fall — paused', disabled: true });
+    }
     select(ex, 'Text format', {
-      options: [
-        { value: 'plain', label: 'Plain text (.txt)' },
-        { value: 'ansi', label: 'ANSI colors (.ans)' },
-        { value: 'html', label: 'Web page (.html)' },
-      ],
+      options: textFormats,
       value: exportSettings.txtFormat,
       oninput: (v) => {
         beforeDiscrete();
@@ -719,7 +813,9 @@ export function buildPanel({
         onExportChange?.({ discrete: true });
       },
     });
-    inlineNote(ex, 'Text downloads and copy use the full ASCII frame. Effect Mask applies to PNG, GIF, and video only.');
+    inlineNote(ex, gravityStyle && gravityOk
+      ? 'Interactive HTML triggers this fall on click or keyboard. Plain, ANSI, static HTML, and copy keep the full ASCII frame.'
+      : 'Text downloads and copy use the full ASCII frame. Effect Mask applies to PNG, GIF, and video only.');
     const copyRow = row(ex, null);
     const copyBtn = document.createElement('button');
     copyBtn.className = 'btn';

@@ -2,11 +2,24 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  applyParams,
   createState,
   modeSizeRange,
   transitionAlgorithm,
   transitionMode,
 } from '../js/state.js';
+
+test('Gravity mode defaults safely and survives partial legacy state merges', () => {
+  const state = createState();
+  assert.equal(state.anim.gravityMode, 'drizzle');
+
+  applyParams(state, { anim: { style: 'gravity', speed: 2 } });
+  assert.equal(state.anim.gravityMode, 'drizzle');
+  state.anim.gravityMode = 'flutter';
+  transitionMode(state, 'dither');
+  transitionMode(state, 'ascii');
+  assert.equal(state.anim.gravityMode, 'flutter');
+});
 
 function changedPaths(before, after, prefix = '') {
   const paths = [];

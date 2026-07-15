@@ -19,6 +19,7 @@ export class CpuPreview {
     this.busy = false;
     this.epoch = 0;                // bumps on any dither-settings/size change
     this.committedEpoch = -1;      // epoch of the frame currently in `committed`
+    this.commitGeneration = 0;     // bumps whenever committed pixels mutate
     this.sig = '';
     this.cw = 0;
     this.ch = 0;
@@ -58,6 +59,9 @@ export class CpuPreview {
     // the editor even though every subsequent frame uses the sync fallback.
     this.worker?.terminate();
     this.worker = null;
+    // The recovery wake renders through a different synchronous surface. Make
+    // retained Post-FX texture keys reject the previously committed bitmap.
+    this.commitGeneration++;
     if (this.onResult) this.onResult();
   }
 
@@ -90,6 +94,7 @@ export class CpuPreview {
     this.cw = w;
     this.ch = h;
     this.committedEpoch = epoch;
+    this.commitGeneration++;
   }
 
   #onMessage(data) {

@@ -1,3 +1,9 @@
+import {
+  createGravityLayout,
+  normalizeGravityMode,
+  sampleGravityBody,
+} from '../effects/ascii-gravity.js';
+
 // ASCII art engine. Four renderers over a sampled luminance/color grid:
 //
 //  ramp      1 sample/cell — coverage-calibrated character ramps with optional
@@ -13,6 +19,8 @@
 // All renderers record lastText (plain) and lastGrid (per-cell char + colors)
 // for TXT / ANSI / HTML export by default. Live-preview callers can pass
 // captureMetadata:false to skip those export-only allocations for a frame.
+// captureGlyphs:true keeps a separate transient grid for glyph-space effects
+// without replacing the most recent text-export snapshot.
 
 export const RAMPS = {
   classic: { name: 'Classic 10', chars: '@%#*+=-:. ' },
@@ -48,6 +56,21 @@ export function fontSpec(a) {
 }
 
 const fontString = (font, px) => `${font.bold ? '700 ' : ''}${px}px ${font.family}`;
+const GRAVITY_ANGLE_STEP = Math.PI / 32;
+const GRAVITY_ANGLE_INDEX_LIMIT = 32;
+const GRAVITY_ANGLE_BIN_COUNT = GRAVITY_ANGLE_INDEX_LIMIT * 2 + 1;
+const GRAVITY_DENSE_ANGLE_STEP = Math.PI / 8;
+const GRAVITY_DENSE_ANGLE_INDEX_LIMIT = 8;
+const GRAVITY_DENSE_ANGLE_BIN_COUNT = GRAVITY_DENSE_ANGLE_INDEX_LIMIT * 2 + 1;
+const GRAVITY_SPRITE_VARIANT_LIMIT = 16;
+const GRAVITY_DENSE_SPRITE_VARIANT_LIMIT = 128;
+const GRAVITY_DENSE_SPRITE_MIN_BODIES = 4_000;
+const GRAVITY_SPRITE_ATLAS_PIXEL_LIMIT = 8_000_000;
+const GRAVITY_SUPERSAMPLE_MAX_CELL = 18;
+// Rasterize cached glyphs above their logical size, then downsample once when
+// drawing. Tiny 4–6px characters otherwise lose counters and stems after the
+// editor also scales the finished ASCII canvas to fit its viewport.
+const GRAVITY_TINY_SPRITE_RASTER_SCALE = 2;
 
 // printable ASCII for structural matching; 'blocks' adds unicode structure
 const SHAPE_ASCII = (() => {
@@ -85,6 +108,33 @@ export class AsciiRenderer {
     this.ctx = this.canvas.getContext('2d');
     this.lastText = '';
     this.lastGrid = null; // rows of [char, fgRGB|null, bgRGB|null]
+    this.lastGlyphFrame = null; // transient live grid, independent of exports
+    this.gravityCanvas = document.createElement('canvas');
+    this.gravityCtx = this.gravityCanvas.getContext('2d');
+    this.gravityLayout = null;
+    this.lastGravityStats = null;
+    this._gravityPose = {};
+    this._gravitySpriteAtlas = document.createElement('canvas');
+    this._gravitySpriteAtlasCtx = this._gravitySpriteAtlas.getContext('2d');
+    this._gravitySpriteSlots = null;
+    this._gravitySpriteSize = 0;
+    this._gravitySpriteStride = 0;
+    this._gravitySpriteColumns = 0;
+    this._gravitySpriteCellW = 0;
+    this._gravitySpriteCellH = 0;
+    this._gravitySpriteRasterScale = 1;
+    this._gravitySpriteFont = '';
+    this._gravitySpriteVariants = [];
+    this._gravityBodyVariantIndices = null;
+    this._gravityVariantSignature = '';
+    this._gravitySpriteSignature = '';
+    this._gravityUseSprites = false;
+    this._gravitySpritePreview = false;
+    this._gravityAngleStep = GRAVITY_ANGLE_STEP;
+    this._gravityAngleIndexLimit = GRAVITY_ANGLE_INDEX_LIMIT;
+    this._gravityAngleBinCount = GRAVITY_ANGLE_BIN_COUNT;
+    this._gravityGrid = null;
+    this._gravityLayoutKey = '';
     this._atlasCache = new Map();
     this._rampCache = new Map();
     // Bounded prefilter top-K cache: the shape prefilter's result depends only
@@ -107,6 +157,25 @@ export class AsciiRenderer {
   clearCaches() {
     this._atlasCache.clear();
     this._rampCache.clear();
+    this.gravityLayout = null;
+    this.clearGravity();
+  }
+
+  clearGravity() {
+    this.lastGlyphFrame = null;
+    this.gravityLayout = null;
+    this.lastGravityStats = null;
+    this._gravityGrid = null;
+    this._gravityLayoutKey = '';
+    this._gravitySpriteVariants = [];
+    this._gravityBodyVariantIndices = null;
+    this._gravityVariantSignature = '';
+    this.#clearGravitySpriteAtlas();
+    this._gravityUseSprites = false;
+    this._gravitySpritePreview = false;
+    this._gravityAngleStep = GRAVITY_ANGLE_STEP;
+    this._gravityAngleIndexLimit = GRAVITY_ANGLE_INDEX_LIMIT;
+    this._gravityAngleBinCount = GRAVITY_ANGLE_BIN_COUNT;
   }
 
   // Widest advance of the glyphs, so the sample grid matches the glyph grid.
@@ -130,6 +199,303 @@ export class AsciiRenderer {
     if (renderer === 'quadrant') return this.#renderQuadrant(imageData, opts);
     if (renderer === 'braille') return this.#renderBraille(imageData, opts);
     return this.#renderRamp(imageData, opts);
+  }
+
+  // Redraw the transient glyph frame as independent falling bodies. This is a
+  // second canvas so the phase-zero raster remains byte-for-byte identical to
+  // the legacy renderer and text-export metadata remains untouched.
+  renderGravity({
+    phase = 0,
+    intensity = 0.6,
+    mode = 'drizzle',
+    preview = false,
+    font,
+    bg = '#000000',
+    cols,
+    rows,
+  } = {}) {
+    const grid = this.lastGlyphFrame;
+    if (!grid || !grid.length || !cols || !rows) {
+      this.lastGravityStats = null;
+      return this.canvas;
+    }
+
+    const gravityMode = normalizeGravityMode(mode);
+    const layoutKey = `${cols}x${rows}|${Math.round(Math.max(0, Math.min(1, intensity)) * 1000)}|${gravityMode}`;
+    const layoutChanged = !this.gravityLayout
+      || this._gravityGrid !== grid
+      || this._gravityLayoutKey !== layoutKey;
+    if (layoutChanged) {
+      this.gravityLayout = createGravityLayout(grid, {
+        cols,
+        rows,
+        intensity,
+        mode: gravityMode,
+      });
+      this._gravityGrid = grid;
+      this._gravityLayoutKey = layoutKey;
+    }
+    if (layoutChanged || this._gravitySpritePreview !== !!preview) {
+      this.#indexGravitySpriteVariants(this.gravityLayout.bodies, {
+        allowDenseQuantization: !!preview,
+      });
+      this._gravitySpritePreview = !!preview;
+    }
+
+    const bodyCount = this.gravityLayout.bodies.length;
+    if (phase <= 0) {
+      this.lastGravityStats = { bodyCount, released: 0, exited: 0, phase: 0 };
+      return this.canvas;
+    }
+
+    const target = this.gravityCanvas;
+    if (target.width !== this.canvas.width || target.height !== this.canvas.height) {
+      target.width = this.canvas.width;
+      target.height = this.canvas.height;
+    }
+    const ctx = this.gravityCtx;
+    const cellW = target.width / cols;
+    const cellH = target.height / rows;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, target.width, target.height);
+    if (phase >= 1) {
+      this.lastGravityStats = { bodyCount, released: bodyCount, exited: bodyCount, phase: 1 };
+      return target;
+    }
+    ctx.font = fontString(font, cellH);
+    ctx.textBaseline = 'top';
+
+    if (this._gravityUseSprites) this.#ensureGravitySpriteAtlas(cellW, cellH, font);
+
+    let released = 0;
+    let exited = 0;
+    let alpha = 1;
+    const bodies = this.gravityLayout.bodies;
+    for (let bodyIndex = 0; bodyIndex < bodies.length; bodyIndex++) {
+      const body = bodies[bodyIndex];
+      const pose = sampleGravityBody(body, phase, this._gravityPose);
+      if (pose.released) released++;
+      if (pose.exited) exited++;
+      if (pose.opacity <= 0.001) continue;
+
+      const x = pose.x * cellW;
+      const y = pose.y * cellH;
+      if (pose.opacity !== alpha) {
+        alpha = pose.opacity;
+        ctx.globalAlpha = alpha;
+      }
+      if (this._gravityUseSprites) {
+        this.#drawGravitySprite(
+          this._gravityBodyVariantIndices[bodyIndex],
+          pose.angle,
+          x,
+          y,
+          pose.scale,
+        );
+      } else {
+        ctx.fillStyle = intToCss(body.foreground ?? 0xffffff);
+        if (Math.abs(pose.angle) < 0.001 && Math.abs((pose.scale ?? 1) - 1) < 0.001) {
+          ctx.fillText(body.glyph, x - cellW / 2, y - cellH / 2);
+        } else {
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate(pose.angle);
+          ctx.scale(pose.scale ?? 1, pose.scale ?? 1);
+          ctx.fillText(body.glyph, -cellW / 2, -cellH / 2);
+          ctx.restore();
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+    this.lastGravityStats = {
+      bodyCount: this.gravityLayout.bodies.length,
+      released,
+      exited,
+      phase,
+    };
+    return target;
+  }
+
+  // Dense monochrome/palette ASCII spends most of its frame budget shaping and
+  // rotating the same handful of glyphs. Give every body a numeric variant id,
+  // then lazily rasterize its 5.625-degree bins into one atlas. The live loop
+  // performs only integer arithmetic and one atlas drawImage per body: no
+  // template strings, Map lookups, or hundreds of tiny source canvases.
+  // Full-color frames with many distinct inks retain the exact fillText path.
+  #indexGravitySpriteVariants(bodies, { allowDenseQuantization = false } = {}) {
+    const indexVariants = (limit, colorForBody) => {
+      const lookup = new Map();
+      const variants = [];
+      const bodyVariants = new Uint16Array(bodies.length);
+      for (let bodyIndex = 0; bodyIndex < bodies.length; bodyIndex++) {
+        const body = bodies[bodyIndex];
+        const foreground = colorForBody(body);
+        const key = `${body.glyph}\u0000${foreground}`;
+        let variantIndex = lookup.get(key);
+        if (variantIndex === undefined) {
+          if (variants.length >= limit) return null;
+          variantIndex = variants.length;
+          lookup.set(key, variantIndex);
+          variants.push({ glyph: body.glyph, foreground });
+        }
+        bodyVariants[bodyIndex] = variantIndex;
+      }
+      return { variants, bodyVariants };
+    };
+
+    let indexed = indexVariants(
+      GRAVITY_SPRITE_VARIANT_LIMIT,
+      (body) => body.foreground ?? 0xffffff,
+    );
+
+    // Dense Colored-glyph frames can contain thousands of exact RGB values.
+    // Rotated fillText plus save/restore for every glyph is dramatically more
+    // expensive than a small color approximation at preview scale. Quantize
+    // only this dense live path; phase zero and every export still use the
+    // original full-color glyph grid/body data.
+    let denseQuantized = false;
+    if (!indexed && allowDenseQuantization
+        && bodies.length >= GRAVITY_DENSE_SPRITE_MIN_BODIES) {
+      const glyphs = new Set();
+      for (const body of bodies) glyphs.add(body.glyph);
+      const levels = Math.min(4, Math.floor(Math.cbrt(
+        GRAVITY_DENSE_SPRITE_VARIANT_LIMIT / Math.max(1, glyphs.size),
+      )));
+      if (levels >= 2) {
+        const step = 255 / (levels - 1);
+        const quantize = (channel) => Math.round(Math.round(channel / step) * step);
+        indexed = indexVariants(GRAVITY_DENSE_SPRITE_VARIANT_LIMIT, (body) => {
+          const color = (body.foreground ?? 0xffffff) >>> 0;
+          return (quantize((color >>> 16) & 0xff) << 16)
+            | (quantize((color >>> 8) & 0xff) << 8)
+            | quantize(color & 0xff);
+        });
+        denseQuantized = !!indexed;
+      }
+    }
+
+    this._gravityAngleStep = denseQuantized ? GRAVITY_DENSE_ANGLE_STEP : GRAVITY_ANGLE_STEP;
+    this._gravityAngleIndexLimit = denseQuantized
+      ? GRAVITY_DENSE_ANGLE_INDEX_LIMIT
+      : GRAVITY_ANGLE_INDEX_LIMIT;
+    this._gravityAngleBinCount = denseQuantized
+      ? GRAVITY_DENSE_ANGLE_BIN_COUNT
+      : GRAVITY_ANGLE_BIN_COUNT;
+    this._gravityUseSprites = !!indexed;
+    this._gravityBodyVariantIndices = indexed?.bodyVariants || null;
+    this._gravitySpriteVariants = indexed?.variants || [];
+    const variantSignature = indexed
+      ? `${denseQuantized ? 'dense' : 'exact'}|${JSON.stringify(indexed.variants)}`
+      : '';
+    if (!indexed || variantSignature !== this._gravityVariantSignature) {
+      this.#clearGravitySpriteAtlas();
+    }
+    this._gravityVariantSignature = variantSignature;
+  }
+
+  #clearGravitySpriteAtlas() {
+    this._gravitySpriteAtlas.width = 0;
+    this._gravitySpriteAtlas.height = 0;
+    this._gravitySpriteSlots = null;
+    this._gravitySpriteSize = 0;
+    this._gravitySpriteStride = 0;
+    this._gravitySpriteColumns = 0;
+    this._gravitySpriteCellW = 0;
+    this._gravitySpriteCellH = 0;
+    this._gravitySpriteRasterScale = 1;
+    this._gravitySpriteFont = '';
+    this._gravitySpriteSignature = '';
+  }
+
+  #ensureGravitySpriteAtlas(cellW, cellH, font) {
+    const slotCount = Math.max(1, this._gravitySpriteVariants.length * this._gravityAngleBinCount);
+    const columns = Math.ceil(Math.sqrt(slotCount));
+    const rows = Math.ceil(slotCount / columns);
+    const logicalSize = Math.hypot(cellW, cellH) * 1.6 + 4;
+    let rasterScale = Math.max(cellW, cellH) < GRAVITY_SUPERSAMPLE_MAX_CELL
+      ? GRAVITY_TINY_SPRITE_RASTER_SCALE
+      : 1;
+    const dimensions = (scale) => {
+      const size = Math.max(4, Math.ceil(logicalSize * scale));
+      // One transparent pixel on every side prevents bilinear sampling from
+      // leaking a neighbouring rotated glyph when a sprite lands between pixels.
+      const stride = size + 2;
+      return { size, stride, pixels: columns * stride * rows * stride };
+    };
+    let shape = dimensions(rasterScale);
+    if (shape.pixels > GRAVITY_SPRITE_ATLAS_PIXEL_LIMIT && rasterScale > 1) {
+      rasterScale = 1;
+      shape = dimensions(rasterScale);
+    }
+    const spriteSignature = `${cellW.toFixed(3)}x${cellH.toFixed(3)}|${font.family}|${font.bold ? 1 : 0}|${rasterScale}x|${this._gravityVariantSignature}`;
+    if (spriteSignature === this._gravitySpriteSignature) return;
+
+    const { size, stride } = shape;
+    if (shape.pixels > GRAVITY_SPRITE_ATLAS_PIXEL_LIMIT) {
+      this._gravityUseSprites = false;
+      this.#clearGravitySpriteAtlas();
+      return;
+    }
+    this._gravitySpriteAtlas.width = columns * stride;
+    this._gravitySpriteAtlas.height = rows * stride;
+    this._gravitySpriteSlots = new Uint8Array(slotCount);
+    this._gravitySpriteSize = size;
+    this._gravitySpriteStride = stride;
+    this._gravitySpriteColumns = columns;
+    this._gravitySpriteCellW = cellW * rasterScale;
+    this._gravitySpriteCellH = cellH * rasterScale;
+    this._gravitySpriteRasterScale = rasterScale;
+    this._gravitySpriteFont = fontString(font, cellH * rasterScale);
+    this._gravitySpriteSignature = spriteSignature;
+  }
+
+  #drawGravitySprite(variantIndex, angle, x, y, scale = 1) {
+    const wrapped = ((angle + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+    const angleIndex = Math.max(
+      -this._gravityAngleIndexLimit,
+      Math.min(this._gravityAngleIndexLimit, Math.round(wrapped / this._gravityAngleStep)),
+    );
+    const slot = variantIndex * this._gravityAngleBinCount
+      + angleIndex + this._gravityAngleIndexLimit;
+    const size = this._gravitySpriteSize;
+    const stride = this._gravitySpriteStride;
+    const sx = (slot % this._gravitySpriteColumns) * stride + 1;
+    const sy = Math.floor(slot / this._gravitySpriteColumns) * stride + 1;
+
+    if (!this._gravitySpriteSlots[slot]) {
+      const variant = this._gravitySpriteVariants[variantIndex];
+      const atlasCtx = this._gravitySpriteAtlasCtx;
+      atlasCtx.save();
+      atlasCtx.setTransform(1, 0, 0, 1, 0, 0);
+      atlasCtx.font = this._gravitySpriteFont;
+      atlasCtx.textBaseline = 'top';
+      atlasCtx.fillStyle = intToCss(variant.foreground);
+      atlasCtx.translate(sx + size / 2, sy + size / 2);
+      atlasCtx.rotate(angleIndex * this._gravityAngleStep);
+      atlasCtx.fillText(
+        variant.glyph,
+        -this._gravitySpriteCellW / 2,
+        -this._gravitySpriteCellH / 2,
+      );
+      atlasCtx.restore();
+      this._gravitySpriteSlots[slot] = 1;
+    }
+
+    const spriteLogicalSize = size / this._gravitySpriteRasterScale;
+    const drawSize = spriteLogicalSize * Math.max(1, Number(scale) || 1);
+    this.gravityCtx.drawImage(
+      this._gravitySpriteAtlas,
+      sx,
+      sy,
+      size,
+      size,
+      x - drawSize / 2,
+      y - drawSize / 2,
+      drawSize,
+      drawSize,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -188,6 +554,7 @@ export class AsciiRenderer {
       this.lastText = lines.join('\n');
       this.lastGrid = grid;
     }
+    this.lastGlyphFrame = grid;
     return this.canvas;
   }
 
@@ -361,7 +728,7 @@ export class AsciiRenderer {
   #renderRamp(imageData, opts) {
     const {
       chars, cellSize, font, colorMode, fg, bg, invertRamp,
-      dither, edgeStrength, autoContrast, captureMetadata = true,
+      dither, edgeStrength, autoContrast, captureMetadata = true, captureGlyphs = false,
     } = opts;
     const { width: cols, height: rows, data } = imageData;
 
@@ -417,30 +784,29 @@ export class AsciiRenderer {
     const uniform = this.lastUniform;
     const ctx = this.#beginDraw(cols, rows, cellW, cellH, font, bg);
 
+    const captureCells = captureMetadata || captureGlyphs;
     const lines = captureMetadata ? [] : null;
-    const grid = captureMetadata ? [] : null;
+    const grid = captureCells ? [] : null;
     if (colorMode === 'mono' && uniform) {
       ctx.fillStyle = fg;
       const fgInt = hexToInt(fg);
       for (let y = 0; y < rows; y++) {
         let line = '';
-        const grow = captureMetadata ? [] : null;
+        const grow = captureCells ? [] : null;
         for (let x = 0; x < cols; x++) {
           const ch = picks[y * cols + x];
           line += ch;
-          if (captureMetadata) grow.push([ch, fgInt, null]);
+          if (captureCells) grow.push([ch, fgInt, null]);
         }
-        if (captureMetadata) {
-          lines.push(line);
-          grid.push(grow);
-        }
+        if (captureMetadata) lines.push(line);
+        if (captureCells) grid.push(grow);
         ctx.fillText(line, 0, y * cellH);
       }
     } else {
       const fgInt = hexToInt(fg);
       for (let y = 0; y < rows; y++) {
         let line = captureMetadata ? '' : null;
-        const grow = captureMetadata ? [] : null;
+        const grow = captureCells ? [] : null;
         for (let x = 0; x < cols; x++) {
           const j = y * cols + x;
           const i = j * 4;
@@ -455,24 +821,22 @@ export class AsciiRenderer {
             const ink = LUMA(data[i], data[i + 1], data[i + 2]) / 255 > 0.5 ? 0x000000 : 0xffffff;
             ctx.fillStyle = intToCss(ink);
             ctx.fillText(ch, x * cellW, y * cellH);
-            if (captureMetadata) grow.push([ch, ink, rgb]);
+            if (captureCells) grow.push([ch, ink, rgb]);
           } else if (colorMode === 'fg') {
             const rgb = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
             if (ch !== ' ') {
               ctx.fillStyle = intToCss(rgb);
               ctx.fillText(ch, x * cellW, y * cellH);
             }
-            if (captureMetadata) grow.push([ch, rgb, null]);
+            if (captureCells) grow.push([ch, rgb, null]);
           } else {
             ctx.fillStyle = fg;
             if (ch !== ' ') ctx.fillText(ch, x * cellW, y * cellH);
-            if (captureMetadata) grow.push([ch, fgInt, null]);
+            if (captureCells) grow.push([ch, fgInt, null]);
           }
         }
-        if (captureMetadata) {
-          lines.push(line);
-          grid.push(grow);
-        }
+        if (captureMetadata) lines.push(line);
+        if (captureCells) grid.push(grow);
       }
     }
     return this.#finish(lines, grid);
@@ -484,7 +848,7 @@ export class AsciiRenderer {
   #renderShape(imageData, opts) {
     const {
       cellSize, font, colorMode, fg, bg, invertRamp, autoContrast, shapeSet,
-      captureMetadata = true,
+      captureMetadata = true, captureGlyphs = false,
     } = opts;
     const W = imageData.width;   // cols * 8
     const H = imageData.height;  // rows * 8
@@ -507,8 +871,9 @@ export class AsciiRenderer {
 
     const fgInt = hexToInt(fg);
     const K = 8; // candidates refined after Hamming prefilter
+    const captureCells = captureMetadata || captureGlyphs;
     const lines = captureMetadata ? [] : null;
-    const grid = captureMetadata ? [] : null;
+    const grid = captureCells ? [] : null;
 
     // scratch
     const px = new Float32Array(64 * 3);
@@ -518,7 +883,7 @@ export class AsciiRenderer {
 
     for (let cy = 0; cy < rows; cy++) {
       let line = captureMetadata ? '' : null;
-      const grow = captureMetadata ? [] : null;
+      const grow = captureCells ? [] : null;
       for (let cx = 0; cx < cols; cx++) {
         // gather 64 pixels
         let minL = 1, maxL = 0, minI = 0, maxI = 0, sumL = 0;
@@ -651,10 +1016,8 @@ export class AsciiRenderer {
           }
         }
 
-        if (captureMetadata) {
-          line += ch;
-          grow.push([ch, cellFg, cellBg]);
-        }
+        if (captureMetadata) line += ch;
+        if (captureCells) grow.push([ch, cellFg, cellBg]);
         if (cellBg !== null && cellBg !== undefined) {
           ctx.fillStyle = intToCss(cellBg);
           ctx.fillRect(cx * cellW, cy * cellH, Math.ceil(cellW), cellH);
@@ -664,10 +1027,8 @@ export class AsciiRenderer {
           ctx.fillText(ch, cx * cellW, cy * cellH);
         }
       }
-      if (captureMetadata) {
-        lines.push(line);
-        grid.push(grow);
-      }
+      if (captureMetadata) lines.push(line);
+      if (captureCells) grid.push(grow);
     }
     return this.#finish(lines, grid);
   }
@@ -678,7 +1039,7 @@ export class AsciiRenderer {
   #renderQuadrant(imageData, opts) {
     const {
       cellSize, font, colorMode, fg, bg, invertRamp,
-      dither, dotThreshold, autoContrast, captureMetadata = true,
+      dither, dotThreshold, autoContrast, captureMetadata = true, captureGlyphs = false,
     } = opts;
     const W = imageData.width;  // cols * 2
     const H = imageData.height; // rows * 2
@@ -698,12 +1059,13 @@ export class AsciiRenderer {
     // mono / fg modes: dot bitmap from dithered luminance
     const bits = colorMode === 'bg' ? null : this.#ditherBits(lum, W, H, dotThreshold, dither);
 
+    const captureCells = captureMetadata || captureGlyphs;
     const lines = captureMetadata ? [] : null;
-    const grid = captureMetadata ? [] : null;
+    const grid = captureCells ? [] : null;
     const SUB = [[0, 0, 1], [1, 0, 2], [0, 1, 4], [1, 1, 8]]; // dx, dy, bit
     for (let cy = 0; cy < rows; cy++) {
       let line = captureMetadata ? '' : null;
-      const grow = captureMetadata ? [] : null;
+      const grow = captureCells ? [] : null;
       for (let cx = 0; cx < cols; cx++) {
         let ch, cellFg = fgInt, cellBg = null;
         if (colorMode === 'bg') {
@@ -752,10 +1114,8 @@ export class AsciiRenderer {
           if (colorMode === 'fg' && n) cellFg = rgbInt(rs / n, gs / n, bs / n);
         }
 
-        if (captureMetadata) {
-          line += ch;
-          grow.push([ch, cellFg, cellBg]);
-        }
+        if (captureMetadata) line += ch;
+        if (captureCells) grow.push([ch, cellFg, cellBg]);
         if (cellBg !== null) {
           ctx.fillStyle = intToCss(cellBg);
           ctx.fillRect(cx * cellW, cy * cellH, Math.ceil(cellW), cellH);
@@ -768,10 +1128,8 @@ export class AsciiRenderer {
           ctx.fillRect(cx * cellW, cy * cellH, Math.ceil(cellW), cellH);
         }
       }
-      if (captureMetadata) {
-        lines.push(line);
-        grid.push(grow);
-      }
+      if (captureMetadata) lines.push(line);
+      if (captureCells) grid.push(grow);
     }
     return this.#finish(lines, grid);
   }
@@ -782,7 +1140,7 @@ export class AsciiRenderer {
   #renderBraille(imageData, opts) {
     const {
       cellSize, font, colorMode, fg, bg, invertRamp,
-      dither, dotThreshold, autoContrast, captureMetadata = true,
+      dither, dotThreshold, autoContrast, captureMetadata = true, captureGlyphs = false,
     } = opts;
     const W = imageData.width;  // cols * 2
     const H = imageData.height; // rows * 4
@@ -801,12 +1159,13 @@ export class AsciiRenderer {
     const ctx = this.#beginDraw(cols, rows, cellW, cellH, font, bg);
     const fgInt = hexToInt(fg);
 
+    const captureCells = captureMetadata || captureGlyphs;
     const lines = captureMetadata ? [] : null;
-    const grid = captureMetadata ? [] : null;
+    const grid = captureCells ? [] : null;
     const needLine = captureMetadata || colorMode === 'mono';
     for (let cy = 0; cy < rows; cy++) {
       let line = needLine ? '' : null;
-      const grow = captureMetadata ? [] : null;
+      const grow = captureCells ? [] : null;
       for (let cx = 0; cx < cols; cx++) {
         let mask = 0;
         let rs = 0, gs = 0, bs = 0, n = 0;
@@ -848,12 +1207,10 @@ export class AsciiRenderer {
             ctx.fillText(ch, cx * cellW, cy * cellH);
           }
         }
-        if (captureMetadata) grow.push([ch, cellFg, cellBg]);
+        if (captureCells) grow.push([ch, cellFg, cellBg]);
       }
-      if (captureMetadata) {
-        lines.push(line);
-        grid.push(grow);
-      }
+      if (captureMetadata) lines.push(line);
+      if (captureCells) grid.push(grow);
       if (colorMode === 'mono') {
         ctx.fillStyle = fg;
         if (this.lastUniform) {

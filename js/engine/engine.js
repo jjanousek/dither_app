@@ -44,12 +44,26 @@ export function getAlgorithm(id) {
 // like the crisp path; that is the intended "fine print" behaviour.
 const SS_SOURCE_BUDGET = 5_000_000;
 
+// Dense ASCII can contain hundreds of thousands of independently sampled
+// Gravity bodies. Keep the interactive editor bounded by reducing the whole
+// glyph grid proportionally; offline/export renders deliberately retain the
+// requested grid so output quality is unchanged.
+// WKWebView pays the cost of thousands of independent sprite composites even
+// when pose sampling itself is cheap. A 12k preview grid keeps fitted glyphs
+// visibly character-sized and leaves full-resolution still/video/HTML exports
+// untouched.
+export const MAX_LIVE_GRAVITY_CELLS = 12_000;
+
 export class Engine {
   constructor() {
     this.work = document.createElement('canvas');
     this.workCtx = this.work.getContext('2d', { willReadFrequently: true });
     this.glCanvas = document.createElement('canvas');
     this.gl = createGL(this.glCanvas);
+    // Increments whenever the backing WebGL surface is lost or restored.
+    // Consumers retaining a rendered canvas can use this to reject pixels
+    // whose GPU storage no longer belongs to the current context lifetime.
+    this.glGeneration = 0;
     this.ascii = new AsciiRenderer();
     this.matrixTextures = {};
     if (this.gl) this.#initGL();
@@ -65,6 +79,8 @@ export class Engine {
     this._allowAsync = false; // per-render flag; only true for the live path
     this._detailRequest = null;
     this.lastAsciiGridInfo = null;
+    this._gravityBaseSource = null;
+    this._gravityBaseKey = '';
   }
 
   /**
@@ -131,9 +147,11 @@ export class Engine {
       this.glCanvas.addEventListener('webglcontextlost', (e) => {
         e.preventDefault(); // allow restoration
         this.glLost = true;
+        this.glGeneration++;
       });
       this.glCanvas.addEventListener('webglcontextrestored', () => {
         this.glLost = false;
+        this.glGeneration++;
         this.#initGL(); // recompile program, re-upload threshold textures
       });
     }
@@ -271,6 +289,7 @@ export class Engine {
         asciiGridInfo: this.lastAsciiGridInfo,
       });
     }
+    if (this._gravityBaseSource) this.#clearGravityBase();
     if (p.mode !== 'dither') {
       const canvas = this.#renderCells(source, srcW, srcH, p, maxPixels);
       if (!this._detailRequest) return canvas;
@@ -862,6 +881,9 @@ export class Engine {
     const DENSITY = { ramp: [1, 1], shape: [8, 8], quadrant: [2, 2], braille: [2, 4] };
     const [dx, dy] = DENSITY[renderer] || DENSITY.ramp;
     const MEASURE = { ramp: a.chars, shape: 'M', quadrant: '█', braille: '⣿' };
+    const gravityActive = p.staticSource
+      && p.anim?.style === 'gravity'
+      && a.colorMode !== 'bg';
 
     const cellH = a.cellSize;
     const font = fontSpec(a);
@@ -873,6 +895,18 @@ export class Engine {
       const k = Math.sqrt(maxPixels / (cols * dx * rows * dy));
       cols = Math.max(1, Math.floor(cols * k));
       rows = Math.max(1, Math.floor(rows * k));
+    }
+    if (p.liveRender && gravityActive && cols * rows > MAX_LIVE_GRAVITY_CELLS) {
+      const k = Math.sqrt(MAX_LIVE_GRAVITY_CELLS / (cols * rows));
+      cols = Math.max(1, Math.floor(cols * k));
+      rows = Math.max(1, Math.floor(rows * k));
+      // Very thin panoramas can pin one dimension at one cell, so the square-
+      // root reduction alone may remain over budget. Trim the long dimension
+      // without cropping the sampled source.
+      if (cols * rows > MAX_LIVE_GRAVITY_CELLS) {
+        if (cols >= rows) cols = Math.max(1, Math.floor(MAX_LIVE_GRAVITY_CELLS / rows));
+        else rows = Math.max(1, Math.floor(MAX_LIVE_GRAVITY_CELLS / cols));
+      }
     }
     const w = cols * dx;
     const h = rows * dy;
@@ -901,6 +935,45 @@ export class Engine {
       if (k < 1) renderCellH = Math.max(1, Math.floor(renderCellH * k));
     }
 
+    const gravityCacheable = gravityActive && a.captureMetadata === false;
+    const gravityBaseKey = gravityCacheable ? JSON.stringify([
+      srcW, srcH, cols, rows, w, h, renderCellH,
+      renderer, a.chars, font.family, font.bold,
+      a.colorMode, a.fg, a.bg, a.invertRamp,
+      a.dither || 'none', a.dotThreshold ?? 0.5,
+      a.edgeStrength || (a.edges ? 0.5 : 0), a.autoContrast !== false,
+      a.shapeSet || 'ascii',
+      p.brightness, p.contrast, p.gamma, p.saturation,
+      p.grayscale, p.invert, p.hue, p.sepia, p.blur,
+    ]) : '';
+
+    // A still-image Gravity tick changes only body poses. Reuse the immutable
+    // sampled glyph grid instead of resampling the image and rebuilding every
+    // ASCII cell on every animation frame.
+    if (gravityCacheable
+        && this._gravityBaseSource === source
+        && this._gravityBaseKey === gravityBaseKey
+        && this.ascii.lastGlyphFrame) {
+      const canvas = this.ascii.renderGravity({
+        phase: p.animPhase || 0,
+        intensity: p.anim.intensity,
+        mode: p.anim.gravityMode,
+        preview: !!p.liveRender,
+        font,
+        bg: a.bg,
+        cols,
+        rows,
+      });
+      this.lastAsciiGridInfo = {
+        cols,
+        rows,
+        rasterWidth: canvas.width,
+        rasterHeight: canvas.height,
+      };
+      return canvas;
+    }
+    if (!gravityCacheable && this._gravityBaseSource) this.#clearGravityBase();
+
     this.#drawWork(source, w, h, p);
     const img = this.workCtx.getImageData(0, 0, w, h);
     applyAdjustments(img, {
@@ -910,7 +983,7 @@ export class Engine {
       saturation: p.grayscale ? 0 : p.saturation,
       invert: p.invert,
     });
-    const canvas = this.ascii.render(img, {
+    let canvas = this.ascii.render(img, {
       renderer,
       chars: a.chars,
       cellSize: renderCellH,
@@ -925,7 +998,24 @@ export class Engine {
       autoContrast: a.autoContrast !== false,
       shapeSet: a.shapeSet || 'ascii',
       captureMetadata: a.captureMetadata !== false,
+      captureGlyphs: gravityActive,
     });
+    if (gravityActive) {
+      if (gravityCacheable) {
+        this._gravityBaseSource = source;
+        this._gravityBaseKey = gravityBaseKey;
+      }
+      canvas = this.ascii.renderGravity({
+        phase: p.animPhase || 0,
+        intensity: p.anim.intensity,
+        mode: p.anim.gravityMode,
+        preview: !!p.liveRender,
+        font,
+        bg: a.bg,
+        cols,
+        rows,
+      });
+    }
     // Export adapters need the raster/grid relationship even when they use
     // the synchronous legacy render API. This four-number descriptor is
     // independent of AsciiRenderer's optional text/grid metadata capture.
@@ -936,6 +1026,12 @@ export class Engine {
       rasterHeight: canvas.height,
     };
     return canvas;
+  }
+
+  #clearGravityBase() {
+    this._gravityBaseSource = null;
+    this._gravityBaseKey = '';
+    this.ascii.clearGravity();
   }
 
   #renderCells(source, srcW, srcH, p, maxPixels = Infinity) {

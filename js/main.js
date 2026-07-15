@@ -5,10 +5,17 @@ import { Engine, getAlgorithm } from './engine/engine.js';
 import { createState, applyParams, resetState, DEFAULTS } from './state.js';
 import { getPalette } from './palettes.js';
 import { RAMPS, FONTS } from './engine/ascii.js';
-import { applyPostFX, estimatePostFXBytes, releasePostFXBuffers } from './effects/postfx.js';
+import {
+  applyPostFX,
+  constrainPostFXDimensions,
+  estimatePostFXBytes,
+  postFXActive,
+  releasePostFXBuffers,
+  trimPostFXBuffers,
+} from './effects/postfx.js';
 import { PRESETS, shuffleParams } from './presets.js';
 import { loadFile, openWebcam, demoImage, demoPhoto, bindDropAndPaste } from './sources.js';
-import { exportText, buildAnsi, buildHtml, VideoExporter, exportGIF, downloadBlob, canFrameExport, exportVideoFrameAccurate, exportLoopFrameAccurate } from './export/exporters.js';
+import { exportText, buildAnsi, buildHtml, buildGravityHtml, MAX_INTERACTIVE_GRAVITY_BODIES, VideoExporter, exportGIF, downloadBlob, canFrameExport, exportVideoFrameAccurate, exportLoopFrameAccurate } from './export/exporters.js';
 import { buildPanel, buildPresetStrip, clearActivePreset, toast } from './ui.js';
 import {
   createExportSettings,
@@ -39,6 +46,14 @@ import { MaskCompositor } from './mask/compositor.js';
 import { MaskEditor } from './mask/tools.js';
 import { syncRangeProgress } from './range-progress.js';
 import {
+  advanceAnimationPhase,
+  gravityAnimationSupported,
+  oneShotExportPhase,
+  postFXOnlyAnimation,
+} from './animation-policy.js';
+import { gravityDurationSeconds } from './effects/ascii-gravity.js';
+import { isFlutedGlassSupported } from './effects/fluted-glass.js';
+import {
   FrameBundleManager,
   MAX_MASK_PREVIEW_AREA,
   MAX_MASK_PREVIEW_SIDE,
@@ -58,6 +73,7 @@ const MAX_EXPORT_AREA = 64_000_000;
 const MAX_MASKED_EXPORT_AREA = 12_000_000;
 const MAX_MASKED_EXPORT_SIDE = 8_192;
 const MAX_MASKED_EXPORT_WORKING_BYTES = 512 * 1024 * 1024;
+const MAX_UNMASKED_POSTFX_WORKING_BYTES = 384 * 1024 * 1024;
 // Final exports retain their full target policy. Live masked motion is a much
 // heavier pipeline (raw copy + processed copy + mask blend), so use a stable
 // 720p-class target and a 540p-class editing target instead of rebuilding five
@@ -113,6 +129,7 @@ let maskPrimeGeneration = 0;
 let maskPrimeGuard = null;
 let activeExportMaskRasterizer = null;
 let activeMaskedVideoPlan = null;
+let activePostFXVideoPlan = null;
 let effectRenderMs = 0;
 let bundleBuildMs = 0;
 let maskCompositeMs = 0;
@@ -162,14 +179,25 @@ const HAS_RVFC = typeof HTMLVideoElement !== 'undefined'
 let cpuResultReady = false;
 engine.onCpuResult = () => { cpuResultReady = true; };
 
-// animation clock: phase in 0..1, wraps once per cycle
+// Animation clock: looping styles wrap at 1; Gravity clamps at 1 and waits for
+// an explicit replay. The selected/supported check stays separate from whether
+// the one-shot is currently ticking so exports remain available at its end.
 let animPhase = 0;
 let phaseOverride = null;    // exporters pin the effect-animation phase
 let genPhaseOverride = null; // exporters pin the generative-scene phase
 let lastLoopT = 0;
+const gravitySupported = () => gravityAnimationSupported({
+  mode: state.mode,
+  sourceType: source?.type,
+  colorMode: state.ascii.colorMode,
+});
+const isOneShotAnimation = () => state.anim.style === 'gravity' && gravitySupported();
 const isAnimating = () => {
   const s = state.anim.style;
   if (s === 'none') return false;
+  if (postFXOnlyAnimation(s) && (+state.anim.intensity || 0) <= 0) return false;
+  if (s === 'fluted' && !isFlutedGlassSupported()) return false;
+  if (s === 'gravity') return gravitySupported();
   if (s === 'flow' || s === 'shimmer') {
     // these drift the pattern of ordered/noise/halftone dithers; on every
     // other mode/algorithm they are no-ops — don't burn a core on them
@@ -178,6 +206,14 @@ const isAnimating = () => {
   }
   return true;
 };
+const isAnimationTicking = () => isAnimating()
+  && (!isOneShotAnimation() || animPhase < 1);
+
+function restartAnimation() {
+  animPhase = 0;
+  phaseOverride = null;
+  dirty = true;
+}
 
 // generative scene source (lazy — created on first Generate click)
 let gen = null;
@@ -192,9 +228,63 @@ function currentGrainPhase() {
   return source?.type === 'image' ? 0 : null;
 }
 
+function requestedAnimationPostFXOptions(animation = state.anim, phase = phaseOverride ?? animPhase) {
+  return {
+    animationStyle: animation?.style || 'none',
+    animationPhase: Number.isFinite(phase) ? phase : 0,
+    animationIntensity: Math.min(1, Math.max(0, Number(animation?.intensity) || 0)),
+  };
+}
+
+function animationPostFXOptions(animation = state.anim, phase = phaseOverride ?? animPhase) {
+  const options = requestedAnimationPostFXOptions(animation, phase);
+  // Treat an unavailable/lost WebGL2 context as a real no-op throughout
+  // rendering, memory planning, and export policy. The renderer still has a
+  // defensive fallback for a context race after this check.
+  if (options.animationStyle === 'fluted'
+      && options.animationIntensity > 0
+      && !isFlutedGlassSupported()) {
+    options.animationIntensity = 0;
+  }
+  return options;
+}
+
+function currentPostFXActive() {
+  return postFXActive(state.fx, animationPostFXOptions());
+}
+
+function trimInactivePostFXBuffers() {
+  // Resource retention follows the requested setting, not temporary support.
+  // A lost context owns no usable GPU allocation, but its canvas listener must
+  // remain alive so WebGL can restore automatically.
+  trimPostFXBuffers(state.fx, requestedAnimationPostFXOptions());
+}
+
 // reusable upscale canvas for post-FX over pixelated results
 const upCanvas = document.createElement('canvas');
 const upCtx = upCanvas.getContext('2d');
+
+// Borrow the Engine's last live result between source-frame changes. Optical
+// and graphic Post-FX animations can repaint their phase without re-running
+// dither/ASCII work on a still or between decoded video frames.
+// Generation fields prevent a retained Engine scratch canvas from being used
+// after the source or effect settings change.
+let liveProcessedCache = null;
+
+function liveProcessedCacheValid() {
+  return !!liveProcessedCache
+    && liveProcessedCache.sourceEpoch === sourceEpoch
+    && liveProcessedCache.effectRevision === effectRevision
+    && liveProcessedCache.frameId === frameId
+    && liveProcessedCache.glGeneration === engine.glGeneration
+    && liveProcessedCache.cpuCommitGeneration === (engine.cpu?.commitGeneration || 0)
+    && liveProcessedCache.canvas?.width > 0
+    && liveProcessedCache.canvas?.height > 0;
+}
+
+function livePostFXSourceKey() {
+  return `${sourceEpoch}:${effectRevision}:${frameId}:${engine.glGeneration}:${engine.cpu?.commitGeneration || 0}`;
+}
 
 // ---------------------------------------------------------------------------
 // viewport (zoom / pan / split)
@@ -304,7 +394,7 @@ function fastPreviewEligible(renderedResult = null) {
   if (exporting || maskPriming || !['video', 'webcam'].includes(source?.type)) return false;
   if (!(source.el instanceof HTMLVideoElement)) return false;
   if (state.mode !== 'dither' || getAlgorithm(state.algorithm).type !== 'gpu') return false;
-  return !Object.values(state.fx).some((value) => +value > 0);
+  return !currentPostFXActive();
 }
 
 function hideFastMaskPreview({ release = true } = {}) {
@@ -613,9 +703,32 @@ function setOutputSize(width, height) {
 
 function presentMaskedBundle(bundle = frameBundles.current) {
   if (!bundle) return false;
+  if (bundle.token?.sourceEpoch !== sourceEpoch
+      || bundle.token?.effectRevision !== effectRevision) {
+    return false;
+  }
   hideFastMaskPreview();
   const started = performance.now();
   const uniform = maskDraft ? null : maskUniformCoverage();
+  let processedTarget = bundle.processedTarget;
+  // An all-original mask cannot expose the processed side. Resolve that cheap
+  // case before running a full-frame animated Post-FX repaint that would be
+  // discarded immediately below.
+  if (uniform !== 0 && bundle.postFXPlan?.defer) {
+    processedTarget = applyPostFX(bundle.processedTarget, bundle.postFXPlan.fx, {
+      ...bundle.postFXPlan.options,
+      grainPhase: currentGrainPhase() ?? bundle.grainPhase,
+      ...animationPostFXOptions(),
+    });
+    if (processedTarget.width !== bundle.targetWidth
+        || processedTarget.height !== bundle.targetHeight) {
+      console.warn('Skipping deferred Post-FX bundle with changed dimensions', {
+        target: [bundle.targetWidth, bundle.targetHeight],
+        processed: [processedTarget.width, processedTarget.height],
+      });
+      return false;
+    }
+  }
   if (uniform !== 0 && uniform !== 1) {
     try {
       prepareMaskedPreviewMemory({ width: bundle.targetWidth, height: bundle.targetHeight }, {
@@ -638,7 +751,7 @@ function presentMaskedBundle(bundle = frameBundles.current) {
     octx.save();
     try {
       octx.globalCompositeOperation = 'copy';
-      octx.drawImage(bundle.processedTarget, 0, 0, out.width, out.height);
+      octx.drawImage(processedTarget, 0, 0, out.width, out.height);
     } finally {
       octx.restore();
     }
@@ -660,15 +773,15 @@ function presentMaskedBundle(bundle = frameBundles.current) {
         effectCoverage = maskRasterizer.rasterFor(maskRasterRequest(bundle));
       }
     }
-    if (bundle.processedTarget.width !== bundle.targetWidth
-        || bundle.processedTarget.height !== bundle.targetHeight
+    if (processedTarget.width !== bundle.targetWidth
+        || processedTarget.height !== bundle.targetHeight
         || bundle.rawTarget.width !== bundle.targetWidth
         || bundle.rawTarget.height !== bundle.targetHeight
-        || effectCoverage.width !== bundle.processedTarget.width
-        || effectCoverage.height !== bundle.processedTarget.height) {
+        || effectCoverage.width !== processedTarget.width
+        || effectCoverage.height !== processedTarget.height) {
       console.warn('Skipping inconsistent masked bundle', {
         target: [bundle.targetWidth, bundle.targetHeight],
-        processed: [bundle.processedTarget.width, bundle.processedTarget.height],
+        processed: [processedTarget.width, processedTarget.height],
         raw: [bundle.rawTarget.width, bundle.rawTarget.height],
         mask: [effectCoverage.width, effectCoverage.height],
         draft: !!maskDraft,
@@ -676,7 +789,7 @@ function presentMaskedBundle(bundle = frameBundles.current) {
       return false;
     }
     maskCompositor.compose({
-      processed: bundle.processedTarget,
+      processed: processedTarget,
       raw: bundle.rawTarget,
       effectCoverage,
       destination: out,
@@ -912,7 +1025,12 @@ function maskedPreviewAreaLimit() {
       ? MAX_MASKED_EDIT_AREA
       : MAX_MASKED_MOTION_AREA;
   }
-  const fxOn = Object.values(state.fx).some((value) => +value > 0);
+  // A live still-image mask may hold the paired raw/processed frames, editor
+  // overlay, draft selections, compositor scratch, and the WebGL refraction
+  // stage at once. Start Fluted below the general FX ceiling so beginning a
+  // brush stroke cannot push the preview over its 96 MiB ownership budget.
+  if (state.anim.style === 'fluted' && isAnimating()) return 850_000;
+  const fxOn = currentPostFXActive();
   return fxOn || maskDraft ? 1_600_000 : MAX_MASK_PREVIEW_AREA;
 }
 
@@ -955,7 +1073,10 @@ function prepareMaskedPreviewMemory(targetPlan, {
     draftBytes: liveDraftBytes + draftCanvasBytes,
     transientRasterBytes,
     compositorBytes: maskCompositor.estimateScratchBytes(width, height),
-    postFXBytes: estimatePostFXBytes(width, height, state.fx, { fast: true }),
+    postFXBytes: estimatePostFXBytes(width, height, state.fx, {
+      fast: true,
+      ...animationPostFXOptions(),
+    }),
     // Engine work/result surfaces are borrowed, but still resident while the
     // owned bundle is built. Count both conservatively at their actual size.
     otherBytes: Math.max(0, processedBytes) * 2,
@@ -972,7 +1093,10 @@ function prepareMaskedPreviewMemory(targetPlan, {
     draftBytes: liveDraftBytes + draftCanvasBytes,
     transientRasterBytes,
     compositorBytes: maskCompositor.estimateScratchBytes(width, height),
-    postFXBytes: estimatePostFXBytes(width, height, state.fx, { fast: true }),
+    postFXBytes: estimatePostFXBytes(width, height, state.fx, {
+      fast: true,
+      ...animationPostFXOptions(),
+    }),
     otherBytes: Math.max(0, processedBytes) * 2,
     previewByteLimit: MAX_MASK_SUBSYSTEM_PREVIEW_BYTES,
   });
@@ -1023,9 +1147,16 @@ function maskedToken(descriptor, targetPlan, acceptedFrameId = frameId) {
 function maskedPostFXPlan(token, sourceHeight, fast = true) {
   return {
     fx: { ...state.fx },
-    grainPhase: currentGrainPhase() ?? grainPhaseForFrame(token.frameId),
-    refH: sourceHeight,
-    fast,
+    // Retain the owned pre-FX branch so each graphics/refraction phase can be
+    // repainted without rebuilding the dither/ASCII result.
+    defer: isAnimating() && postFXOnlyAnimation(state.anim.style),
+    options: {
+      grainPhase: currentGrainPhase() ?? grainPhaseForFrame(token.frameId),
+      refH: sourceHeight,
+      fast,
+      sourceKey: `mask:${token.sourceEpoch}:${token.effectRevision}:${token.frameId}:${token.targetRevision}`,
+      ...animationPostFXOptions(),
+    },
   };
 }
 
@@ -1133,6 +1264,9 @@ function resolveLiveRenderBudget() {
   const inherentlyMoving = source?.type === 'webcam'
     || source?.type === 'gen'
     || source?.type === 'animated-image';
+  // Keep the preview budget stable for the entire selected animation. A
+  // one-shot may stop ticking at phase 1, but changing its render dimensions
+  // at that endpoint would make replay visibly jump in size and sharpness.
   const moving = videoMoving || inherentlyMoving || isAnimating();
   if (moving && cpuDither) budget = liveCpuDitherBudget(state.pixelSize);
   else if (moving && heavyAscii) budget = MAX_LIVE_CPU_PIXELS;
@@ -1258,12 +1392,18 @@ function renderOnce(budgetOverride = null, contentNew = true, noFx = false, capt
   contentNew = options.contentNew ?? true;
   noFx = !!options.noFx;
   captureMetadata = !!options.captureMetadata;
+  const skipPresent = !!options.skipPresent;
+  const includeAnimation = options.includeAnimation !== false;
   const processedOnly = !!options.processedOnly || noFx || captureMetadata;
   const offline = options.offline ?? explicitBudget !== null;
   const [w, h] = srcDims();
   if (!w || !h) return out;
   if (source.type === 'gen') source.gen.tick(genPhaseOverride ?? source.gen.phase);
   const p = derived(captureMetadata);
+  if (!includeAnimation) {
+    p.anim = { ...p.anim, style: 'none' };
+    p.animPhase = 0;
+  }
   // Preview work is bounded for every source, including large still images.
   // Exports pass an explicit budget and remain full quality. At fit-to-window
   // sizes 0.42MP already exceeds the editor viewport; GPU dithers get 2.25MP
@@ -1314,7 +1454,7 @@ function renderOnce(budgetOverride = null, contentNew = true, noFx = false, capt
   const renderStarted = performance.now();
   const result = engine.render(source.el, w, h, p, renderBudget, allowAsync, contentNew);
   effectRenderMs = performance.now() - renderStarted;
-  if (result) present(result, w, offline, noFx);
+  if (result && !skipPresent) present(result, w, offline, noFx);
   return out;
 }
 
@@ -1325,15 +1465,37 @@ function renderOnce(budgetOverride = null, contentNew = true, noFx = false, capt
 // recording.
 // noFx = present the raw render without the post-FX stack (the GIF exporter
 // applies fx itself, AFTER decimation, at the GIF's own resolution).
-function present(result, srcW, offline = false, noFx = false) {
+function present(
+  result,
+  srcW,
+  offline = false,
+  noFx = false,
+  boxResolved = engine.lastBoxResolved,
+  reusePostFXInput = false,
+) {
   hideFastMaskPreview();
-  const fxOn = !noFx && Object.values(state.fx).some((v) => v > 0);
+  if (!offline && !noFx && !reusePostFXInput) {
+    liveProcessedCache = {
+      canvas: result,
+      sourceWidth: srcW,
+      sourceEpoch,
+      effectRevision,
+      frameId,
+      glGeneration: engine.glGeneration,
+      cpuCommitGeneration: engine.cpu?.commitGeneration || 0,
+      boxResolved,
+    };
+  }
+  const fxOn = !noFx && currentPostFXActive();
   let final = result;
   if (fxOn) {
     // applied/ideal upscale ratio — compensates refH when the budget forces a
     // smaller fx canvas, so grain/chromatic/glow geometry stays proportional
     let fxScaleRatio = 1;
-    if (state.mode === 'dither') {
+    if (reusePostFXInput && liveProcessedCache?.postFXInput?.width > 0) {
+      final = liveProcessedCache.postFXInput;
+      fxScaleRatio = liveProcessedCache.fxScaleRatio ?? 1;
+    } else if (state.mode === 'dither') {
       // upscale first so scanlines/grain/vignette are crisp over the pixels
       const idealScale = Math.min(2, Math.max(1, srcW / result.width));
       let scale = idealScale;
@@ -1358,12 +1520,18 @@ function present(result, srcW, offline = false, noFx = false) {
         final = upCanvas;
       }
     }
+    if (!offline && !noFx && postFXOnlyAnimation(state.anim.style)) {
+      liveProcessedCache.postFXInput = final;
+      liveProcessedCache.fxScaleRatio = fxScaleRatio;
+    }
     // refH scaled by the forgone upscale keeps the capped live rendition's
     // fx geometry proportionally identical to the uncapped export (N36)
     final = applyPostFX(final, state.fx, {
       grainPhase: currentGrainPhase(),
       refH: (srcDims()[1] || final.height) * fxScaleRatio,
       fast: !offline,
+      ...(offline ? {} : { sourceKey: livePostFXSourceKey() }),
+      ...animationPostFXOptions(),
     });
   }
   let resized = false;
@@ -1381,7 +1549,7 @@ function present(result, srcW, offline = false, noFx = false) {
   // (tone) result should scale smoothly. Use the engine's ACTUAL last-frame
   // state so a CPU algorithm, WebGL loss, or governor ss->1 (all crisp) keep
   // nearest-neighbour even while state.smoothness > 0.
-  const pixelate = state.mode === 'dither' && !engine.lastBoxResolved;
+  const pixelate = state.mode === 'dither' && !boxResolved;
   out.classList.toggle('pixelated', pixelate);
   if (resized) view.contentResized();
   if (resized) {
@@ -1391,6 +1559,23 @@ function present(result, srcW, offline = false, noFx = false) {
   // not during exports: out is at export resolution and the overlay is hidden
   // behind the busy screen anyway
   if (view.splitOn && !view.splitSuppressed && !comparing && !exporting) drawSplitOverlay();
+}
+
+function presentPostFXRepaint() {
+  if (maskIsActive()) {
+    return !!frameBundles.current?.postFXPlan?.defer
+      && presentMaskedBundle(frameBundles.current);
+  }
+  if (!liveProcessedCacheValid()) return false;
+  present(
+    liveProcessedCache.canvas,
+    liveProcessedCache.sourceWidth,
+    false,
+    false,
+    liveProcessedCache.boxResolved,
+    true,
+  );
+  return true;
 }
 
 function presentOriginal() {
@@ -1500,11 +1685,26 @@ function loop(t) {
   lastLoopT = t;
   // recordings must track wall time even when rAF is throttled; otherwise
   // swallow the jump after a long gap (window was hidden)
-  const dt = exporting ? Math.min(1000, rawDt) : (rawDt > 250 ? 0 : rawDt);
+  // Looping effects swallow a long foreground/background jump so they do not
+  // visibly skip. Gravity is a one-shot transition, though: if a dense frame
+  // itself takes >250ms, treating that elapsed time as zero can freeze it at
+  // one phase forever. Let it continue on wall time, capped to a 1s jump.
+  const dt = (exporting || isOneShotAnimation())
+    ? Math.min(1000, rawDt)
+    : (rawDt > 250 ? 0 : rawDt);
 
   // advance the animation clock (paused while an exporter pins the phase)
-  const animating = isAnimating() && phaseOverride === null;
-  if (animating) animPhase = (animPhase + (dt / 1000) * state.anim.speed * 0.15) % 1;
+  const animating = isAnimationTicking() && phaseOverride === null;
+  if (animating) {
+    const phaseStep = isOneShotAnimation()
+      ? (dt / 1000) / gravityDurationSeconds(state.anim.speed, state.anim.gravityMode)
+      : (dt / 1000) * state.anim.speed * 0.15;
+    animPhase = advanceAnimationPhase(
+      animPhase,
+      phaseStep,
+      { oneShot: isOneShotAnimation() },
+    );
+  }
 
   if (source.type === 'gen' && genPhaseOverride === null) {
     source.gen.phase = (source.gen.phase + (dt / 1000) * source.gen.params.speed * GEN_CYCLES_PER_SEC) % 1;
@@ -1516,18 +1716,21 @@ function loop(t) {
       ? (!source.el.paused && !source.el.ended)
       : true); // webcam-less live sources (generated scenes) always play
   // Only re-dither a video/webcam when a new frame actually decoded (rVFC);
-  // generative scenes change every tick so they always render. An active
-  // animation also changes the output every tick, so it forces a render.
+  // generative scenes change every tick so they always render. Post-FX-only
+  // animations repaint the last owned/borrowed processed frame between source
+  // changes rather than forcing Engine work.
   const videoWork = isVideoEl ? (playing && (!HAS_RVFC || videoFrameReady)) : playing;
+  const postFXTick = animating && postFXOnlyAnimation(state.anim.style);
   // Genuinely-new content vs a worker-completion wake-up. Only real content
   // dispatches a new dither; a wake-up just presents the finished result.
-  const contentNew = dirty || videoWork || animating;
+  const contentNew = dirty || videoWork || (animating && !postFXTick);
+  const postFXRepaint = postFXTick && !contentNew;
   // During an export the exporter drives its own synchronous renders; a stale
   // pre-export worker reply must not repaint `out` mid-frame. (recordCanvas
   // exports still render via contentNew from playing/animating.)
   if (exporting) cpuResultReady = false;
   const cpuWake = cpuResultReady;
-  if (!contentNew && !cpuWake && !maskDirty) return;
+  if (!contentNew && !cpuWake && !maskDirty && !postFXRepaint) return;
   cpuResultReady = false;
   videoFrameReady = false;
   dirty = false;
@@ -1538,6 +1741,10 @@ function loop(t) {
     presentFastMaskPreview();
   } else if (maskDirty && !contentNew && !cpuWake && frameBundles.current) {
     presentMaskedBundle();
+  } else if (postFXRepaint && !cpuWake) {
+    // A cache miss only happens during initial/invalidated priming. Pay for
+    // one real render, then subsequent phases remain Post-FX-only.
+    if (!presentPostFXRepaint()) renderOnce(null, true);
   } else {
     // Safari may suspend performance.now() while an app window is occluded;
     // Date.now() keeps the requested recording length tied to real wall time.
@@ -1558,7 +1765,7 @@ function loop(t) {
     }
   }
 
-  if (shouldSamplePlaybackCadence(playing, animating, contentNew)) {
+  if (shouldSamplePlaybackCadence(playing, animating, contentNew || postFXRepaint)) {
     if (lastFrameT) {
       const fdt = t - lastFrameT;
       fpsEma = fpsEma ? fpsEma * 0.9 + fdt * 0.1 : fdt;
@@ -1678,6 +1885,8 @@ function restoreSnapshot(snap, {
   const parsed = JSON.parse(snap);
   resetState(state);
   applyParams(state, parsed.s || parsed);
+  if (state.anim.style !== 'none') restartAnimation();
+  trimInactivePostFXBuffers();
   restoreExportSettings(exportSettings, parsed.x);
   if (Number.isSafeInteger(parsed.m) && maskStore.has(parsed.m)) maskRevisionId = parsed.m;
   if (parsed.g?.sourceEpoch === sourceEpoch && parsed.g.params && source?.type === 'gen') {
@@ -1800,7 +2009,11 @@ async function renderPresetThumbs() {
       const thumbParams = deriveParams(base);
       thumbParams.ascii.captureMetadata = false;
       const result = thumbEngine.render(snap, TW, TH, thumbParams, Infinity);
-      const final = applyPostFX(result, base.fx, { grainPhase: 0, refH: TH });
+      const final = applyPostFX(result, base.fx, {
+        grainPhase: 0,
+        refH: TH,
+        ...animationPostFXOptions(base.anim, 0),
+      });
       const tctx = target.getContext('2d');
       tctx.imageSmoothingEnabled = false;
       tctx.fillStyle = '#000';
@@ -1849,6 +2062,8 @@ function setSource(next) {
   const keptMask = maskIsActive();
   disposeSource(source);
   source = next;
+  liveProcessedCache = null;
+  if (state.anim.style !== 'none') restartAnimation();
   sourceEpoch++;
   frameId = 0;
   effectRevision++;
@@ -1976,7 +2191,8 @@ function updateExportButtons() {
   $('btn-export-video').hidden = !(frameAccurate || canRecord)
     || !(isVideo || isWebcam || isAnimatedImage || animatedStill || isGen);
   // a static image would make a pointless single-frame "animated" GIF
-  $('btn-export-gif').hidden = !(isVideo || isWebcam || isAnimatedImage || isGen || animatedStill);
+  $('btn-export-gif').hidden = isOneShotAnimation()
+    || !(isVideo || isWebcam || isAnimatedImage || isGen || animatedStill);
   $('btn-export-txt').hidden = state.mode !== 'ascii';
   const textDescriptor = textExportDescriptor(exportSettings.txtFormat);
   $('btn-export-txt').textContent = textDescriptor.label;
@@ -2057,6 +2273,7 @@ function unlockMaskAfterExport() {
   activeExportMaskRasterizer?.releaseAll();
   activeExportMaskRasterizer = null;
   activeMaskedVideoPlan = null;
+  activePostFXVideoPlan = null;
   frameBundles.unlockTarget();
   maskEditor.setLocked(false);
   overlayDirty = true;
@@ -2113,7 +2330,7 @@ function renderProcessedForExport(budget, {
   if (!result) throw new Error('renderer produced no frame');
   if (result.width > maxOutputSide || result.height > maxOutputSide
       || result.width * result.height > maxOutputPixels) {
-    throw new Error(`renderer exceeded masked export bounds at ${result.width}×${result.height}`);
+    throw new Error(`renderer exceeded export bounds at ${result.width}×${result.height}`);
   }
   return {
     canvas: result,
@@ -2133,7 +2350,10 @@ function maskedPreviewResidentBytes() {
     ? maskCompositor.estimateScratchBytes(target.width, target.height)
     : 0;
   const postFXBytes = target
-    ? estimatePostFXBytes(target.width, target.height, state.fx, { fast: true })
+    ? estimatePostFXBytes(target.width, target.height, state.fx, {
+      fast: true,
+      ...animationPostFXOptions(),
+    })
     : 0;
   return bundleBytes + inFlightBytes + canvasBackingBytes(out) + overlayBytes
     + maskRasterizer.cacheBytes + compositorBytes + postFXBytes;
@@ -2143,25 +2363,49 @@ function capMaskedDimensions(width, height, {
   reserveBytes = 0,
   surfaceCount = 16,
   label = 'export',
+  memoryLabel = 'masked memory limit',
+  estimateWorkingBytes = null,
 } = {}) {
   const remainingBytes = Math.max(
     1,
     MAX_MASKED_EXPORT_WORKING_BYTES - reserveBytes - maskedPreviewResidentBytes(),
   );
-  const byteArea = Math.max(1, Math.floor(remainingBytes / (surfaceCount * 4)));
-  const area = Math.min(MAX_MASKED_EXPORT_AREA, byteArea);
-  const scale = Math.min(
+  let scale = Math.min(
     1,
     MAX_MASKED_EXPORT_SIDE / width,
     MAX_MASKED_EXPORT_SIDE / height,
-    Math.sqrt(area / (width * height)),
+    Math.sqrt(MAX_MASKED_EXPORT_AREA / (width * height)),
   );
+  const workingBytes = estimateWorkingBytes
+    || ((candidateWidth, candidateHeight) => candidateWidth * candidateHeight * surfaceCount * 4);
+  const dimensionsAt = (candidateScale) => ({
+    width: Math.max(1, Math.floor(width * candidateScale)),
+    height: Math.max(1, Math.floor(height * candidateScale)),
+  });
+  if (workingBytes(1, 1) > remainingBytes) {
+    throw new Error(`${label} exceeds the available export memory`);
+  }
+  const initial = dimensionsAt(scale);
+  if (workingBytes(initial.width, initial.height) > remainingBytes) {
+    let low = 0;
+    let high = scale;
+    // The active Post-FX estimator includes rounded scratch/tile sizes, so a
+    // byte-based binary search is more accurate than assuming a fixed number
+    // of full-resolution surfaces.
+    for (let i = 0; i < 24; i++) {
+      const mid = (low + high) / 2;
+      const candidate = dimensionsAt(mid);
+      if (workingBytes(candidate.width, candidate.height) <= remainingBytes) low = mid;
+      else high = mid;
+    }
+    scale = low;
+  }
   const capped = {
     width: Math.max(1, Math.floor(width * scale)),
     height: Math.max(1, Math.floor(height * scale)),
     capped: scale < 1,
   };
-  if (capped.capped) toast(`${label} capped to ${capped.width}×${capped.height} (masked memory limit)`);
+  if (capped.capped) toast(`${label} capped to ${capped.width}×${capped.height} (${memoryLabel})`);
   return capped;
 }
 
@@ -2177,7 +2421,7 @@ function crispExportTarget(descriptor, capped, { even = false } = {}) {
     };
   }
   const k = Math.floor(Math.min(capped.width / descriptor.width, capped.height / descriptor.height));
-  if (k < 1) throw new Error('masked export target is smaller than the crisp render grid');
+  if (k < 1) throw new Error('export target is smaller than the crisp render grid');
   let cropWidth = descriptor.width;
   let cropHeight = descriptor.height;
   if (even && (cropWidth * k) % 2) cropWidth--;
@@ -2206,6 +2450,8 @@ function buildMaskedExportFrame({
   processedCrop = { x: 0, y: 0, width: processed?.width, height: processed?.height },
   processedAlreadyTarget = false,
   grainPhase = currentGrainPhase() ?? 0,
+  animationPhase = phaseOverride ?? animPhase,
+  postFXSourceKey = null,
   refH = null,
   fast = false,
 } = {}) {
@@ -2259,6 +2505,8 @@ function buildMaskedExportFrame({
       grainPhase,
       refH: refH ?? sourceHeight,
       fast,
+      sourceKey: postFXSourceKey,
+      ...animationPostFXOptions(state.anim, animationPhase),
     });
     if (fxResult !== processedStage) {
       processedTarget = createOwnedCanvas(width, height, 'owned post-FX export target');
@@ -2366,13 +2614,30 @@ async function doExportPNG() {
       }
       return;
     }
-    const p = derived();
+    const activePostFXOptions = animationPostFXOptions();
+    const requestedScale = exportSettings.pngSize === 'source2x' ? 2 : 1;
+    const preliminaryTarget = currentPostFXActive()
+      ? constrainPostFXDimensions(w * requestedScale, h * requestedScale, state.fx, activePostFXOptions, {
+        maxSide: MAX_EXPORT_SIDE,
+        maxArea: MAX_EXPORT_AREA,
+        maxBytes: MAX_UNMASKED_POSTFX_WORKING_BYTES,
+      })
+      : null;
     // Apply the browser's area bound before rendering, not after allocating a
     // potentially enormous work canvas/error buffer. Cell effects may produce
     // up to 2x their sampling budget in output pixels.
-    const renderBudget = state.mode === 'dither' ? MAX_EXPORT_AREA : MAX_EXPORT_AREA / 2;
-    const result = engine.render(source.el, w, h, p, renderBudget);
-    if (!result) return;
+    const baseRenderBudget = state.mode === 'dither' ? MAX_EXPORT_AREA : MAX_EXPORT_AREA / 2;
+    const safePreScaleArea = preliminaryTarget
+      ? preliminaryTarget.width * preliminaryTarget.height / (requestedScale * requestedScale)
+      : baseRenderBudget;
+    const renderBudget = Math.max(1, Math.min(baseRenderBudget, Math.floor(safePreScaleArea)));
+    const rendered = renderProcessedForExport(renderBudget, {
+      maxOutputPixels: preliminaryTarget
+        ? Math.max(1, Math.floor(safePreScaleArea))
+        : MAX_EXPORT_AREA,
+      maxOutputSide: MAX_EXPORT_SIDE,
+    });
+    const result = rendered.canvas;
 
     let W = result.width;
     let H = result.height;
@@ -2383,8 +2648,21 @@ async function doExportPNG() {
       W = result.width * 2;
       H = result.height * 2;
     }
-    // stay under the browser's canvas limits instead of silently cropping
-    if (W > MAX_EXPORT_SIDE || H > MAX_EXPORT_SIDE || W * H > MAX_EXPORT_AREA) {
+    // Stay below both browser canvas bounds and the active Post-FX working
+    // set before allocating the staging/output surfaces.
+    if (currentPostFXActive()) {
+      const safe = constrainPostFXDimensions(W, H, state.fx, activePostFXOptions, {
+        maxSide: MAX_EXPORT_SIDE,
+        maxArea: MAX_EXPORT_AREA,
+        maxBytes: MAX_UNMASKED_POSTFX_WORKING_BYTES,
+      });
+      W = safe.width;
+      H = safe.height;
+      if (safe.capped) {
+        const reason = safe.reason === 'memory' ? 'Post-FX memory limit' : 'browser canvas limit';
+        toast(`PNG capped to ${W}×${H} (${reason})`);
+      }
+    } else if (W > MAX_EXPORT_SIDE || H > MAX_EXPORT_SIDE || W * H > MAX_EXPORT_AREA) {
       const k = Math.min(MAX_EXPORT_SIDE / W, MAX_EXPORT_SIDE / H, Math.sqrt(MAX_EXPORT_AREA / (W * H)));
       W = Math.floor(W * k);
       H = Math.floor(H * k);
@@ -2405,7 +2683,11 @@ async function doExportPNG() {
     cx.imageSmoothingEnabled = engine.lastBoxResolved;
     cx.imageSmoothingQuality = 'high';
     cx.drawImage(result, 0, 0, W, H);
-    const final = applyPostFX(c, state.fx, { grainPhase: currentGrainPhase() ?? 0, refH: h });
+    const final = applyPostFX(c, state.fx, {
+      grainPhase: currentGrainPhase() ?? 0,
+      refH: h,
+      ...activePostFXOptions,
+    });
 
     // applyPostFX may return a shared canvas — copy before async encoding.
     const outC = final === c ? c : (() => {
@@ -2437,16 +2719,39 @@ async function doExportPNG() {
 function recordCanvasSeconds(secs, filename) {
   let rec = null;
   let iv = null;
+  let mirrorTimer = null;
   let cancelled = false;
   try {
     const mime = VideoExporter.pickMime();
     if (!mime) throw new Error('MediaRecorder is not supported in this browser');
-    const stream = out.captureStream(30);
+    // WebKit may advertise frame-accurate H.264 while dropping queued frames,
+    // which sends animated stills through this recorder fallback. Small ASCII
+    // glyphs are hostile to H.264 at the live canvas resolution, so mirror
+    // that canvas into a bounded nearest-neighbour target before capture.
+    const longSide = Math.max(out.width, out.height, 1);
+    const asciiScale = state.mode === 'ascii' && longSide < 640
+      ? Math.min(3, Math.max(2, Math.floor(1440 / longSide)))
+      : 1;
+    const captureCanvas = asciiScale > 1 ? document.createElement('canvas') : out;
+    if (captureCanvas !== out) {
+      captureCanvas.width = Math.max(2, (out.width * asciiScale) & ~1);
+      captureCanvas.height = Math.max(2, (out.height * asciiScale) & ~1);
+      const mirrorCtx = captureCanvas.getContext('2d');
+      mirrorCtx.imageSmoothingEnabled = false;
+      const mirror = () => {
+        mirrorCtx.globalCompositeOperation = 'copy';
+        mirrorCtx.drawImage(out, 0, 0, captureCanvas.width, captureCanvas.height);
+      };
+      mirror();
+      mirrorTimer = setInterval(mirror, 1000 / 30);
+    }
+    const stream = captureCanvas.captureStream(30);
     rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
     const chunks = [];
     rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
     rec.onstop = () => {
       clearInterval(iv);
+      clearInterval(mirrorTimer);
       stream.getTracks().forEach((tr) => tr.stop());
       hideBusy();
       exporting = false;
@@ -2469,10 +2774,12 @@ function recordCanvasSeconds(secs, filename) {
     showBusy(`Recording ${secs}s…`, () => {
       cancelled = true;
       clearInterval(iv);
+      clearInterval(mirrorTimer);
       if (rec.state !== 'inactive') rec.stop();
     });
   } catch (err) {
     clearInterval(iv);
+    clearInterval(mirrorTimer);
     hideBusy();
     exporting = false;
     unlockMaskAfterExport();
@@ -2494,18 +2801,49 @@ function mp4RenderBudget() {
   return Math.min(gpuAlgo ? 2_200_000 : EXPORT_PIXELS, longSideArea);
 }
 
-function renderMp4Frame(masked) {
-  if (!masked) {
+function renderMp4Frame(finalizeAtTarget, cachedRendered = null, postFXSourceKey = null) {
+  if (!finalizeAtTarget) {
     renderOnce(mp4RenderBudget());
     return out;
   }
-  const rendered = renderProcessedForExport(mp4RenderBudget());
+  const rendered = cachedRendered || renderProcessedForExport(mp4RenderBudget());
   return {
     canvas: rendered.canvas,
     meta: {
       descriptor: rendered.descriptor,
       grainPhase: currentGrainPhase() ?? 0,
+      animationPhase: phaseOverride ?? animPhase,
+      postFXSourceKey,
     },
+  };
+}
+
+function planPostFXMp4Target({ first, frameMeta, defaultTarget, maxSampleBytes }) {
+  const descriptor = frameMeta?.descriptor || exportDescriptor(first);
+  const animationPhase = frameMeta?.animationPhase ?? 0;
+  const capped = capMaskedDimensions(defaultTarget.width, defaultTarget.height, {
+    // The muxer can retain up to maxSampleBytes of compressed frames. The
+    // renderer's first frame also stays live while target sizing is planned.
+    reserveBytes: maxSampleBytes + canvasBackingBytes(first),
+    label: 'Video',
+    memoryLabel: 'animation memory limit',
+    // Finalization holds its target stage and owned return canvas alongside
+    // the module-owned Post-FX output/channel/glow buffers.
+    estimateWorkingBytes: (width, height) => (width * height * 4 * 2)
+      + estimatePostFXBytes(width, height, state.fx, {
+        fast: false,
+        ...animationPostFXOptions(state.anim, animationPhase),
+      }),
+  });
+  activePostFXVideoPlan = crispExportTarget(descriptor, capped, { even: true });
+  if (descriptor.samplingKind !== 'crisp') {
+    activePostFXVideoPlan.width = Math.max(2, activePostFXVideoPlan.width & ~1);
+    activePostFXVideoPlan.height = Math.max(2, activePostFXVideoPlan.height & ~1);
+  }
+  return {
+    width: activePostFXVideoPlan.width,
+    height: activePostFXVideoPlan.height,
+    scale: activePostFXVideoPlan.integerScale ?? defaultTarget.scale,
   };
 }
 
@@ -2536,7 +2874,77 @@ function finalizeMp4Frame(processed, { width, height, frameMeta }) {
     normalizedCrop: activeMaskedVideoPlan?.normalizedCrop,
     processedCrop: activeMaskedVideoPlan?.processedCrop,
     grainPhase: frameMeta?.grainPhase ?? currentGrainPhase() ?? 0,
+    animationPhase: frameMeta?.animationPhase ?? phaseOverride ?? animPhase,
+    postFXSourceKey: frameMeta?.postFXSourceKey ?? null,
   });
+}
+
+function finalizePostFXMp4Frame(processed, {
+  width,
+  height,
+  strict,
+  frameMeta,
+}) {
+  const descriptor = frameMeta?.descriptor || exportDescriptor(processed);
+  const crop = activePostFXVideoPlan?.processedCrop
+    || { x: 0, y: 0, width: processed.width, height: processed.height };
+  let stage = createOwnedCanvas(width, height, 'animated Post-FX video target');
+  let finalCanvas = null;
+  try {
+    const context = stage.getContext('2d');
+    context.save();
+    try {
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.globalAlpha = 1;
+      context.globalCompositeOperation = 'copy';
+      context.filter = 'none';
+      context.imageSmoothingEnabled = descriptor.samplingKind === 'continuous' || !strict;
+      context.imageSmoothingQuality = 'high';
+      context.drawImage(
+        processed,
+        crop.x,
+        crop.y,
+        crop.width,
+        crop.height,
+        0,
+        0,
+        width,
+        height,
+      );
+    } finally {
+      context.restore();
+    }
+
+    const fxResult = applyPostFX(stage, state.fx, {
+      grainPhase: frameMeta?.grainPhase ?? currentGrainPhase() ?? 0,
+      refH: srcDims()[1] || height,
+      fast: false,
+      sourceKey: frameMeta?.postFXSourceKey ?? null,
+      ...animationPostFXOptions(
+        state.anim,
+        frameMeta?.animationPhase ?? phaseOverride ?? animPhase,
+      ),
+    });
+    if (fxResult === stage) {
+      const owned = stage;
+      stage = null;
+      return { canvas: owned, release: () => releaseOwnedCanvas(owned) };
+    }
+
+    finalCanvas = createOwnedCanvas(width, height, 'owned animated Post-FX video frame');
+    const finalContext = finalCanvas.getContext('2d');
+    finalContext.globalCompositeOperation = 'copy';
+    finalContext.drawImage(fxResult, 0, 0);
+    releaseOwnedCanvas(stage);
+    stage = null;
+    const owned = finalCanvas;
+    finalCanvas = null;
+    return { canvas: owned, release: () => releaseOwnedCanvas(owned) };
+  } catch (error) {
+    releaseOwnedCanvas(stage);
+    releaseOwnedCanvas(finalCanvas);
+    throw error;
+  }
 }
 
 function abortVideoExport(error) {
@@ -2556,13 +2964,35 @@ async function doExportVideo() {
   if (!source || exporting) return;
   const isAnimatedImage = source.type === 'animated-image';
   const animatedStill = source.type === 'image' && isAnimating();
+  const gravityStill = source.type === 'image' && isOneShotAnimation();
   const isGen = source.type === 'gen';
   if (!(source.el instanceof HTMLVideoElement) && !isAnimatedImage && !animatedStill && !isGen) return;
   if (!(await beginExport())) return;
   const maskedExport = maskIsActive();
+  const postFXFinal = !maskedExport
+    && isAnimating()
+    && postFXOnlyAnimation(state.anim.style);
+  const finalizeAtTarget = maskedExport || postFXFinal;
+  const cacheStaticPostFXBase = source.type === 'image'
+    && postFXOnlyAnimation(state.anim.style)
+    && finalizeAtTarget;
+  let staticPostFXBase = null;
+  const staticPostFXSourceKey = cacheStaticPostFXBase
+    ? `video:${sourceEpoch}:${effectRevision}:${frameId}`
+    : null;
+  const renderVideoFrame = () => {
+    if (cacheStaticPostFXBase && !staticPostFXBase) {
+      staticPostFXBase = renderProcessedForExport(mp4RenderBudget());
+    }
+    return renderMp4Frame(finalizeAtTarget, staticPostFXBase, staticPostFXSourceKey);
+  };
   engine.invalidateTemporal(); // frame 0 of the export must not blend with the preview
 
-  let secs = parseInt(exportSettings.recordSeconds, 10) || 5;
+  // A still-image Gravity export is one complete fall. Its Speed control sets
+  // the clip duration; looping styles retain the explicit Video length menu.
+  let secs = gravityStill
+    ? gravityDurationSeconds(state.anim.speed, state.anim.gravityMode)
+    : (parseInt(exportSettings.recordSeconds, 10) || 5);
   if (source.type === 'webcam' || isAnimatedImage) {
     recordCanvasSeconds(secs, source.type === 'webcam'
       ? 'ditherlab-webcam'
@@ -2594,17 +3024,27 @@ async function doExportVideo() {
       showBusy('Rendering video (frame-accurate)…', () => { cancelled = true; });
       try {
         await exportLoopFrameAccurate({
-          renderFrame: () => renderMp4Frame(maskedExport),
+          renderFrame: renderVideoFrame,
           setPhase: (f) => {
             if (isGen) genPhaseOverride = (f * genCycles) % 1;
-            if (effCycles) phaseOverride = (f * effCycles) % 1;
+            if (gravityStill) {
+              // exportLoopFrameAccurate excludes the duplicate loop endpoint;
+              // remap its last sample to exactly 1 for the one-shot clear frame.
+              phaseOverride = oneShotExportPhase(f, count);
+            } else if (effCycles) {
+              phaseOverride = (f * effCycles) % 1;
+            }
           },
           count,
           fps,
           name,
           strict: strictFn,
-          planFinalTarget: maskedExport ? planMaskedMp4Target : null,
-          finalizeFrame: maskedExport ? finalizeMp4Frame : null,
+          planFinalTarget: maskedExport
+            ? planMaskedMp4Target
+            : (postFXFinal ? planPostFXMp4Target : null),
+          finalizeFrame: maskedExport
+            ? finalizeMp4Frame
+            : (postFXFinal ? finalizePostFXMp4Frame : null),
           onProgress: busyProgress,
           onInfo: (msg) => toast(msg, 4000),
           shouldAbort: () => cancelled,
@@ -2631,11 +3071,16 @@ async function doExportVideo() {
       // stable live bitmap before captureStream() starts; resizing a captured
       // canvas mid-recording can glitch or truncate the first frames.
       try {
+        if (gravityStill) restartAnimation();
         renderOnce();
       } catch (error) {
         abortVideoExport(error);
         return;
       }
+    }
+    if (gravityStill) {
+      restartAnimation();
+      renderOnce();
     }
     recordCanvasSeconds(secs, name);
     return;
@@ -2654,14 +3099,18 @@ async function doExportVideo() {
     try {
       await exportVideoFrameAccurate({
         video: source.el,
-        renderFrame: () => renderMp4Frame(maskedExport),
+        renderFrame: renderVideoFrame,
         name,
         strict: strictFn,
         // true source rate from playback (rVFC mediaTime deltas) — sampling
         // 24fps footage on a 30fps grid bakes 2:3 pulldown judder into the file
         sourceFps: source._frameDurEma ? 1 / source._frameDurEma : 0,
-        planFinalTarget: maskedExport ? planMaskedMp4Target : null,
-        finalizeFrame: maskedExport ? finalizeMp4Frame : null,
+        planFinalTarget: maskedExport
+          ? planMaskedMp4Target
+          : (postFXFinal ? planPostFXMp4Target : null),
+        finalizeFrame: maskedExport
+          ? finalizeMp4Frame
+          : (postFXFinal ? finalizePostFXMp4Frame : null),
         // pattern animation pinned to the VIDEO timeline, not wall clock (the
         // live loop would otherwise advance it while the exporter awaits) —
         // also stops the loop's concurrent renders during the export
@@ -2721,6 +3170,10 @@ async function doExportVideo() {
 
 async function doExportGIF() {
   if (!source || exporting) return;
+  if (isOneShotAnimation()) {
+    toast('Gravity fall is one-shot · export Video instead');
+    return;
+  }
   if (!(await beginExport())) return;
   const maskedExport = maskIsActive();
   engine.invalidateTemporal(); // frame 0 of the export must not blend with the preview
@@ -2772,11 +3225,17 @@ async function doExportGIF() {
   // usual 480px sizes and either average away (smooth) or alias (strict).
   // The frames render raw (noFx) and this hook re-applies the stack per
   // frame with refH compensated so intensity/geometry match the preview.
-  const fxOn = Object.values(state.fx).some((v) => v > 0);
+  const fxOn = currentPostFXActive();
   let fxCanvas = null;
   let fxCtx = null;
   let gifProcessedCanvas = null;
   let gifProcessedCtx = null;
+  const cacheStaticPostFXBase = source.type === 'image' && postFXOnlyAnimation(state.anim.style);
+  let staticGifProcessed = null;
+  let staticGifCanvas = null;
+  const gifPostFXSourceKey = cacheStaticPostFXBase
+    ? `gif:${sourceEpoch}:${effectRevision}:${frameId}`
+    : null;
   const gifPostFXRefH = (gw, gh, sizeMeta = null) => {
     const descriptor = sizeMeta?.frameMeta?.descriptor;
     const renderedWidth = descriptor?.width || out.width;
@@ -2810,6 +3269,8 @@ async function doExportGIF() {
         normalizedCrop: sizeMeta?.normalizedCrop || { u0: 0, v0: 0, u1: 1, v1: 1 },
         processedAlreadyTarget: true,
         grainPhase: sizeMeta?.frameMeta?.grainPhase ?? currentGrainPhase() ?? 0,
+        animationPhase: sizeMeta?.frameMeta?.animationPhase ?? phaseOverride ?? animPhase,
+        postFXSourceKey: sizeMeta?.frameMeta?.postFXSourceKey ?? gifPostFXSourceKey,
         refH: gifPostFXRefH(gw, gh, sizeMeta),
       });
       try {
@@ -2822,7 +3283,12 @@ async function doExportGIF() {
     // present() would show this render at out.height * scale with refH=srcH;
     // scale refH by our (smaller) canvas so the fx read proportionally alike
     const refH = gifPostFXRefH(gw, gh, sizeMeta);
-    const final = applyPostFX(fxCanvas, state.fx, { grainPhase: currentGrainPhase(), refH });
+    const final = applyPostFX(fxCanvas, state.fx, {
+      grainPhase: currentGrainPhase(),
+      refH,
+      sourceKey: gifPostFXSourceKey,
+      ...animationPostFXOptions(),
+    });
     return final.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, gw, gh).data;
   } : null;
 
@@ -2835,7 +3301,7 @@ async function doExportGIF() {
       // 1.6MP export budget so wide/native GIFs are not needlessly softened.
       renderFrame: () => {
         if (maskedExport) {
-          const rendered = renderProcessedForExport(EXPORT_PIXELS);
+          const rendered = staticGifProcessed || renderProcessedForExport(EXPORT_PIXELS);
           // The GPU renderer's canvas already owns a WebGL context, so the GIF
           // sampler cannot call getContext('2d') on it. Copy that branch into
           // one reusable 2D staging canvas; CPU/ASCII/cell results are already
@@ -2854,15 +3320,25 @@ async function doExportGIF() {
             gifProcessedCtx.drawImage(rendered.canvas, 0, 0);
             rendered.canvas = gifProcessedCanvas;
           }
+          if (cacheStaticPostFXBase && !staticGifProcessed) {
+            staticGifProcessed = {
+              canvas: rendered.canvas,
+              descriptor: rendered.descriptor,
+            };
+          }
           return {
             canvas: rendered.canvas,
             meta: {
               descriptor: rendered.descriptor,
               grainPhase: currentGrainPhase() ?? 0,
+              animationPhase: phaseOverride ?? animPhase,
+              postFXSourceKey: gifPostFXSourceKey,
             },
           };
         }
+        if (cacheStaticPostFXBase && staticGifCanvas) return staticGifCanvas;
         renderOnce(EXPORT_PIXELS, true, fxOn);
+        if (cacheStaticPostFXBase) staticGifCanvas = out;
         return out;
       },
       fps,
@@ -2896,10 +3372,43 @@ async function doExportGIF() {
 
 function doExportTxt() {
   if (state.mode !== 'ascii') return;
-  renderOnce(Infinity, true, false, true); // text exports capture the full-resolution grid once
-  const name = `${source?.name || 'ditherlab'}-ascii`;
   const fmt = exportSettings.txtFormat;
-  if (fmt === 'ansi' && engine.ascii.lastGrid) {
+  // Interactive HTML visits every cell each frame. Bound its metadata render
+  // before arrays or physics bodies are created; denser ASCII renderers spend
+  // multiple source samples per output cell, hence the density multiplier.
+  const renderer = state.ascii.renderer || (state.ascii.braille ? 'braille' : 'ramp');
+  const sampleDensity = ({ ramp: 1, shape: 64, quadrant: 4, braille: 8 })[renderer] || 1;
+  const metadataBudget = fmt === 'interactive'
+    ? MAX_INTERACTIVE_GRAVITY_BODIES * sampleDensity
+    : Infinity;
+  renderOnce({
+    budget: metadataBudget,
+    contentNew: true,
+    noFx: true,
+    captureMetadata: true,
+    includeAnimation: false,
+    skipPresent: true,
+  });
+  const name = `${source?.name || 'ditherlab'}-ascii`;
+  if (fmt === 'interactive' && engine.ascii.lastGrid) {
+    if (!isOneShotAnimation()) {
+      toast('Interactive fall needs Gravity on an ASCII still image');
+      dirty = true;
+      return;
+    }
+    const f = FONTS[state.ascii.fontId] || FONTS.menlo;
+    exportText(buildGravityHtml(engine.ascii.lastGrid, state.ascii.bg, {
+      family: f.family,
+      size: state.ascii.cellSize,
+      bold: state.ascii.bold,
+    }, {
+      intensity: state.anim.intensity,
+      speed: state.anim.speed,
+      mode: state.anim.gravityMode,
+      title: `${source?.name || 'Ditherlab'} · Gravity fall`,
+    }), name, 'html', 'text/html');
+    toast('Interactive Gravity HTML exported');
+  } else if (fmt === 'ansi' && engine.ascii.lastGrid) {
     const defaultBg = state.ascii.colorMode === 'mono'
       ? parseInt(state.ascii.bg.replace('#', ''), 16)
       : null;
@@ -2924,7 +3433,14 @@ function doExportTxt() {
 
 exportSettings.onCopyText = () => {
   if (state.mode !== 'ascii') return;
-  renderOnce(Infinity, true, false, true);
+  renderOnce({
+    budget: Infinity,
+    contentNew: true,
+    noFx: true,
+    captureMetadata: true,
+    includeAnimation: false,
+    skipPresent: true,
+  });
   dirty = true;
   navigator.clipboard.writeText(engine.ascii.lastText)
     .then(() => toast(maskIsActive()
@@ -2943,7 +3459,13 @@ function rebuildPanel() {
     exportSettings,
     sourceType: source?.type || null,
     isLive: source?.type === 'video' || source?.type === 'webcam',
+    isFlutedSupported: () => isFlutedGlassSupported(),
     gen: source?.type === 'gen' ? source.gen : null,
+    onAnimationReplay: () => {
+      if (!isOneShotAnimation() || exporting || maskPriming) return;
+      restartAnimation();
+      frameBundles.invalidate('gravity replay', { releaseCurrent: false });
+    },
     onGenChange: () => {
       if (exporting || maskPriming) return;
       clearActivePreset($('preset-strip'));
@@ -2960,8 +3482,10 @@ function rebuildPanel() {
       if (discrete) commitHistory();
       else pushHistory();
     },
-    onChange: ({ discrete } = {}) => {
+    onChange: ({ discrete, animationRestart = false } = {}) => {
       if (exporting || maskPriming) return;
+      if (animationRestart || isOneShotAnimation()) restartAnimation();
+      trimInactivePostFXBuffers();
       clearActivePreset($('preset-strip'));
       updateExportButtons();
       updateStatus();
@@ -2981,6 +3505,8 @@ function applyPreset(preset) {
   commitHistory(); // land any pending debounced edit first
   resetState(state);
   applyParams(state, preset.params);
+  if (state.anim.style !== 'none') restartAnimation();
+  trimInactivePostFXBuffers();
   rebuildPanel();
   updateExportButtons();
   updateStatus();
@@ -3003,6 +3529,8 @@ thumbCanvases = buildPresetStrip({
     clearActivePreset($('preset-strip'));
     resetState(state);
     applyParams(state, shuffleParams());
+    if (state.anim.style === 'gravity') restartAnimation();
+    trimInactivePostFXBuffers();
     rebuildPanel();
     updateExportButtons();
     updateStatus();
@@ -3082,6 +3610,7 @@ $('btn-reset').onclick = () => {
   commitHistory();
   clearActivePreset($('preset-strip'));
   resetState(state);
+  trimInactivePostFXBuffers();
   commitMaskProposal(maskStore.proposeReset(maskRevisionId), { addHistory: false });
   Object.assign(exportSettings, EXPORT_DEFAULTS);
   rebuildPanel();
@@ -3102,6 +3631,8 @@ $('btn-shuffle').onclick = () => {
   clearActivePreset($('preset-strip'));
   resetState(state);
   applyParams(state, shuffleParams());
+  if (state.anim.style === 'gravity') restartAnimation();
+  trimInactivePostFXBuffers();
   rebuildPanel();
   updateExportButtons();
   updateStatus();
@@ -3253,11 +3784,15 @@ const defaultsSnapshot = snapshotStr(); // undo must reach the defaults beneath 
 const bootPreset = PRESETS.find((p) => p.id === qp.get('preset'));
 if (bootPreset) {
   applyParams(state, bootPreset.params);
+  if (state.anim.style === 'gravity') restartAnimation();
+  trimInactivePostFXBuffers();
   rebuildPanel();
   updateExportButtons();
   updateStatus();
   syncMaskEditor();
-  document.querySelector(`.preset-card[data-id="${bootPreset.id}"]`)?.classList.add('active');
+  const bootPresetCard = document.querySelector(`.preset-card[data-id="${bootPreset.id}"]`);
+  bootPresetCard?.classList.add('active');
+  bootPresetCard?.setAttribute('aria-pressed', 'true');
 }
 const genParam = qp.get('gen');
 if (genParam) {
@@ -3316,6 +3851,7 @@ window.__dl = {
   renderOnce,
   setPhase(ph) { phaseOverride = ph; dirty = true; },
   clearPhase() { phaseOverride = null; dirty = true; },
+  replayAnimation() { restartAnimation(); },
   setGenPhase(ph) { genPhaseOverride = ph; dirty = true; },
   clearGenPhase() { genPhaseOverride = null; dirty = true; },
   get source() { return source; },
@@ -3334,6 +3870,16 @@ window.__dl = {
     };
   },
   get maskTimings() { return { effectRenderMs, bundleBuildMs, maskCompositeMs }; },
+  get animation() {
+    return {
+      phase: phaseOverride ?? animPhase,
+      selected: state.anim.style,
+      active: isAnimating(),
+      ticking: isAnimationTicking() && phaseOverride === null,
+      oneShot: isOneShotAnimation(),
+      gravity: engine.ascii.lastGravityStats,
+    };
+  },
   engine,
   state,
 };

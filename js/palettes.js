@@ -25,6 +25,7 @@ export const PALETTES = [
   { id: 'apple2',        name: 'Apple II',            colors: ['#000000', '#6c2940', '#403578', '#d93cf0', '#135740', '#808080', '#2697f0', '#bfb4f8', '#404b07', '#d9680f', '#808080', '#eca8bf', '#26c30b', '#bfca87', '#93d6bf', '#ffffff'] },
   { id: 'teletext',      name: 'Teletext',            colors: ['#000000', '#ff0000', '#00ff00', '#ffff00', '#0000ff', '#ff00ff', '#00ffff', '#ffffff'] },
   { id: 'vaporwave',     name: 'Vaporwave',           colors: ['#170d27', '#2e2157', '#f6019d', '#2de2e6', '#ff6c11', '#fdfdfd'] },
+  { id: 'command',       name: 'Command Violet',      colors: ['#09060D', '#261137', '#653091', '#B8FF3D', '#F4F0DE'] },
   { id: 'sepia',         name: 'Sepia',               colors: ['#2a1a0f', '#6b4226', '#b08d57', '#e8d5b7'] },
   { id: 'sunset',        name: 'Sunset',              colors: ['#1a1423', '#5d2e46', '#a84448', '#e8985e', '#f6e27f'] },
   { id: 'nokia',         name: 'Nokia 3310',          colors: ['#212c16', '#72a488'] },

@@ -1,9 +1,17 @@
 // postfx.js — Canvas-2D post-processing stack for the dither/ASCII studio.
 //
-// Applies (in order): chromatic aberration -> glow -> film grain ->
-// scanlines -> vignette. Runs per video frame, so every buffer here is a
-// module-level scratch canvas that is only resized when the source
-// dimensions change; the grain tile is generated once at module init.
+// Applies (in order): fluted-glass refraction -> chromatic aberration ->
+// command graphics -> glow -> film grain -> scanlines -> vignette. Runs per
+// video frame, so every buffer here is a module-level scratch canvas that is
+// only resized when the source dimensions change; the grain tile is generated
+// once at module init.
+
+import { drawCommandSequence } from './command-sequence.js';
+import {
+    estimateFlutedGlassBytes,
+    releaseFlutedGlass,
+    renderFlutedGlass,
+} from './fluted-glass.js';
 
 const GRAIN_SIZE = 128;
 
@@ -76,6 +84,16 @@ const fxEnabled = (fx) => !!fx && (
     (+fx.chromatic || 0) > 0 ||
     (+fx.glow || 0) > 0
 );
+
+const commandSequenceEnabled = (opts) => opts?.animationStyle === 'command'
+    && (+opts.animationIntensity || 0) > 0;
+
+const flutedGlassEnabled = (opts) => opts?.animationStyle === 'fluted'
+    && (+opts.animationIntensity || 0) > 0;
+
+export function postFXActive(fx, opts = {}) {
+    return fxEnabled(fx) || commandSequenceEnabled(opts) || flutedGlassEnabled(opts);
+}
 
 // ---------------------------------------------------------------------------
 // Stage helpers
@@ -242,7 +260,9 @@ function drawVignette(w, h, vignette) {
  *          chromatic?:number, glow?:number}} fx
  *   vignette 0..1, scanlines 0..1, grain 0..1, chromatic 0..20 (px at
  *   1080p-height reference; scaled with the resolution factor), glow 0..1
- * @param {{grainPhase?:(number|null), refH?:(number|null)}} [opts]
+ * @param {{grainPhase?:(number|null), refH?:(number|null), fast?:boolean,
+ *          animationStyle?:string, animationPhase?:number,
+ *          animationIntensity?:number, sourceKey?:string}} [opts]
  *   grainPhase: 0..1 position in the grain animation cycle. When provided,
  *     the grain offset is a pure function of it — identical phase produces
  *     identical grain (deterministic re-exports, N34) and phase 1.0 wraps to
@@ -258,17 +278,18 @@ function drawVignette(w, h, vignette) {
  *   0/falsy, otherwise a module-level reusable output canvas
  */
 export function applyPostFX(srcCanvas, fx, opts = {}) {
-    if (!fx) return srcCanvas;
-
-    const vignette = +fx.vignette || 0;
-    const scanlines = +fx.scanlines || 0;
-    const grain = +fx.grain || 0;
-    const chromatic = +fx.chromatic || 0;
-    const glow = +fx.glow || 0;
+    const values = fx || {};
+    const vignette = +values.vignette || 0;
+    const scanlines = +values.scanlines || 0;
+    const grain = +values.grain || 0;
+    const chromatic = +values.chromatic || 0;
+    const glow = +values.glow || 0;
+    const commandSequence = commandSequenceEnabled(opts);
+    const flutedGlass = flutedGlassEnabled(opts);
 
     // Fast path: nothing to do, hand back the source untouched (no copy).
     if (vignette <= 0 && scanlines <= 0 && grain <= 0 &&
-        chromatic <= 0 && glow <= 0) {
+        chromatic <= 0 && glow <= 0 && !commandSequence && !flutedGlass) {
         return srcCanvas;
     }
 
@@ -302,19 +323,44 @@ export function applyPostFX(srcCanvas, fx, opts = {}) {
     outCtx.globalAlpha = 1;
     outCtx.filter = 'none';
 
-    // 1) Base layer: chromatic RGB split, or a plain copy of the source.
+    // 1) Optical refraction. This stays ahead of the Canvas2D stack so the
+    // ordinary Post-FX stages act on the refracted image, not vice versa.
+    let baseCanvas = srcCanvas;
+    if (flutedGlass) {
+        const refracted = renderFlutedGlass(srcCanvas, {
+            phase: opts.animationPhase,
+            intensity: opts.animationIntensity,
+            sourceKey: opts.sourceKey,
+        });
+        // Keep the Post-FX contract dimension-preserving even if a lost or
+        // failed GL context hands back no usable render target.
+        if (refracted?.width === w && refracted?.height === h) baseCanvas = refracted;
+    }
+
+    // 2) Base layer: chromatic RGB split, or a plain copy of the source.
     if (chromatic > 0) {
         // Round to a whole pixel but never below 1 so a nonzero setting
         // always produces a visible split, even at small preview sizes.
         const shift = Math.max(1, Math.round(chromatic * k));
-        drawChromatic(srcCanvas, w, h, shift);
+        drawChromatic(baseCanvas, w, h, shift);
     } else {
         outCtx.globalCompositeOperation = 'copy';
-        outCtx.drawImage(srcCanvas, 0, 0);
+        outCtx.drawImage(baseCanvas, 0, 0);
         outCtx.globalCompositeOperation = 'source-over';
     }
 
-    // 2) Glow, 3) grain, 4) scanlines, 5) vignette.
+    // 3) Command graphics and synchronization slices. The channel canvas is
+    // no longer needed after chromatic recombination, so it doubles as the
+    // reusable full-frame slice scratch instead of allocating another surface.
+    if (commandSequence) {
+        drawCommandSequence(outCtx, out, chan, {
+            phase: opts.animationPhase,
+            intensity: opts.animationIntensity,
+            refH,
+        });
+    }
+
+    // 4) Glow, 5) grain, 6) scanlines, 7) vignette.
     if (glow > 0) drawGlow(w, h, glow, k, !!(opts && opts.fast));
     if (grain > 0) drawGrain(w, h, grain, k, grainPhase);
     if (scanlines > 0) drawScanlines(w, h, scanlines);
@@ -328,27 +374,136 @@ export function applyPostFX(srcCanvas, fx, opts = {}) {
  * Post-FX stages at a target size. The estimate intentionally excludes the
  * caller-owned source canvas and includes only module-owned surfaces.
  */
-export function estimatePostFXBytes(width, height, fx, { fast = false } = {}) {
-    if (!fxEnabled(fx) || width <= 0 || height <= 0) return 0;
+export function estimatePostFXBytes(width, height, fx, opts = {}) {
+    const fast = !!opts.fast;
+    if (!postFXActive(fx, opts) || width <= 0 || height <= 0) return 0;
     const full = width * height * 4;
     let bytes = full; // returned composite
-    if ((+fx.chromatic || 0) > 0) bytes += full; // isolated channel scratch
-    if ((+fx.glow || 0) > 0) {
+    if (flutedGlassEnabled(opts)) bytes += estimateFlutedGlassBytes(width, height);
+    // Chromatic isolation and command slices share the same reusable scratch.
+    if ((+fx?.chromatic || 0) > 0 || commandSequenceEnabled(opts)) bytes += full;
+    if ((+fx?.glow || 0) > 0) {
         const div = fast ? 4 : 1;
         bytes += Math.max(1, Math.round(width / div))
             * Math.max(1, Math.round(height / div)) * 4;
     }
     // Grain/scanline tiles are small but real and remain allocated.
-    if ((+fx.grain || 0) > 0) bytes += GRAIN_SIZE * GRAIN_SIZE * 4;
-    if ((+fx.scanlines || 0) > 0) {
+    if ((+fx?.grain || 0) > 0) bytes += GRAIN_SIZE * GRAIN_SIZE * 4;
+    if ((+fx?.scanlines || 0) > 0) {
         const spacing = Math.max(2, Math.round(height / 270));
         bytes += 4 * spacing * 6 * 4;
     }
     return bytes;
 }
 
+/**
+ * Bound an unmasked export before any result or Post-FX canvases are created.
+ * The returned integer dimensions retain the input aspect ratio as closely as
+ * pixel rounding allows. `reason` names the tightest limit: side, area, or
+ * memory. Invalid dimensions/limits and a byte budget too small for even a
+ * 1x1 working set are rejected instead of returning an unsafe canvas size.
+ */
+export function constrainPostFXDimensions(
+    width,
+    height,
+    fx,
+    opts = {},
+    {
+        maxSide = Infinity,
+        maxArea = Infinity,
+        maxBytes = Infinity,
+        baseBytesPerPixel = 12,
+    } = {},
+) {
+    const positiveInteger = (value, name) => {
+        const number = Number(value);
+        if (!Number.isFinite(number) || number <= 0) {
+            throw new RangeError(`${name} must be a positive finite number`);
+        }
+        return Math.max(1, Math.floor(number));
+    };
+    const positiveLimit = (value, name) => {
+        if (value === Infinity) return Infinity;
+        const number = Number(value);
+        if (!Number.isFinite(number) || number <= 0) {
+            throw new RangeError(`${name} must be positive or Infinity`);
+        }
+        return number;
+    };
+
+    const sourceWidth = positiveInteger(width, 'width');
+    const sourceHeight = positiveInteger(height, 'height');
+    const sideLimit = positiveLimit(maxSide, 'maxSide');
+    const areaLimit = positiveLimit(maxArea, 'maxArea');
+    const byteLimit = positiveLimit(maxBytes, 'maxBytes');
+    const baseBytes = Number(baseBytesPerPixel);
+    if (!Number.isFinite(baseBytes) || baseBytes < 0) {
+        throw new RangeError('baseBytesPerPixel must be a non-negative finite number');
+    }
+
+    const sideScale = Math.min(
+        1,
+        sideLimit / sourceWidth,
+        sideLimit / sourceHeight,
+    );
+    const areaScale = Math.min(
+        1,
+        Math.sqrt(areaLimit / (sourceWidth * sourceHeight)),
+    );
+    let scale = 1;
+    let reason = null;
+    if (sideScale < scale) {
+        scale = sideScale;
+        reason = 'side';
+    }
+    if (areaScale < scale) {
+        scale = areaScale;
+        reason = 'area';
+    }
+
+    const dimensionsAt = (candidateScale) => ({
+        width: Math.max(1, Math.floor(sourceWidth * candidateScale)),
+        height: Math.max(1, Math.floor(sourceHeight * candidateScale)),
+    });
+    const workingBytes = (candidateWidth, candidateHeight) => (
+        candidateWidth * candidateHeight * baseBytes
+        + estimatePostFXBytes(candidateWidth, candidateHeight, fx, opts)
+    );
+
+    const geometricTarget = dimensionsAt(scale);
+    if (byteLimit < Infinity
+        && workingBytes(geometricTarget.width, geometricTarget.height) > byteLimit) {
+        if (workingBytes(1, 1) > byteLimit) {
+            throw new RangeError('maxBytes is too small for the minimum Post-FX working set');
+        }
+        let low = 0;
+        let high = scale;
+        // The estimator includes fixed-size tiles and rounded fast-mode
+        // surfaces, so solve it directly instead of assuming bytes scale only
+        // with area.
+        for (let iteration = 0; iteration < 32; iteration++) {
+            const mid = (low + high) / 2;
+            const candidate = dimensionsAt(mid);
+            if (workingBytes(candidate.width, candidate.height) <= byteLimit) low = mid;
+            else high = mid;
+        }
+        scale = low;
+        reason = 'memory';
+    }
+
+    const constrained = dimensionsAt(scale);
+    const capped = constrained.width !== sourceWidth || constrained.height !== sourceHeight;
+    return {
+        width: constrained.width,
+        height: constrained.height,
+        capped,
+        reason: capped ? reason : null,
+    };
+}
+
 /** Release target-sized Post-FX backing stores after source/export teardown. */
 export function releasePostFXBuffers() {
+    releaseFlutedGlass();
     out.width = 0;
     out.height = 0;
     chan.width = 0;
@@ -368,4 +523,49 @@ export function releasePostFXBuffers() {
     glowFilterGlow = -1;
     glowFilterK = -1;
     glowFilterDiv = -1;
+}
+
+/**
+ * Release backing stores for stages that are no longer active without
+ * disturbing buffers still needed by the current effect stack. Call this
+ * after settings changes so memory accounting describes resident surfaces,
+ * not just the next frame's work.
+ */
+export function trimPostFXBuffers(fx, opts = {}) {
+    const values = fx || {};
+    const commandSequence = commandSequenceEnabled(opts);
+    const flutedGlass = flutedGlassEnabled(opts);
+
+    if (!flutedGlass) releaseFlutedGlass();
+    if ((+values.chromatic || 0) <= 0 && !commandSequence) {
+        chan.width = 0;
+        chan.height = 0;
+    }
+    if ((+values.glow || 0) <= 0) {
+        soft.width = 0;
+        soft.height = 0;
+        glowFilter = '';
+        glowFilterGlow = -1;
+        glowFilterK = -1;
+        glowFilterDiv = -1;
+    }
+    if ((+values.grain || 0) <= 0) {
+        grainPattern = null;
+        grainPatternK = -1;
+    }
+    if ((+values.scanlines || 0) <= 0) {
+        scanTile = null;
+        scanPattern = null;
+        scanSpacing = 0;
+    }
+    if ((+values.vignette || 0) <= 0) {
+        vigGrad = null;
+        vigW = 0;
+        vigH = 0;
+        vigV = -1;
+    }
+    if (!postFXActive(values, opts)) {
+        out.width = 0;
+        out.height = 0;
+    }
 }

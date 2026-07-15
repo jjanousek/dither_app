@@ -14,6 +14,21 @@ import WebKit
 var appURL = URL(string: "http://127.0.0.1/")! // real port filled in at launch
 let testMode = ProcessInfo.processInfo.environment["DL_TEST_DOWNLOAD"] == "1"
 let testExportTarget = ProcessInfo.processInfo.environment["DL_TEST_EXPORT"] ?? "png"
+let testScreenshotPath = ProcessInfo.processInfo.environment["DL_TEST_SCREENSHOT"]
+let testAnimationStyle = ProcessInfo.processInfo.environment["DL_TEST_ANIMATION_STYLE"]
+let testPresetID = ProcessInfo.processInfo.environment["DL_TEST_PRESET_ID"]
+let testEffectMode = ProcessInfo.processInfo.environment["DL_TEST_EFFECT_MODE"]
+let testPhase = ProcessInfo.processInfo.environment["DL_TEST_PHASE"].flatMap(Double.init)
+let testTimeoutSeconds = ProcessInfo.processInfo.environment["DL_TEST_TIMEOUT"]
+    .flatMap(Double.init)
+    .map { min(300, max(10, $0)) } ?? 60
+
+private func safeTestToken(_ value: String?) -> String? {
+    guard let value,
+          !value.isEmpty,
+          value.range(of: "^[a-z0-9-]+$", options: .regularExpression) != nil else { return nil }
+    return value
+}
 
 private func matchesAppOrigin(scheme: String?, host: String?, port: Int?) -> Bool {
     guard let scheme, let host,
@@ -285,37 +300,146 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: automated export test (DL_TEST_DOWNLOAD=1)
 
+    private func testSetupScript(renderSynchronously: Bool) -> String {
+        let preset = safeTestToken(testPresetID)
+        let supportedModes: Set<String> = [
+            "dither", "ascii", "dots", "lego", "voxel", "led", "lattice", "mosaic",
+        ]
+        let requestedMode = safeTestToken(testEffectMode)
+        let mode = requestedMode.flatMap { supportedModes.contains($0) ? $0 : nil }
+        let supportedStyles: Set<String> = [
+            "none", "breathe", "pulse", "command", "fluted", "sweep",
+            "wave", "flow", "shimmer", "gravity",
+        ]
+        let requestedStyle = safeTestToken(testAnimationStyle)
+        let defaultStyle: String? = renderSynchronously && preset == nil && mode == nil
+            ? "fluted"
+            : (!renderSynchronously && testExportTarget == "video" && preset == nil && mode == nil
+                ? "breathe" : nil)
+        let style = requestedStyle.flatMap { supportedStyles.contains($0) ? $0 : nil }
+            ?? defaultStyle
+        let phase = testPhase ?? (renderSynchronously ? 0.18 : 0)
+        let liveGravitySnapshot = renderSynchronously && style == "gravity"
+
+        let presetStatement = preset.map {
+            "document.querySelector('.preset-card[data-id=\"\($0)\"]')?.click();"
+        } ?? ""
+        let modeStatement = mode.map {
+            "[...document.querySelectorAll('.mode-pill')].find((el) => el.textContent.trim().toLowerCase() === '\($0)')?.click();"
+        } ?? ""
+        let styleStatement = style.map { value in
+            """
+            const styleRow = [...document.querySelectorAll('.row')]
+              .find((el) => el.querySelector('label')?.textContent === 'Style');
+            const style = styleRow?.querySelector('select');
+            if (!style) throw new Error('animation style control missing');
+            style.value = '\(value)';
+            style.dispatchEvent(new Event('change', { bubbles: true }));
+            """
+        } ?? ""
+        let renderStatement = renderSynchronously ? """
+            window.__dl.setPhase(\(phase));
+            const rendered = window.__dl.renderOnce({
+              budget: \(liveGravitySnapshot ? "null" : "900000"),
+              contentNew: true,
+              allowAsync: false,
+              offline: \(liveGravitySnapshot ? "false" : "true"),
+            });
+            const panel = document.getElementById('panel');
+            const animation = [...panel.querySelectorAll('.section')]
+              .find((el) => el.querySelector('h3')?.textContent
+                ?.trim().startsWith('Animation'));
+            if (panel && animation) panel.scrollTop = Math.max(0, animation.offsetTop - 72);
+            """ : "const rendered = null;"
+
+        return """
+        (() => {
+          \(presetStatement)
+          \(modeStatement)
+          \(styleStatement)
+          \(renderStatement)
+          return {
+            mode: window.__dl.state.mode,
+            style: window.__dl.animation.selected,
+            active: window.__dl.animation.active,
+            width: rendered?.width || 0,
+            height: rendered?.height || 0,
+          };
+        })()
+        """
+    }
+
     func scheduleTestHook() {
         guard testMode else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            if testExportTarget == "video" {
-                let script = """
-                (() => {
-                  const row = [...document.querySelectorAll('.row')]
-                    .find((el) => el.querySelector('label')?.textContent === 'Style');
-                  const style = row?.querySelector('select');
-                  if (!style) throw new Error('animation style control missing');
-                  style.value = 'breathe';
-                  style.dispatchEvent(new Event('change', { bubbles: true }));
-                  setTimeout(() => {
-                    const lengthRow = [...document.querySelectorAll('.row')]
-                    .find((el) => el.querySelector('label')?.textContent === 'Video length');
-                    const length = lengthRow?.querySelector('select');
-                    if (length) {
-                      length.value = '3';
-                      length.dispatchEvent(new Event('change', { bubbles: true }));
+            let screenshotPath = testScreenshotPath
+            self.webView.evaluateJavaScript(
+                self.testSetupScript(renderSynchronously: screenshotPath != nil)
+            ) { result, error in
+                if let error {
+                    print("TEST_SETUP_FAIL: \(error.localizedDescription)")
+                    exit(1)
+                }
+                print("TEST_SETUP_STATE: \(String(describing: result))")
+                if let screenshotPath {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        self.webView.takeSnapshot(with: nil) { image, error in
+                            guard error == nil,
+                                  let image,
+                                  let tiff = image.tiffRepresentation,
+                                  let bitmap = NSBitmapImageRep(data: tiff),
+                                  let png = bitmap.representation(using: .png, properties: [:]) else {
+                                print("TEST_SCREENSHOT_FAIL: \(error?.localizedDescription ?? "no image")")
+                                exit(1)
+                            }
+                            do {
+                                try png.write(to: URL(fileURLWithPath: screenshotPath), options: .atomic)
+                                print("TEST_SCREENSHOT_OK: \(screenshotPath)")
+                                exit(0)
+                            } catch {
+                                print("TEST_SCREENSHOT_FAIL: \(error.localizedDescription)")
+                                exit(1)
+                            }
+                        }
                     }
-                    document.getElementById('btn-export-video').click();
-                  }, 250);
-                })()
-                """
-                self.webView.evaluateJavaScript(script)
-            } else {
-                let id = testExportTarget == "gif" ? "btn-export-gif" : "btn-export-png"
-                self.webView.evaluateJavaScript("document.getElementById('\(id)').click()")
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    if testExportTarget == "video" {
+                        let script = """
+                        (() => {
+                          const lengthRow = [...document.querySelectorAll('.row')]
+                            .find((el) => el.querySelector('label')?.textContent === 'Video length');
+                          const length = lengthRow?.querySelector('select');
+                          if (length) {
+                            length.value = '3';
+                            length.dispatchEvent(new Event('change', { bubbles: true }));
+                          }
+                          document.getElementById('btn-export-video').click();
+                        })()
+                        """
+                        self.webView.evaluateJavaScript(script)
+                    } else if testExportTarget == "web" {
+                        let script = """
+                        (() => {
+                          const formatRow = [...document.querySelectorAll('.row')]
+                            .find((el) => el.querySelector('label')?.textContent === 'Text format');
+                          const format = formatRow?.querySelector('select');
+                          if (!format) throw new Error('text format control missing');
+                          format.value = 'interactive';
+                          format.dispatchEvent(new Event('change', { bubbles: true }));
+                          document.getElementById('btn-export-txt').click();
+                        })()
+                        """
+                        self.webView.evaluateJavaScript(script)
+                    } else {
+                        let id = testExportTarget == "gif" ? "btn-export-gif" : "btn-export-png"
+                        self.webView.evaluateJavaScript("document.getElementById('\(id)').click()")
+                    }
+                }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + testTimeoutSeconds) {
             print("TEST_DOWNLOAD_FAIL: timed out")
             exit(1)
         }

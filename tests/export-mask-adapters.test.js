@@ -59,6 +59,8 @@ class FakeVideoFrame {
 }
 
 class FakeVideoEncoder {
+  static dropAfterFirst = false;
+
   static async isConfigSupported(config) { return { supported: true, config }; }
 
   constructor({ output, error }) {
@@ -75,13 +77,15 @@ class FakeVideoEncoder {
   }
 
   encode(_frame, opts) {
-    const bytes = new Uint8Array([0, 0, 0, 1, this.count & 255]);
+    const index = this.count++;
+    if (FakeVideoEncoder.dropAfterFirst && index > 0) return;
+    const bytes = new Uint8Array([0, 0, 0, 1, index & 255]);
     const chunk = {
       byteLength: bytes.length,
       type: opts.keyFrame ? 'key' : 'delta',
       copyTo(dest) { dest.set(bytes); },
     };
-    const meta = this.count++ === 0
+    const meta = index === 0
       ? { decoderConfig: { description: new Uint8Array([1, 100, 0, 51]) } }
       : undefined;
     this.output(chunk, meta);
@@ -203,4 +207,22 @@ test('legacy H.264 path retains staging draw behavior when no finalizer is suppl
 
   assert.equal(createdCanvases.length, 1);
   assert.equal(createdCanvases[0].ctx.drawCalls, 1);
+});
+
+test('frame-accurate export rejects encoders that silently drop submitted frames', async () => {
+  FakeVideoEncoder.dropAfterFirst = true;
+  try {
+    await assert.rejects(
+      exportLoopFrameAccurate({
+        renderFrame: () => new FakeCanvas(320, 180),
+        setPhase: () => {},
+        count: 3,
+        fps: 30,
+        name: 'dropped-frames',
+      }),
+      (error) => error.name === 'NotSupportedError' && /returned 1 of 3 frames/.test(error.message),
+    );
+  } finally {
+    FakeVideoEncoder.dropAfterFirst = false;
+  }
 });

@@ -149,10 +149,11 @@ export const DEFAULTS = {
 
   // --- animation (all modes; works on still images too) ---
   anim: {
-    style: 'none',         // none|breathe|pulse|sweep|wave|flow|shimmer
+    style: 'none',         // none|breathe|pulse|sweep|wave|flow|shimmer|command|fluted|gravity
     speed: 3,              // 1..10 (cycles/sec = speed * 0.15)
     intensity: 0.6,        // 0..1
     direction: 'right',    // flow: right|left|up|down|downright|upleft
+    gravityMode: 'drizzle', // drizzle|cascade|flutter|collapse
   },
 };
 

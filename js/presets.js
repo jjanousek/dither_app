@@ -92,6 +92,22 @@ export const PRESETS = [
     },
   },
   {
+    id: 'evangelion',
+    name: 'Evangelion',
+    params: {
+      mode: 'dither',
+      algorithm: 'bayer4',
+      paletteId: 'command',
+      pixelSize: 3,
+      threshold: 0.47,
+      contrast: 0.3,
+      gamma: 0.92,
+      saturation: 1.15,
+      anim: { style: 'command', speed: 1.5, intensity: 0.82 },
+      fx: { vignette: 0.22, scanlines: 0.26, grain: 0.1, chromatic: 1, glow: 0.18 },
+    },
+  },
+  {
     id: 'retro-crt',
     name: 'Retro CRT',
     params: {
@@ -284,7 +300,7 @@ const SHUFFLE_PALETTES = [
   'bw', 'gray4', 'gray8', 'gray16', 'gameboy', 'gbpocket', 'gblight',
   'amber', 'green', 'blueterm', 'paperwhite', 'macintosh', 'cga1', 'cga2',
   'cga16', 'ega', 'c64', 'zx', 'nes', 'pico8', 'apple2', 'teletext',
-  'vaporwave', 'sepia', 'sunset', 'nokia', 'obra', 'cmyk', 'rgb3',
+  'vaporwave', 'command', 'sepia', 'sunset', 'nokia', 'obra', 'cmyk', 'rgb3',
 ];
 
 const SHUFFLE_RAMPS = ['classic', 'detailed', 'blocks', 'minimal', 'dots', 'binary', 'slashes'];

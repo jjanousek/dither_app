@@ -26,6 +26,12 @@ class AsciiContext {
     this.ops.push(['fillText', ...args, this.fillStyle, this.font, this.globalAlpha]);
   }
 
+  save() { this.ops.push(['save']); }
+  restore() { this.ops.push(['restore']); }
+  setTransform(...args) { this.ops.push(['setTransform', ...args]); }
+  translate(...args) { this.ops.push(['translate', ...args]); }
+  rotate(...args) { this.ops.push(['rotate', ...args]); }
+
   getImageData(_x, _y, width, height) {
     const data = new Uint8ClampedArray(width * height * 4);
     for (let y = 0; y < height; y++) {
@@ -104,6 +110,25 @@ test('ASCII metadata capture defaults on and can be skipped without changing dra
     assert.equal(captured.lastText, textSnapshot);
     assert.equal(captured.lastGrid, gridSnapshot);
   }
+});
+
+test('animation glyph capture does not replace the most recent text-export snapshot', () => {
+  const renderer = new AsciiRenderer();
+  const opts = { ...asciiBase, renderer: 'ramp', colorMode: 'mono' };
+  renderer.render(imageData(5, 4), opts);
+  const textSnapshot = renderer.lastText;
+  const gridSnapshot = renderer.lastGrid;
+
+  renderer.render(imageData(5, 4, 47), {
+    ...opts,
+    captureMetadata: false,
+    captureGlyphs: true,
+  });
+
+  assert.equal(renderer.lastText, textSnapshot);
+  assert.equal(renderer.lastGrid, gridSnapshot);
+  assert.ok(Array.isArray(renderer.lastGlyphFrame));
+  assert.notEqual(renderer.lastGlyphFrame, gridSnapshot);
 });
 
 class Gradient {

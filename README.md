@@ -95,7 +95,7 @@ The shape-matching renderer in full color rebuilds the image out of pure text �
 
 ## Palettes
 
-30 presets: 1-bit black & white (and inverted), grayscale 4/8/16, Game Boy DMG / Pocket / Light, amber & green & blue terminal phosphors, E-Ink paper, Macintosh, CGA (both mode-4 palettes and full 16), EGA, Commodore 64, ZX Spectrum, NES, PICO-8, Apple II, Teletext, Vaporwave, Sepia, Sunset, Nokia 3310, Obra Dinn, CMYK, RGB primaries — plus a **custom palette editor** with up to 32 colors (right-click a swatch to remove it).
+31 presets: 1-bit black & white (and inverted), grayscale 4/8/16, Game Boy DMG / Pocket / Light, amber & green & blue terminal phosphors, E-Ink paper, Macintosh, CGA (both mode-4 palettes and full 16), EGA, Commodore 64, ZX Spectrum, NES, PICO-8, Apple II, Teletext, Vaporwave, Command Violet, Sepia, Sunset, Nokia 3310, Obra Dinn, CMYK, RGB primaries — plus a **custom palette editor** with up to 32 colors (right-click a swatch to remove it).
 
 ## Adjustments, post FX & animation
 
@@ -103,18 +103,21 @@ The shape-matching renderer in full color rebuilds the image out of pure text �
 
 **Post FX** (all modes): vignette, scanlines, film grain, chromatic aberration, glow.
 
-**Animation** — six phase-driven styles that work in every mode, on videos *and still images*:
+**Animation** — eight looping styles plus a one-shot ASCII physics effect:
 
 | Style | Effect |
 | --- | --- |
 | Breathe | slow exposure swell |
 | Pulse | double-beat heartbeat |
+| Command | tracking brackets, scan rails, alert slabs, and synchronization slices |
+| Fluted glass | animated vertical refraction across the rendered frame |
 | Sweep | light band traveling across the frame |
 | Wave | sinusoidal row distortion |
 | Flow | the dither pattern itself drifts (6 directions) |
 | Shimmer | deterministic pattern jitter |
+| Gravity fall | ASCII glyphs release independently, accelerate, and fall out below the frame |
 
-Speed and intensity are adjustable. Because animation is a pure function of a normalized phase, animated stills export as **seamlessly looping GIFs** (exactly one cycle is baked) or as fixed-length video recordings.
+Speed and intensity are adjustable. The eight looping styles export as **seamlessly looping GIFs** (exactly one cycle is baked) or fixed-length videos. Fluted glass affects raster, GIF, and video output while text exports stay unchanged. Gravity fall is a deterministic one-shot for still-image ASCII in Mono or Colored glyph mode, with four physics profiles: gentle **Drizzle**, top-down **Cascade**, windy **Flutter**, and heavy **Collapse**. Its Pace control sets the clip length while Scatter changes the variation. Dense live previews use an adaptive physics grid for smooth playback; full-frame text/still and frame-accurate video exports retain their export resolution. Use Replay in the editor, export it as video, or choose **Interactive fall (.html)** for a click/Enter/Space-triggered website asset. The page emits `ditherlab:complete` when the glyphs clear.
 
 ![Signal Drift preset: animated Bayer dither with scanlines](docs/animation.png)
 
@@ -124,7 +127,7 @@ Speed and intensity are adjustable. Because animation is a pure function of a no
 
 - **Zoom & pan viewport** — scroll to zoom around the cursor, drag to pan, double-click to toggle fit ↔ actual pixels, with floating zoom controls and a live zoom readout.
 - **Before/after split view** — a draggable divider with the untouched original on the left and the processed result on the right, live even during video playback. Hold-to-compare (`C`) flips the whole frame.
-- **Live preset thumbnails** — 26 one-click looks (Terminal, Game Boy, Newsprint, Noir, Obra Dinn, Arcade, Vaporwave, Retro CRT, Matrix, Typewriter, Braille, Structural, Textmode Color, Block Mosaic, LEGO Brick, Voxel City, LED Wall, Constellation, Mosaic Tile, Amber Tube, Riso Print, Nokia LCD, Ink Dots, Signal Drift, Heartbeat, Tidal), each thumbnail rendered live from *your* media. Plus a Shuffle card that rolls a random look.
+- **Live preset thumbnails** — 27 one-click looks (Terminal, Game Boy, Newsprint, Noir, Obra Dinn, Arcade, Vaporwave, Evangelion, Retro CRT, Matrix, Typewriter, Braille, Structural, Textmode Color, Block Mosaic, LEGO Brick, Voxel City, LED Wall, Constellation, Mosaic Tile, Amber Tube, Riso Print, Nokia LCD, Ink Dots, Signal Drift, Heartbeat, Tidal), each thumbnail rendered live from *your* media. Plus a Shuffle card that rolls a random look.
 - **Undo/redo** — every settings change is snapshotted (`⌘Z` / `⇧⌘Z`, 100 steps).
 - **Status bar** — file name, resolution, active mode, live fps, zoom level.
 - Drag & drop anywhere, clipboard paste, and a demo scene so the app never opens empty.
@@ -203,7 +206,7 @@ Design notes:
 - The source frame is downsampled per renderer: one sample per pixel for dithering, one per character cell for ramp ASCII, 8×8 per cell for shape matching, 2×2 for quadrants, 2×4 for braille.
 - Glyph atlases are rasterized once per font and cached: 8×8 coverage bitmaps (as two 32-bit words for fast XOR+popcount Hamming distance) double as the ink-coverage measurements that calibrate the character ramps.
 - The GIF encoder keeps exact colors for palettized output and falls back to a weighted median-cut global palette when a clip exceeds 256 colors; frame delays use cumulative rounding so long GIFs don't drift.
-- Animation is a pure function of a normalized phase, which is how animated stills can be baked into GIFs that loop without a seam.
+- Animation is a pure function of a normalized phase. Looping styles omit the duplicate endpoint for seamless GIFs; Gravity includes its cleared endpoint for one-shot video.
 - Video export records the live preview canvas in real time; GIF export re-renders deterministically frame by frame.
 
 ## Acknowledgements

@@ -85,6 +85,7 @@ test('CpuPreview reports synchronous cold start without accepting a worker job',
   assert.equal(result.rendered, true);
   assert.equal(result.acceptedJob, null);
   assert.equal(result.canvas, cpu.committed);
+  assert.equal(cpu.commitGeneration, 1);
   assert.equal(FakeWorker.instances[0].messages.length, 0);
 });
 
@@ -117,6 +118,7 @@ test('CpuPreview separates a landed commit from the next accepted pending job', 
 
   FakeWorker.instances[0].reply(0);
   assert.equal(wakes, 1);
+  assert.equal(cpu.commitGeneration, 2, 'worker landings expose a new processed-output generation');
   const committedA = cpu.takeCommittedResult();
   assert.equal(committedA.token.frameId, 10);
   assert.equal(committedA.canvas, cpu.committed);
@@ -153,4 +155,19 @@ test('CpuPreview legacy calls continue returning the committed canvas', () => {
     false
   );
   FakeWorker.instances[0].reply(0);
+});
+
+test('worker failure invalidates retained processed-output cache keys', () => {
+  FakeWorker.instances.length = 0;
+  let wakes = 0;
+  const cpu = new CpuPreview(() => { wakes++; });
+  cpu.render(image(40), 2, 1, palette, 'floyd', opts, 'failure', new FakeContext(), true);
+  cpu.render(image(90), 2, 1, palette, 'floyd', opts, 'failure', new FakeContext(), true);
+  assert.equal(cpu.commitGeneration, 1);
+
+  FakeWorker.instances[0].onerror();
+
+  assert.equal(cpu.state, 'failed');
+  assert.equal(cpu.commitGeneration, 2);
+  assert.equal(wakes, 1);
 });

@@ -2,10 +2,20 @@
 
 import { GifEncoder } from './gif.js';
 import { Mp4Muxer } from './mp4.js';
+import {
+  createGravityLayout,
+  gravityDurationSeconds,
+  isGravityGlyph,
+  sampleGravityBody,
+} from '../effects/ascii-gravity.js';
 
 export const MAX_MP4_SAMPLE_BYTES = 256 * 1024 * 1024;
 const SEEK_TIMEOUT_MS = 4000;
 export const GIF_RETAINED_PIXEL_BUDGET = 60_000_000;
+// Interactive pages retain physics constants for every visible glyph and
+// visit them on every animation frame. Keep generated files and runtime work
+// bounded; the app downsamples the ASCII grid to this ceiling before export.
+export const MAX_INTERACTIVE_GRAVITY_BODIES = 25_000;
 
 export function gifFrameBudget(width, height) {
   const pixels = Math.max(1, width * height);
@@ -205,12 +215,21 @@ async function makeH264Encoder(first, fps, strict, requestedTarget = null) {
   }
 
   const keyEvery = Math.max(1, Math.round(fps * 2)); // ~2s GOP at any rate
+  let submittedFrames = 0;
   const encodeCanvas = async (canvas, i) => {
     const vf = new VideoFrame(canvas, { timestamp: Math.round((i * 1e6) / fps), duration: Math.round(1e6 / fps) });
     const opts = { keyFrame: i % keyEvery === 0 };
     if (quantizer !== null) opts.avc = { quantizer };
     encoder.encode(vf, opts);
+    submittedFrames++;
     vf.close();
+    // WebKit's queue size can stay at zero while its hardware encoder is
+    // still buffering work. Flush bounded batches so an offline export cannot
+    // overrun that hidden queue and silently lose nearly every submitted frame.
+    if (submittedFrames % 8 === 0) {
+      await encoder.flush();
+      if (encErr) throw encErr;
+    }
     while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 4));
     return !muxer.limitReached;
   };
@@ -236,6 +255,14 @@ async function makeH264Encoder(first, fps, strict, requestedTarget = null) {
     async finish() {
       await encoder.flush();
       if (encErr) throw encErr;
+      if (muxer.samples.length !== submittedFrames) {
+        const producedFrames = muxer.samples.length;
+        encoder.close();
+        muxer.release();
+        throw unsupportedH264(
+          `H.264 encoder returned ${producedFrames} of ${submittedFrames} frames`,
+        );
+      }
       encoder.close();
       const blob = muxer.finalize();
       muxer.release();
@@ -405,8 +432,8 @@ export function downloadBlob(blob, filename) {
   revokeTimer?.unref?.(); // keep Node-side regression tests from waiting 10s
 }
 
-export function exportText(text, name = 'ascii', ext = 'txt') {
-  downloadBlob(new Blob([text], { type: 'text/plain' }), `${name}.${ext}`);
+export function exportText(text, name = 'ascii', ext = 'txt', mime = 'text/plain') {
+  downloadBlob(new Blob([text], { type: mime }), `${name}.${ext}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +518,88 @@ export function buildHtml(grid, pageBg = '#0a0a0c', font = null) {
   return `<!doctype html><meta charset="utf-8"><title>ascii art</title>` +
     `<body style="background:${pageBg};margin:20px 0">` +
     `<pre style="font:${fontCss};text-align:center">${rows.join('\n')}</pre>`;
+}
+
+// Self-contained click-to-enter page using the same deterministic body
+// constants as the editor preview. The host can listen for
+// `ditherlab:complete`, or for the same message from an iframe, to reveal or
+// navigate to its real content.
+export function buildGravityHtml(grid, pageBg = '#0a0a0c', font = null, {
+  intensity = 0.6,
+  speed = 3,
+  mode = 'drizzle',
+  title = 'ASCII gravity',
+} = {}) {
+  const rows = Math.max(1, grid?.length || 0);
+  const cols = Math.max(1, grid?.reduce((max, row) => Math.max(max, row.length), 0) || 0);
+  let bodyCount = 0;
+  for (const row of grid || []) {
+    for (const cell of row || []) {
+      if (isGravityGlyph(cell?.[0]) && ++bodyCount > MAX_INTERACTIVE_GRAVITY_BODIES) {
+        throw new RangeError(
+          `Interactive Gravity supports up to ${MAX_INTERACTIVE_GRAVITY_BODIES.toLocaleString('en-US')} visible glyphs`,
+        );
+      }
+    }
+  }
+  const layout = createGravityLayout(grid, {
+    cols,
+    rows,
+    intensity,
+    mode,
+  });
+  const family = font?.family || 'Menlo, monospace';
+  const size = Math.max(4, Number(font?.size) || 12);
+  const durationMs = Math.round(gravityDurationSeconds(speed, layout.mode) * 1000);
+  const spec = {
+    cols,
+    rows,
+    mode: layout.mode,
+    background: pageBg,
+    font: { family, size, bold: !!font?.bold },
+    motionSeconds: layout.duration,
+    durationMs,
+    bodies: layout.bodies,
+  };
+  const json = JSON.stringify(spec)
+    .replace(/&/g, '\\u0026')
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+  const escapedTitle = String(title)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  // Inject the shared sampler itself so the website artifact cannot drift
+  // from editor physics when off-screen exit behavior changes.
+  const gravitySampler = sampleGravityBody.toString();
+
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,">
+<title>${escapedTitle}</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;background:${pageBg};overflow:hidden}
+body{display:grid;place-items:center;font-family:system-ui,sans-serif}#ditherlab-gravity{display:block;max-width:100vw;max-height:100vh;width:auto;height:auto;cursor:pointer;outline:none;transition:opacity .18s ease}
+#ditherlab-gravity:focus-visible{box-shadow:0 0 0 2px #fff8}#ditherlab-hint{position:fixed;left:50%;bottom:24px;translate:-50% 0;color:#fff9;font:12px/1 system-ui,sans-serif;letter-spacing:.08em;text-transform:uppercase;pointer-events:none;transition:opacity .18s ease}
+body.running #ditherlab-hint,body.complete #ditherlab-hint,body.complete #ditherlab-gravity{opacity:0}body.complete #ditherlab-gravity{pointer-events:none}
+@media(prefers-reduced-motion:reduce){#ditherlab-gravity,#ditherlab-hint{transition:none}}
+</style></head><body><canvas id="ditherlab-gravity" tabindex="0" role="button" aria-label="Enter site"></canvas><div id="ditherlab-hint">Click to enter</div>
+<script>(()=>{const spec=${json};const canvas=document.getElementById('ditherlab-gravity');const ctx=canvas.getContext('2d');
+const clamp=(value,min,max)=>Math.min(max,Math.max(min,value));const clamp01=value=>clamp(Number(value)||0,0,1);function smoothstep(edge0,edge1,value){const t=clamp01((value-edge0)/Math.max(1e-9,edge1-edge0));return t*t*(3-2*t)}const ASCII_GRAVITY_DURATION_SECONDS=spec.motionSeconds;
+${gravitySampler}
+const font=(spec.font.bold?'700 ':'')+spec.font.size+'px/1 '+spec.font.family;ctx.font=font;let cellW=1;for(const body of spec.bodies)cellW=Math.max(cellW,ctx.measureText(body.glyph).width||0);const cellH=spec.font.size;const dpr=Math.max(1,window.devicePixelRatio||1);const logicalW=Math.ceil(spec.cols*cellW);const logicalH=Math.ceil(spec.rows*cellH);canvas.width=Math.ceil(logicalW*dpr);canvas.height=Math.ceil(logicalH*dpr);function fit(){const scale=Math.min(1,innerWidth/logicalW,innerHeight/logicalH);canvas.style.width=logicalW*scale+'px';canvas.style.height=logicalH*scale+'px'}addEventListener('resize',fit,{passive:true});fit();
+const cssColor=value=>'#'+((value??16777215)>>>0).toString(16).padStart(6,'0');let spriteRaster=Math.max(cellW,cellH)<18?2:1;const spriteLogicalSize=Math.max(4,Math.ceil(Math.hypot(cellW,cellH)*1.6+4));let spriteSize=0,spriteStride=0;
+function indexVariants(limit,colorForBody){const lookup=new Map,variants=[],indices=new Uint16Array(spec.bodies.length);for(let i=0;i<spec.bodies.length;i++){const body=spec.bodies[i],foreground=colorForBody(body),key=body.glyph+'\\0'+foreground;let vi=lookup.get(key);if(vi===undefined){if(variants.length>=limit)return null;vi=variants.length;lookup.set(key,vi);variants.push({glyph:body.glyph,foreground})}indices[i]=vi}return{variants,indices}}
+function atlasShape(variantCount,bins,raster=spriteRaster){const size=Math.ceil(spriteLogicalSize*raster),stride=size+2,slots=Math.max(1,variantCount*bins),columns=Math.ceil(Math.sqrt(slots)),rows=Math.ceil(slots/columns);return{size,stride,slots,columns,rows,pixels:columns*stride*rows*stride}}
+let indexed=indexVariants(16,body=>body.foreground??16777215);if(!indexed&&spec.bodies.length>=4000){const glyphs=new Set;for(const body of spec.bodies)glyphs.add(body.glyph);let levels=Math.min(4,Math.floor(Math.cbrt(128/Math.max(1,glyphs.size))));while(levels>=2&&!indexed){const step=255/(levels-1),q=channel=>Math.round(Math.round(channel/step)*step);const candidate=indexVariants(128,body=>{const color=(body.foreground??16777215)>>>0;return(q((color>>>16)&255)<<16)|(q((color>>>8)&255)<<8)|q(color&255)});if(candidate&&atlasShape(candidate.variants.length,17,1).pixels<=8000000){candidate.dense=true;indexed=candidate}levels--}}
+const denseSprites=!!indexed?.dense,angleStep=denseSprites?Math.PI/8:Math.PI/32,angleBins=denseSprites?17:65,angleLimit=denseSprites?8:32;let useSprites=!!indexed,atlas=null,atlasCtx=null,atlasSlots=null,atlasColumns=0;if(useSprites){let shape=atlasShape(indexed.variants.length,angleBins);if(shape.pixels>8000000&&spriteRaster>1){spriteRaster=1;shape=atlasShape(indexed.variants.length,angleBins)}if(shape.pixels>8000000)useSprites=false;else{spriteSize=shape.size;spriteStride=shape.stride;atlas=document.createElement('canvas');atlas.width=shape.columns*spriteStride;atlas.height=shape.rows*spriteStride;atlasCtx=atlas.getContext('2d');atlasSlots=new Uint8Array(shape.slots);atlasColumns=shape.columns}}
+function drawSprite(variantIndex,angle,x,y,scale=1){const wrapped=((angle+Math.PI)%(Math.PI*2)+Math.PI*2)%(Math.PI*2)-Math.PI,ai=Math.max(-angleLimit,Math.min(angleLimit,Math.round(wrapped/angleStep))),slot=variantIndex*angleBins+ai+angleLimit,sx=(slot%atlasColumns)*spriteStride+1,sy=Math.floor(slot/atlasColumns)*spriteStride+1;if(!atlasSlots[slot]){const variant=indexed.variants[variantIndex];atlasCtx.save();atlasCtx.setTransform(1,0,0,1,0,0);atlasCtx.font=(spec.font.bold?'700 ':'')+(cellH*spriteRaster)+'px/1 '+spec.font.family;atlasCtx.textBaseline='top';atlasCtx.fillStyle=cssColor(variant.foreground);atlasCtx.translate(sx+spriteSize/2,sy+spriteSize/2);atlasCtx.rotate(ai*angleStep);atlasCtx.fillText(variant.glyph,-cellW*spriteRaster/2,-cellH*spriteRaster/2);atlasCtx.restore();atlasSlots[slot]=1}const drawSize=spriteLogicalSize*Math.max(1,Number(scale)||1);ctx.drawImage(atlas,sx,sy,spriteSize,spriteSize,x-drawSize/2,y-drawSize/2,drawSize,drawSize)}
+const poseScratch={x:0,y:0,angle:0,scale:1,opacity:1,released:false,exited:false};
+function draw(phase){ctx.setTransform(dpr,0,0,dpr,0,0);ctx.globalAlpha=1;ctx.fillStyle=spec.background;ctx.fillRect(0,0,logicalW,logicalH);if(phase>=1)return;ctx.font=font;ctx.textBaseline='top';if(phase<=0){for(const body of spec.bodies){ctx.fillStyle=cssColor(body.foreground);ctx.fillText(body.glyph,(body.x0-.5)*cellW,(body.y0-.5)*cellH)}return}let alpha=1;for(let i=0;i<spec.bodies.length;i++){const body=spec.bodies[i],p=sampleGravityBody(body,phase,poseScratch);if(p.opacity<=.001)continue;if(p.opacity!==alpha){alpha=p.opacity;ctx.globalAlpha=alpha}const x=p.x*cellW,y=p.y*cellH;if(useSprites)drawSprite(indexed.indices[i],p.angle,x,y,p.scale);else{ctx.fillStyle=cssColor(body.foreground);if(Math.abs(p.angle)<.001&&Math.abs((p.scale??1)-1)<.001)ctx.fillText(body.glyph,x-cellW/2,y-cellH/2);else{ctx.save();ctx.translate(x,y);ctx.rotate(p.angle);ctx.scale(p.scale??1,p.scale??1);ctx.fillText(body.glyph,-cellW/2,-cellH/2);ctx.restore()}}}ctx.globalAlpha=1}
+let running=false,started=0,runId=0;function finish(){running=false;document.body.classList.remove('running');document.body.classList.add('complete');const detail={effect:'gravity',version:1};window.dispatchEvent(new CustomEvent('ditherlab:complete',{detail}));if(parent!==window)parent.postMessage({type:'ditherlab:complete',detail},'*')}
+function frame(now,id){if(id!==runId)return;const phase=clamp((now-started)/spec.durationMs,0,1);draw(phase);if(phase<1)requestAnimationFrame(next=>frame(next,id));else finish()}
+function start(){if(running||document.body.classList.contains('complete'))return;const id=++runId;if(matchMedia('(prefers-reduced-motion: reduce)').matches){draw(1);finish();return}running=true;document.body.classList.add('running');started=performance.now();requestAnimationFrame(now=>frame(now,id))}
+function reset(){runId++;running=false;document.body.classList.remove('running','complete');draw(0)}function replay(){reset();start()}
+canvas.addEventListener('click',start);canvas.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();start()}});window.DitherlabGravity={start,replay,reset};draw(0)})();</script></body></html>`;
 }
 
 // ---------------------------------------------------------------------------
