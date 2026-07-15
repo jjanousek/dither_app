@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="1.3.2"
+VERSION="1.4.0"
 DEST="$HOME/Applications/Ditherlab.app"
 PROJECT_DIR="$(cd .. && pwd)"
 TMP="$(mktemp -d)"
@@ -50,7 +50,7 @@ cat > "$TMP/Ditherlab.app/Contents/Info.plist" <<PLIST
 	<key>CFBundleIconFile</key><string>Ditherlab</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
-	<key>CFBundleVersion</key><string>10</string>
+	<key>CFBundleVersion</key><string>11</string>
 	<key>LSMinimumSystemVersion</key><string>13.5</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSCameraUsageDescription</key>
