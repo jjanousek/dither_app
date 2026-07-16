@@ -1,5 +1,11 @@
 // Deterministic, source-sampling fluted-glass Post FX.
 //
+// The optical model follows the July 2026 teardown of the reference plate
+// (indicium.ai): rigid ribs, an orthographic incident ray, and pure
+// refraction with no painted rib lighting — the glass character comes from
+// the artwork being compressed at the flute edges, and the animation is the
+// content drifting behind static glass rather than the glass bending.
+//
 // This module is deliberately lazy: importing it does not create a canvas or
 // request a WebGL context. The singleton is allocated only when the effect is
 // enabled, and callers receive their original source on every unsupported or
@@ -40,30 +46,36 @@ void main() {
   float amount = clamp(u_intensity, 0.0, 1.0);
   float aspect = u_resolution.x / max(u_resolution.y, 1.0);
 
-  // A periodic, analytic bend keeps the renderer random-access: the same
-  // source, settings, and phase always produce the same frame, and phase 1
-  // is exactly phase 0. This is important for deterministic GIF/video export.
-  float time = u_phase * TAU;
-  float broadBend = sin(time + uv.y * TAU) * (0.0015 + 0.0045 * amount);
-  float localBend = sin(time * 2.0 - uv.y * TAU * 2.0 + uv.x * TAU)
-    * 0.0015 * amount;
-  float warpedX = uv.x + broadBend + localBend;
+  // Real fluted glass never bends: the reference plate keeps its ribs rigid
+  // and lets the field behind them flow. The motion is a divergence-free
+  // drift of the content — the perpendicular gradient of a stream function
+  // built from three traveling plane waves, so the artwork swirls without
+  // stretching. Integer temporal cycles keep the renderer random-access:
+  // the same source, settings, and phase always produce the same frame, and
+  // phase 1 is exactly phase 0 for deterministic GIF/video export.
+  vec2 p = vec2(uv.x * aspect, uv.y);
+  float w0 = TAU * (dot(p, vec2( 0.9,  1.4)) + u_phase) + 1.07;
+  float w1 = TAU * (dot(p, vec2(-1.3,  0.8)) - u_phase) + 3.84;
+  float w2 = TAU * (dot(p, vec2( 0.6, -1.1)) + 2.0 * u_phase) + 5.51;
+  vec2 swirl = vec2( 1.4, -0.9) * cos(w0)
+             + vec2( 0.8,  1.3) * cos(w1)
+             + vec2(-1.1, -0.6) * cos(w2);
+  vec2 drift = (0.0028 * amount) * swirl / vec2(max(aspect, 0.001), 1.0);
 
-  float rib = warpedX * u_ribCount;
-  float ribUv = fract(rib);
+  // Rigid ribs with a circular cross-section (squircle exponent 2, IOR 1.3 —
+  // the reference material), lit by nothing: the streaks and seams emerge
+  // from refraction compressing the artwork, not from painted shading.
+  float rib = uv.x * u_ribCount;
   float cylinderX = fract(rib + 0.5) * 2.0 - 1.0;
   float cylinderZ = sqrt(max(1.0 - cylinderX * cylinderX, 0.001));
   vec3 normal = normalize(vec3(cylinderX, 0.0, cylinderZ));
-  vec3 incident = normalize(vec3(
-    0.06 * (uv.x - 0.5) / max(aspect, 0.001),
-    0.025 * (uv.y - 0.5),
-    -1.0
-  ));
-  vec3 ray = refract(incident, normal, 1.0 / 1.3);
+  // Orthographic incident ray: every flute refracts identically across the
+  // image and the ray gains no vertical component.
+  vec3 ray = refract(vec3(0.0, 0.0, -1.0), normal, 1.0 / 1.3);
 
   float refraction = mix(0.008, 0.055, amount);
   vec2 refractedUv = clamp(
-    uv + vec2(ray.x * refraction, ray.y * refraction * 0.45),
+    uv + drift + vec2(ray.x * refraction, 0.0),
     vec2(0.001),
     vec2(0.999)
   );
@@ -71,19 +83,10 @@ void main() {
   vec4 base = texture(u_source, uv);
   vec4 refracted = texture(u_source, refractedUv);
 
-  float edge = pow(1.0 - normal.z, 2.5);
-  float leading = 1.0 - smoothstep(0.0, max(fwidth(ribUv) * 2.2, 0.015), ribUv);
-  float crease = smoothstep(0.82, 0.985, ribUv);
-  float shade = 1.0 + 0.085 * leading + 0.045 * edge - 0.09 * crease;
-  vec3 glassRgb = refracted.rgb * shade;
-  glassRgb += vec3(0.72, 0.86, 1.0)
-    * (0.035 * leading + 0.018 * edge)
-    * refracted.a;
-
   // Alpha follows the same optical sampling as color. At partial intensity it
   // transitions from the untouched source alpha rather than forcing opacity.
   float alpha = mix(base.a, refracted.a, amount);
-  vec3 rgb = mix(base.rgb, glassRgb, amount);
+  vec3 rgb = mix(base.rgb, refracted.rgb, amount);
   outColor = vec4(max(rgb, vec3(0.0)), alpha);
 }`;
 

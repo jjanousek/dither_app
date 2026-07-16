@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 DEST="$HOME/Applications/Ditherlab.app"
 PROJECT_DIR="$(cd .. && pwd)"
 TMP="$(mktemp -d)"
